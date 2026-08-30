@@ -2,7 +2,7 @@
 
 > **This is a fork.** The original mod — and all the hard reverse-engineering work behind it — is by
 > [Banz99](https://github.com/Banz99/Final-Fantasy-Type-0-Hd-Unlocker). This fork keeps everything
-> the original does and adds intro skipping, high-framerate timing fixes and crash protection —
+> the original does and adds intro skipping, high-framerate timing fixes and more —
 > see [FORK-CHANGES.md](FORK-CHANGES.md) for a plain-language list. Everything below is the
 > original README.
 

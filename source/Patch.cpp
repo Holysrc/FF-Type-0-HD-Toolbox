@@ -11,6 +11,8 @@
 #include <cstdarg>
 #include <stdexcept>
 #include <thread>
+#include <commctrl.h>
+#pragma comment(lib, "Comctl32.lib")
 #include "Utils/Trampoline.h"
 #include "include/keystone/keystone.h"
 
@@ -352,6 +354,388 @@ static void StartBootTraceWatcher()
 	}).detach();
 }
 
+// Fine camera control ([Camera] ini section). The launcher's camera presets
+// resolve to plain floats: distance value = (1 - preset*0.5) * 200 for the
+// free camera (global at base+0x6BD128; Far=0, Mid=100, Near=200) and * 300
+// for the lock-on camera (base+0x6BD12C; Far=0, Mid=150, Near=300). Turn
+// speed multipliers live at base+0x61141C (pad) and base+0x611418 (mouse),
+// 1.0 = Normal. A watcher re-applies the overrides so settings reloads can't
+// undo them. Values below the Far preset (negative) are experimental.
+static int g_camFree = -9999;
+static int g_camLock = -9999;
+static int g_padTurnPct = -1;
+static int g_mouseTurnPct = -1;
+static int g_vertTurnPct = -1; // vertical axis multiplier at base+0x611C8C, shared by pad and mouse
+
+// Dynamic FOV ([Camera] DynamicFOVPercent): the FOV patch reads its multiplier
+// from a dedicated trampoline float; a fast worker widens it while the right
+// stick is deflected (reading the raw stick globals) and eases it back.
+static volatile float* g_fovMulPtr = nullptr;
+static float g_fovBase = 1.0f;
+static int g_dynFovPct = 0;
+static int g_pitchFovPct = 0;
+
+// Stick telemetry ([Diagnostics] TraceSticks=1): logs the raw camera-stick
+// values 5x/second for 60s, to check the pad-to-game mapping (deadzone and
+// early saturation) before designing response curves around it.
+static void StartStickTraceWatcher()
+{
+	if (!g_logEnabled || !g_gameBase)
+		return;
+	std::thread([] {
+		const ULONGLONG t0 = GetTickCount64();
+		while (GetTickCount64() - t0 < 60000)
+		{
+			Sleep(200);
+			const int sx = *reinterpret_cast<volatile int*>(g_gameBase + 0x638B28);
+			const int sy = *reinterpret_cast<volatile int*>(g_gameBase + 0x638B2C);
+			LogF("[Stick +%llums] x=%d y=%d", GetTickCount64() - t0, sx, sy);
+		}
+	}).detach();
+}
+
+// Pitch telemetry ([Diagnostics] TracePitch=1): logs candidate camera-angle
+// globals 5x/second for 60s. Protocol: tilt the camera slowly to max up, hold,
+// then max down, hold, recenter — the address that follows is the live pitch.
+static void StartPitchTraceWatcher()
+{
+	if (!g_logEnabled || !g_gameBase)
+		return;
+	std::thread([] {
+		const uintptr_t addrs[] = { 0x659270, 0x6591C0, 0x6591D0, 0x6591D4, 0x6591DC, 0x6591E0 };
+		const ULONGLONG t0 = GetTickCount64();
+		while (GetTickCount64() - t0 < 60000)
+		{
+			Sleep(200);
+			float v[6];
+			for (int i = 0; i < 6; i++)
+				v[i] = *reinterpret_cast<volatile float*>(g_gameBase + addrs[i]);
+			LogF("[Pitch +%llums] 270=%.4f 1C0=%.4f 1D0=%.4f 1D4=%.4f 1DC=%.4f 1E0=%.4f",
+				GetTickCount64() - t0, v[0], v[1], v[2], v[3], v[4], v[5]);
+		}
+	}).detach();
+}
+
+// Live-tunable knee curve state (dedicated trampoline floats, see the knee
+// patch; the tuner window rewrites them when sliders move)
+static volatile float* g_kneeKPtr = nullptr;
+static volatile float* g_kneeCPtr = nullptr;
+static volatile float* g_kneeBPtr = nullptr;
+static volatile float* g_satMulPtr = nullptr;
+//Below-knee segment is a polynomial c1*e + c2*e^2 + c3*e^3 so the tuner can
+//blend the inner exponent live (including fractional values like 2.4)
+static volatile float* g_kneeC1Ptr = nullptr;
+static volatile float* g_kneeC2Ptr = nullptr;
+static volatile float* g_kneeC3Ptr = nullptr;
+static bool g_tuneWindow = false;
+
+//Inner exponent p (1.0..3.0) as a blend of e^floor(p) and e^ceil(p), scaled so
+//the curve still meets the knee point exactly: speed(k) = s
+static void KneeInnerCoeffs(float k, float s, int expX10, float* c1, float* c2, float* c3)
+{
+	float p = expX10 / 10.0f;
+	if (p < 1.0f) p = 1.0f;
+	if (p > 3.0f) p = 3.0f;
+	const int lo = (p >= 3.0f) ? 3 : static_cast<int>(p);
+	const float frac = p - lo;
+	float w[4] = { 0, 0, 0, 0 };
+	w[lo] = 1.0f - frac;
+	if (lo < 3)
+		w[lo + 1] = frac;
+	const float scale = s / (w[1] * k + w[2] * k * k + w[3] * k * k * k);
+	*c1 = scale * w[1];
+	*c2 = scale * w[2];
+	*c3 = scale * w[3];
+}
+
+static void StartDynamicFovWatcher()
+{
+	if (!g_fovMulPtr || (g_dynFovPct <= 0 && g_pitchFovPct <= 0 && !g_tuneWindow) || !g_gameBase)
+		return;
+	std::thread([] {
+		float cur = g_fovBase;
+		//Final camera pitch in radians lives at base+0x6591D0 (traced in-game:
+		//clamped to +0.471 up / -0.785 down, rest ~-0.13). Seed the limits with
+		//those and keep calibrating in case other camera modes allow more.
+		float calUp = 0.4712f, calDown = 0.7854f;
+		for (;;)
+		{
+			Sleep(8);
+			const int sx = *reinterpret_cast<volatile int*>(g_gameBase + 0x638B28);
+			const int sy = *reinterpret_cast<volatile int*>(g_gameBase + 0x638B2C);
+			float mag = sqrtf(static_cast<float>(sx * sx + sy * sy)) / 255.0f;
+			if (mag > 1.0f)
+				mag = 1.0f;
+			float pn = 0.0f;
+			if (g_pitchFovPct > 0)
+			{
+				const float pitch = *reinterpret_cast<volatile float*>(g_gameBase + 0x6591D0);
+				if (pitch > calUp && pitch < 1.6f)
+					calUp = pitch;
+				if (-pitch > calDown && -pitch < 1.6f)
+					calDown = -pitch;
+				pn = (pitch >= 0.0f) ? pitch / calUp : -pitch / calDown;
+				if (pn > 1.0f)
+					pn = 1.0f;
+				pn *= pn; // quadratic: quiet near center, strong at the extremes
+			}
+			const float target = g_fovBase * (1.0f + g_dynFovPct / 100.0f * mag) * (1.0f + g_pitchFovPct / 100.0f * pn);
+			cur += (target - cur) * 0.06f;
+			*g_fovMulPtr = cur;
+		}
+	}).detach();
+}
+
+static void StartCameraWatcher()
+{
+	if ((g_camFree == -9999 && g_camLock == -9999 && g_padTurnPct < 0 && g_mouseTurnPct < 0 && g_vertTurnPct < 0 && !g_tuneWindow) || !g_gameBase)
+		return;
+	std::thread([] {
+		for (;;)
+		{
+			if (g_camFree != -9999)
+				*reinterpret_cast<volatile float*>(g_gameBase + 0x6BD128) = static_cast<float>(g_camFree);
+			if (g_camLock != -9999)
+				*reinterpret_cast<volatile float*>(g_gameBase + 0x6BD12C) = static_cast<float>(g_camLock);
+			if (g_padTurnPct >= 0)
+				*reinterpret_cast<volatile float*>(g_gameBase + 0x61141C) = g_padTurnPct / 100.0f;
+			if (g_mouseTurnPct >= 0)
+				*reinterpret_cast<volatile float*>(g_gameBase + 0x611418) = g_mouseTurnPct / 100.0f;
+			if (g_vertTurnPct >= 0)
+				*reinterpret_cast<volatile float*>(g_gameBase + 0x611C8C) = g_vertTurnPct / 100.0f;
+			Sleep(500);
+		}
+	}).detach();
+}
+
+// Camera tuner window ([Camera] TuneWindow=1): a small always-on-top window
+// with sliders for every live-tunable camera value plus a Save button that
+// writes the current numbers back into the ini. Changes apply instantly
+// (distance/speed globals via the camera watcher, knee curve via its
+// dedicated trampoline floats). CurveInnerExponent still needs a restart.
+struct TuneParam
+{
+	const wchar_t* label;
+	const wchar_t* tip;
+	const wchar_t* section;
+	const wchar_t* iniKey;
+	int minV, maxV;
+	int div; // 1 = plain integer, 10 = slider holds value*10 (shown/saved with one decimal)
+	volatile int* value;
+};
+
+static int g_tuneKneePos = 90, g_tuneKneeSpd = 40, g_tuneSat = 85;
+static int g_tuneInnerX10 = 20, g_tuneFovPct = 0;
+static TuneParam g_tuneParams[] = {
+	{ L"Camera distance",
+	  L"How far the camera sits from your character while exploring. Lower = farther away; negative values go beyond the launcher's \"Far\".",
+	  L"Camera", L"FreeCameraDistance",       -500, 300,  1, reinterpret_cast<volatile int*>(&g_camFree) },
+	{ L"Camera distance (lock-on)",
+	  L"Same as above, but while locked onto an enemy.",
+	  L"Camera", L"LockCameraDistance",       -500, 300,  1, reinterpret_cast<volatile int*>(&g_camLock) },
+	{ L"Turn speed \x2014 pad %",
+	  L"Fastest left/right camera speed on the gamepad, as % of the game's default (100 = unchanged).",
+	  L"Camera", L"PadTurnSpeedPercent",        10, 300,  1, reinterpret_cast<volatile int*>(&g_padTurnPct) },
+	{ L"Turn speed \x2014 mouse %",
+	  L"Fastest left/right camera speed with the mouse, as % of the game's default.",
+	  L"Camera", L"MouseTurnSpeedPercent",      10, 300,  1, reinterpret_cast<volatile int*>(&g_mouseTurnPct) },
+	{ L"Turn speed \x2014 up/down %",
+	  L"Fastest up/down camera speed (pad and mouse), as % of the game's default.",
+	  L"Camera", L"VerticalTurnSpeedPercent",    5, 200,  1, reinterpret_cast<volatile int*>(&g_vertTurnPct) },
+	{ L"Slow zone size %",
+	  L"How much of the stick's travel stays slow and precise. Example: 90 means the first 90% of the tilt is the calm zone, and only the last 10% ramps up to full speed.",
+	  L"Camera", L"CurveKneeDeflection",         5,  95,  1, reinterpret_cast<volatile int*>(&g_tuneKneePos) },
+	{ L"Slow zone speed %",
+	  L"Camera speed at the edge of the slow zone, as % of maximum. Lower = calmer, more precise aiming inside the zone.",
+	  L"Camera", L"CurveKneeSpeed",              1,  99,  1, reinterpret_cast<volatile int*>(&g_tuneKneeSpd) },
+	{ L"Start smoothness (1-3)",
+	  L"How gently the camera starts moving near the stick center: 1 = even response, 3 = very soft start (tiny tilts barely move the camera). Fractions like 2.5 work.",
+	  L"Camera", L"CurveInnerExponent",         10,  30, 10, reinterpret_cast<volatile int*>(&g_tuneInnerX10) },
+	{ L"Full-tilt threshold %",
+	  L"Stick tilt that already counts as 100%. Real pads don't reach the full range on diagonals \x2014 lowering this keeps slightly-off-axis tilts at full speed.",
+	  L"Camera", L"CurveSaturation",            50, 100,  1, reinterpret_cast<volatile int*>(&g_tuneSat) },
+	{ L"FOV boost when turning %",
+	  L"Widens the view a little while the camera spins fast, for a modern sense of speed. 0 = off.",
+	  L"Camera", L"DynamicFOVPercent",           0,  30,  1, reinterpret_cast<volatile int*>(&g_dynFovPct) },
+	{ L"FOV boost looking up/down %",
+	  L"Widens the view as you tilt the camera steeply up or down. 0 = off.",
+	  L"Camera", L"PitchFOVPercent",             0, 100,  1, reinterpret_cast<volatile int*>(&g_pitchFovPct) },
+	{ L"Field of view %",
+	  L"Base field of view. 100 = the game's original.",
+	  L"FOV",    L"FOVPercentage",              60, 150,  1, reinterpret_cast<volatile int*>(&g_tuneFovPct) },
+};
+const int TUNE_COUNT = sizeof(g_tuneParams) / sizeof(g_tuneParams[0]);
+static HWND g_tuneSliders[TUNE_COUNT];
+static HWND g_tuneLabels[TUNE_COUNT];
+static HWND g_tuneEdits[TUNE_COUNT];
+
+static void TuneApplyLive()
+{
+	if (g_kneeKPtr)
+	{
+		const float k = g_tuneKneePos / 100.0f;
+		const float s = g_tuneKneeSpd / 100.0f;
+		const float b = (1.0f - s) / (1.0f - k);
+		float c = s - k * b;
+		if (c > -1e-4f && c < 1e-4f)
+			c = -1e-4f;
+		float c1, c2, c3;
+		KneeInnerCoeffs(k, s, g_tuneInnerX10, &c1, &c2, &c3);
+		*g_kneeC1Ptr = c1;
+		*g_kneeC2Ptr = c2;
+		*g_kneeC3Ptr = c3;
+		*g_kneeBPtr = b;
+		*g_kneeCPtr = c;
+		*g_kneeKPtr = k;
+		*g_satMulPtr = 100.0f / g_tuneSat;
+	}
+	if (g_fovMulPtr && g_tuneFovPct > 0)
+		g_fovBase = g_tuneFovPct / 100.0f; // the dynamic-FOV worker picks it up
+}
+
+static void TuneSetEditText(int i)
+{
+	wchar_t buf[32];
+	if (g_tuneParams[i].div == 10)
+		swprintf_s(buf, L"%.1f", *g_tuneParams[i].value / 10.0f);
+	else
+		swprintf_s(buf, L"%d", *g_tuneParams[i].value);
+	SetWindowTextW(g_tuneEdits[i], buf);
+}
+
+//Typed value: parse, clamp to the slider range, apply like a slider move
+static void TuneApplyEdit(int i)
+{
+	wchar_t buf[32];
+	GetWindowTextW(g_tuneEdits[i], buf, 32);
+	const float f = static_cast<float>(_wtof(buf));
+	int v = static_cast<int>(f * g_tuneParams[i].div + (f >= 0 ? 0.5f : -0.5f));
+	if (v < g_tuneParams[i].minV) v = g_tuneParams[i].minV;
+	if (v > g_tuneParams[i].maxV) v = g_tuneParams[i].maxV;
+	*g_tuneParams[i].value = v;
+	SendMessageW(g_tuneSliders[i], TBM_SETPOS, TRUE, v);
+	TuneApplyLive();
+	TuneSetEditText(i);
+}
+
+static LRESULT CALLBACK TuneEditProc(HWND h, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR ref)
+{
+	if (msg == WM_KEYDOWN && wp == VK_RETURN)
+	{
+		TuneApplyEdit(static_cast<int>(ref));
+		SendMessageW(h, EM_SETSEL, 0, -1);
+		return 0;
+	}
+	if (msg == WM_CHAR && wp == L'\r') // swallow the beep
+		return 0;
+	return DefSubclassProc(h, msg, wp, lp);
+}
+
+static LRESULT CALLBACK TuneWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+	switch (msg)
+	{
+	case WM_HSCROLL:
+		for (int i = 0; i < TUNE_COUNT; i++)
+		{
+			if (reinterpret_cast<HWND>(lp) == g_tuneSliders[i])
+			{
+				*g_tuneParams[i].value = static_cast<int>(SendMessageW(g_tuneSliders[i], TBM_GETPOS, 0, 0));
+				TuneSetEditText(i);
+			}
+		}
+		TuneApplyLive();
+		return 0;
+	case WM_COMMAND:
+		if (HIWORD(wp) == EN_KILLFOCUS && LOWORD(wp) >= 2000 && LOWORD(wp) < 2000 + TUNE_COUNT)
+			TuneApplyEdit(LOWORD(wp) - 2000);
+		else if (LOWORD(wp) == 1000) // Save
+		{
+			wchar_t buf[32];
+			for (int i = 0; i < TUNE_COUNT; i++)
+			{
+				if (g_tuneParams[i].div == 10)
+					swprintf_s(buf, L"%.1f", *g_tuneParams[i].value / 10.0f);
+				else
+					swprintf_s(buf, L"%d", *g_tuneParams[i].value);
+				WritePrivateProfileStringW(g_tuneParams[i].section, g_tuneParams[i].iniKey, buf, wcModulePath);
+			}
+			SetWindowTextW(hwnd, L"FFT0HD Camera Tuner - saved!");
+			LogF("[Tuner] settings saved to ini");
+		}
+		return 0;
+	case WM_CLOSE:
+		ShowWindow(hwnd, SW_MINIMIZE);
+		return 0;
+	}
+	return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+static void StartTuneWindow()
+{
+	if (!g_tuneWindow)
+		return;
+	std::thread([] {
+		INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_BAR_CLASSES | ICC_WIN95_CLASSES };
+		InitCommonControlsEx(&icc);
+		WNDCLASSW wc = {};
+		wc.lpfnWndProc = TuneWndProc;
+		wc.hInstance = GetModuleHandleW(nullptr);
+		wc.lpszClassName = L"FFT0HDTuner";
+		wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
+		wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+		RegisterClassW(&wc);
+		const int rowH = 52;
+		HWND hwnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, L"FFT0HDTuner", L"FFT0HD Camera Tuner",
+			WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, 40, 40, 340, TUNE_COUNT * rowH + 90, nullptr, nullptr, wc.hInstance, nullptr);
+		const HFONT font = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+		HWND tips = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr, WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
+			CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, hwnd, nullptr, wc.hInstance, nullptr);
+		SendMessageW(tips, TTM_SETMAXTIPWIDTH, 0, 320);
+		SendMessageW(tips, TTM_SETDELAYTIME, TTDT_AUTOPOP, 30000); // keep tips up long enough to read
+		auto addTip = [&](HWND ctl, const wchar_t* text) {
+			TOOLINFOW ti = {};
+			ti.cbSize = sizeof(ti);
+			ti.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
+			ti.hwnd = hwnd;
+			ti.uId = reinterpret_cast<UINT_PTR>(ctl);
+			ti.lpszText = const_cast<wchar_t*>(text);
+			SendMessageW(tips, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&ti));
+		};
+		for (int i = 0; i < TUNE_COUNT; i++)
+		{
+			g_tuneLabels[i] = CreateWindowExW(0, L"STATIC", g_tuneParams[i].label, WS_CHILD | WS_VISIBLE | SS_NOTIFY,
+				12, 10 + i * rowH, 228, 18, hwnd, nullptr, wc.hInstance, nullptr);
+			g_tuneEdits[i] = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_RIGHT,
+				248, 7 + i * rowH, 68, 20, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(2000 + i)), wc.hInstance, nullptr);
+			g_tuneSliders[i] = CreateWindowExW(0, TRACKBAR_CLASSW, L"", WS_CHILD | WS_VISIBLE | TBS_HORZ,
+				8, 28 + i * rowH, 308, 22, hwnd, nullptr, wc.hInstance, nullptr);
+			SendMessageW(g_tuneSliders[i], TBM_SETRANGE, TRUE, MAKELPARAM(g_tuneParams[i].minV, g_tuneParams[i].maxV));
+			int v = *g_tuneParams[i].value;
+			if (v < g_tuneParams[i].minV) v = g_tuneParams[i].minV;
+			if (v > g_tuneParams[i].maxV) v = g_tuneParams[i].maxV;
+			SendMessageW(g_tuneSliders[i], TBM_SETPOS, TRUE, v);
+			SendMessageW(g_tuneLabels[i], WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+			SendMessageW(g_tuneEdits[i], WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+			SetWindowSubclass(g_tuneEdits[i], TuneEditProc, 1, i);
+			TuneSetEditText(i);
+			addTip(g_tuneLabels[i], g_tuneParams[i].tip);
+			addTip(g_tuneSliders[i], g_tuneParams[i].tip);
+			addTip(g_tuneEdits[i], g_tuneParams[i].tip);
+		}
+		HWND saveBtn = CreateWindowExW(0, L"BUTTON", L"Save to ini", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
+			90, 12 + TUNE_COUNT * rowH, 150, 30, hwnd, reinterpret_cast<HMENU>(1000), wc.hInstance, nullptr);
+		SendMessageW(saveBtn, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+		ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+		MSG m;
+		while (GetMessageW(&m, nullptr, 0, 0) > 0)
+		{
+			TranslateMessage(&m);
+			DispatchMessageW(&m);
+		}
+	}).detach();
+}
+
 static void PressKey(WORD vk)
 {
 	INPUT in = {};
@@ -537,8 +921,8 @@ HMODULE hDLLKeystone;
 constexpr float SIXTEENBYNINE = 16.0f / 9.0f;
 const uint8_t ALLOCATED_FLOATS = 30;
 const uint8_t CONSTANTS_ARRAY_SIZE = 5;
-const uint8_t POINTERS_ARRAY_SIZE = 5;
-const uint8_t FLOATS_ARRAY_SIZE = 5;
+const uint8_t POINTERS_ARRAY_SIZE = 10;
+const uint8_t FLOATS_ARRAY_SIZE = 10;
 
 Trampoline* trampoline;
 float* floatpointers;
@@ -1069,17 +1453,214 @@ void OnInitializeHook()
 			param_floats[0] = 30.0f / framerate;
 			ParametricASMJump("mulss xmm1, xmm8; mulss xmm1, %0", match, 0x5, 0xA);
 
+			//Stick response curve override ([Camera] TurnCurveExponent, 1..4).
+			//Stock game: pad axes use deflection^2, mouse axes are linear. The
+			//curve is applied where |stick| turns into rotation speed, at the
+			//same spots the framerate fixes below already patch (horizontal)
+			//plus two new injections for the vertical axis.
+			int curveExp = GetPrivateProfileIntW(L"Camera", L"TurnCurveExponent", 0, wcModulePath);
+			if (curveExp > 4)
+				curveExp = 4;
+			//Radial mode applies the curve to the stick vector LENGTH instead of
+			//each axis separately, so diagonals aren't penalized twice (the pad
+			//stick is circular: a diagonal gives each axis only ~0.7 deflection).
+			const bool radialCurve = GetPrivateProfileIntW(L"Camera", L"RadialCurve", 0, wcModulePath) != 0;
+			if (radialCurve && curveExp > 3)
+				curveExp = 3;
+			//Knee curve (pad only, implies radial): piecewise response — up to
+			//CurveKneeDeflection% of stick travel the speed rises linearly to
+			//CurveKneeSpeed% of maximum, the remaining travel ramps to 100%.
+			//E.g. 80/50: first 80% of deflection = 0..50% speed, last 20% = 50..100%.
+			int kneePos = GetPrivateProfileIntW(L"Camera", L"CurveKneeDeflection", 0, wcModulePath);
+			int kneeSpd = GetPrivateProfileIntW(L"Camera", L"CurveKneeSpeed", 50, wcModulePath);
+			const bool kneeCurve = kneePos >= 5 && kneePos <= 95;
+			float kneeB = 0, kneeC = 0, kneeK = 0;
+			//Real pads don't reach the full ±255 off the cardinal axes (measured
+			//~218 at diagonals) — treat CurveSaturation% of the range as "full"
+			//so slight tilts off an axis don't fall below the knee.
+			int satPct = GetPrivateProfileIntW(L"Camera", L"CurveSaturation", 85, wcModulePath);
+			if (satPct < 50) satPct = 50;
+			if (satPct > 100) satPct = 100;
+			//Shape of the segment below the knee: 1 = linear, 3 = very eased
+			//start; fractional values (e.g. 2.4) blend the two nearest powers
+			wchar_t expBuf[32];
+			GetPrivateProfileStringW(L"Camera", L"CurveInnerExponent", L"2", expBuf, 32, wcModulePath);
+			float innerExpF = static_cast<float>(_wtof(expBuf));
+			if (innerExpF < 1.0f) innerExpF = 1.0f;
+			if (innerExpF > 3.0f) innerExpF = 3.0f;
+			if (kneeCurve)
+			{
+				if (kneeSpd < 1) kneeSpd = 1;
+				if (kneeSpd > 99) kneeSpd = 99;
+				kneeK = kneePos / 100.0f;
+				const float s = kneeSpd / 100.0f;
+				kneeB = (1.0f - s) / (1.0f - kneeK);    // slope above the knee
+				kneeC = s - kneeK * kneeB;              // f(mag) = B + C/mag above the knee
+				if (kneeC > -1e-4f && kneeC < 1e-4f)
+					kneeC = -1e-4f;
+				g_tuneInnerX10 = static_cast<int>(innerExpF * 10.0f + 0.5f);
+				float kc1, kc2, kc3;
+				KneeInnerCoeffs(kneeK, s, g_tuneInnerX10, &kc1, &kc2, &kc3);
+				//dedicated (non-deduplicated) slots so the tuner window can
+				//rewrite the curve live without touching shared constants
+				auto pk = trampoline->Pointer<float>(); *pk = kneeK; g_kneeKPtr = pk;
+				auto pc = trampoline->Pointer<float>(); *pc = kneeC; g_kneeCPtr = pc;
+				auto pb = trampoline->Pointer<float>(); *pb = kneeB; g_kneeBPtr = pb;
+				auto p1 = trampoline->Pointer<float>(); *p1 = kc1; g_kneeC1Ptr = p1;
+				auto p2 = trampoline->Pointer<float>(); *p2 = kc2; g_kneeC2Ptr = p2;
+				auto p3 = trampoline->Pointer<float>(); *p3 = kc3; g_kneeC3Ptr = p3;
+				auto ps = trampoline->Pointer<float>(); *ps = 100.0f / satPct; g_satMulPtr = ps;
+				g_tuneKneePos = kneePos;
+				g_tuneKneeSpd = kneeSpd;
+				g_tuneSat = satPct;
+				LogF("[Camera] knee curve: %d%% deflection -> %d%% speed (inner exp %.1f)", kneePos, kneeSpd, innerExpF);
+			}
+			else if (curveExp > 0)
+				LogF("[Camera] stick response curve exponent = %d%s", curveExp, radialCurve ? " (radial)" : "");
+
 			//Fix controller camera speed (orbital) for controller
+			//At the injection point xmm7 already holds deflection^2 (stock pad
+			//curve); sqrtss recovers |x| to build other exponents from it.
 			match = FindOne("C7 F3 0F 59 C7 0F 28 F8 F3 0F 59 3D AC 2D 32 00");
 			param_floats[0] = 30.0f / framerate;
 			pointers[0] = baseaddress + 0x61141C;
-			ParametricASMJump("mulss xmm7, dword ptr [rip + ?0]; mulss xmm7, %0", match, 0x8, 0x10);
+			{
+				std::string curveasm;
+				if (kneeCurve)
+				{
+					//Circle-to-square remap + knee curve. Effective per-axis
+					//deflection e = |x| * mag / max(|x|,|y|) (a full diagonal
+					//counts as full deflection on BOTH axes), then the knee
+					//shape: speed = e * f(e); f = B + C/e above the knee,
+					//below it f = c1 + c2*e + c3*e^2 (live inner exponent).
+					param_floats[1] = 255.0f;
+					param_floats[2] = 1.0f;
+					param_floats[7] = 1e-6f;
+					pointers[1] = baseaddress + 0x638B2C;
+					pointers[2] = reinterpret_cast<uintptr_t>(g_kneeKPtr);
+					pointers[3] = reinterpret_cast<uintptr_t>(g_kneeCPtr);
+					pointers[4] = reinterpret_cast<uintptr_t>(g_kneeBPtr);
+					pointers[5] = reinterpret_cast<uintptr_t>(g_kneeC1Ptr);
+					pointers[6] = reinterpret_cast<uintptr_t>(g_satMulPtr);
+					pointers[7] = reinterpret_cast<uintptr_t>(g_kneeC2Ptr);
+					pointers[8] = reinterpret_cast<uintptr_t>(g_kneeC3Ptr);
+					curveasm =
+						"movd xmm0, dword ptr [rip + ?1]; cvtdq2ps xmm0, xmm0; divss xmm0, %1; mulss xmm0, xmm0; "
+						"sub rsp, 0x10; movss dword ptr [rsp], xmm0; "
+						"addss xmm0, xmm7; minss xmm0, %2; sqrtss xmm0, xmm0; movss dword ptr [rsp + 4], xmm0; "
+						"movss xmm0, dword ptr [rsp]; maxss xmm0, xmm7; sqrtss xmm0, xmm0; maxss xmm0, %7; "
+						"sqrtss xmm7, xmm7; mulss xmm7, dword ptr [rsp + 4]; divss xmm7, xmm0; mulss xmm7, dword ptr [rip + ?6]; minss xmm7, %2; "
+						"comiss xmm7, dword ptr [rip + ?2]; jbe L; rcpss xmm0, xmm7; mulss xmm0, dword ptr [rip + ?3]; addss xmm0, dword ptr [rip + ?4]; jmp M; "
+						"L: movss xmm0, dword ptr [rip + ?8]; mulss xmm0, xmm7; addss xmm0, dword ptr [rip + ?7]; mulss xmm0, xmm7; addss xmm0, dword ptr [rip + ?5]; "
+						"M: mulss xmm7, xmm0; add rsp, 0x10; ";
+				}
+				else if (radialCurve && curveExp >= 1)
+				{
+					//xmm7 = x_norm^2 at the injection point; bring in the other
+					//axis, build mag^2 = x^2+y^2 (clamped to 1), then
+					//speed = |x| * mag^(exp-1)
+					param_floats[1] = 255.0f;
+					param_floats[2] = 1.0f;
+					pointers[1] = baseaddress + 0x638B2C;
+					curveasm = "movd xmm0, dword ptr [rip + ?1]; cvtdq2ps xmm0, xmm0; divss xmm0, %1; mulss xmm0, xmm0; addss xmm0, xmm7; minss xmm0, %2; sqrtss xmm7, xmm7; ";
+					if (curveExp == 2)
+						curveasm += "sqrtss xmm0, xmm0; ";
+					if (curveExp >= 2)
+						curveasm += "mulss xmm7, xmm0; ";
+				}
+				else if (curveExp == 1)
+					curveasm = "sqrtss xmm7, xmm7; ";
+				else if (curveExp == 3)
+					curveasm = "sqrtss xmm0, xmm7; mulss xmm7, xmm0; ";
+				else if (curveExp == 4)
+					curveasm = "mulss xmm7, xmm7; ";
+				curveasm += "mulss xmm7, dword ptr [rip + ?0]; mulss xmm7, %0";
+				ParametricASMJump(curveasm.c_str(), match, 0x8, 0x10);
+			}
 
-			//Same as above but for mouse
+			//Same as above but for mouse (stock linear; xmm7 holds |x| here)
 			match = FindOne("F3 0F 59 3D 9E 2D 32 00 80 3D 0A AA 36 00");
 			param_floats[0] = log(framerate) / log(30.0f);
 			pointers[0] = baseaddress + 0x611418;
-			ParametricASMJump("mulss xmm7, dword ptr [rip + ?0]; mulss xmm7, %0", match, 0, 0x8);
+			{
+				std::string curveasm;
+				if (curveExp >= 2)
+				{
+					curveasm = "movaps xmm0, xmm7; ";
+					for (int i = 1; i < curveExp; i++)
+						curveasm += "mulss xmm7, xmm0; ";
+				}
+				curveasm += "mulss xmm7, dword ptr [rip + ?0]; mulss xmm7, %0";
+				ParametricASMJump(curveasm.c_str(), match, 0, 0x8);
+			}
+
+			//Vertical axis response curve (no framerate fix needed here, but the
+			//same ini exponent is applied; xmm1 holds |y|, pad path squares it,
+			//mouse path is linear times the mouse speed global)
+			if (curveExp > 0 || kneeCurve)
+			{
+				match = FindOne("84 C9 75 0A F3 0F 59 C9 F3 0F 59 D1 EB 10 F3 0F 10 05 ? ? ? ? F3 0F 59 C1 F3 0F 59 D0");
+				{
+					std::string curveasm;
+					if (kneeCurve)
+					{
+						param_floats[0] = 255.0f;
+						param_floats[1] = 1.0f;
+						param_floats[2] = 1e-6f;
+						pointers[0] = baseaddress + 0x638B28;
+						pointers[1] = reinterpret_cast<uintptr_t>(g_kneeKPtr);
+						pointers[2] = reinterpret_cast<uintptr_t>(g_kneeCPtr);
+						pointers[3] = reinterpret_cast<uintptr_t>(g_kneeBPtr);
+						pointers[4] = reinterpret_cast<uintptr_t>(g_kneeC1Ptr);
+						pointers[5] = reinterpret_cast<uintptr_t>(g_satMulPtr);
+						pointers[6] = reinterpret_cast<uintptr_t>(g_kneeC2Ptr);
+						pointers[7] = reinterpret_cast<uintptr_t>(g_kneeC3Ptr);
+						curveasm =
+							"movaps xmm6, xmm1; mulss xmm6, xmm6; "
+							"movd xmm0, dword ptr [rip + ?0]; cvtdq2ps xmm0, xmm0; divss xmm0, %0; mulss xmm0, xmm0; "
+							"sub rsp, 0x10; movss dword ptr [rsp], xmm0; "
+							"addss xmm0, xmm6; minss xmm0, %1; sqrtss xmm0, xmm0; movss dword ptr [rsp + 4], xmm0; "
+							"movss xmm0, dword ptr [rsp]; maxss xmm0, xmm6; sqrtss xmm0, xmm0; maxss xmm0, %2; "
+							"mulss xmm1, dword ptr [rsp + 4]; divss xmm1, xmm0; mulss xmm1, dword ptr [rip + ?5]; minss xmm1, %1; "
+							"comiss xmm1, dword ptr [rip + ?1]; jbe L; rcpss xmm0, xmm1; mulss xmm0, dword ptr [rip + ?2]; addss xmm0, dword ptr [rip + ?3]; jmp M; "
+							"L: movss xmm0, dword ptr [rip + ?7]; mulss xmm0, xmm1; addss xmm0, dword ptr [rip + ?6]; mulss xmm0, xmm1; addss xmm0, dword ptr [rip + ?4]; "
+							"M: mulss xmm1, xmm0; add rsp, 0x10; ";
+					}
+					else if (radialCurve)
+					{
+						//xmm1 = |y|; xmm6 is scratch here (cleared right after
+						//this block by the game). speed = |y| * mag^(exp-1)
+						param_floats[0] = 255.0f;
+						param_floats[1] = 1.0f;
+						pointers[0] = baseaddress + 0x638B28;
+						curveasm = "movaps xmm6, xmm1; mulss xmm6, xmm6; movd xmm0, dword ptr [rip + ?0]; cvtdq2ps xmm0, xmm0; divss xmm0, %0; mulss xmm0, xmm0; addss xmm0, xmm6; minss xmm0, %1; ";
+						if (curveExp == 2)
+							curveasm += "sqrtss xmm0, xmm0; ";
+						if (curveExp >= 2)
+							curveasm += "mulss xmm1, xmm0; ";
+					}
+					else if (curveExp >= 2)
+					{
+						curveasm = "movaps xmm0, xmm1; ";
+						for (int i = 1; i < curveExp; i++)
+							curveasm += "mulss xmm1, xmm0; ";
+					}
+					curveasm += "mulss xmm2, xmm1";
+					ParametricASMJump(curveasm.c_str(), match, 0x4, 0xC);
+				}
+				{
+					pointers[0] = baseaddress + 0x611418;
+					std::string curveasm;
+					if (curveExp >= 2)
+					{
+						curveasm = "movaps xmm0, xmm1; ";
+						for (int i = 1; i < curveExp; i++)
+							curveasm += "mulss xmm1, xmm0; ";
+					}
+					curveasm += "movss xmm0, dword ptr [rip + ?0]; mulss xmm0, xmm1; mulss xmm2, xmm0";
+					ParametricASMJump(curveasm.c_str(), match, 0xE, 0x1A);
+				}
+			}
 
 			//Fix controller camera speed (when transitioning to lock-on)
 			match = FindOne("FF F3 44 0F 10 1D 42 F6 31 00 F3 41 0F 59 C3 44");
@@ -1507,10 +2088,22 @@ void OnInitializeHook()
 			*keepcutscenefov = GetPrivateProfileIntW(L"FOV", L"KeepCutsceneFOV", 1, wcModulePath);
 
 			match = FindOne("0F 59 35 45 41 1D 00 44 0F 29 50 A8 44 0F 29 58");
-			param_floats[0] = fovoverride;
+			auto fovmul = trampoline->Pointer<float>();
+			*fovmul = fovoverride;
 			pointers[0] = reinterpret_cast<uintptr_t>(keepcutscenefov);
 			pointers[1] = baseaddress + 0x658F70;
-			ParametricASMJump("movaps xmmword ptr [rax - 0x58], xmm10; cmp byte ptr [rip + ?0], 1; jnz A; cmp dword ptr [rip + ?1], 1; jz B; A: mulss xmm6, %0; B: nop", match, 0x7, 0xC);
+			pointers[2] = reinterpret_cast<uintptr_t>(fovmul);
+			ParametricASMJump("movaps xmmword ptr [rax - 0x58], xmm10; cmp byte ptr [rip + ?0], 1; jnz A; cmp dword ptr [rip + ?1], 1; jz B; A: mulss xmm6, dword ptr [rip + ?2]; B: nop", match, 0x7, 0xC);
+			const int dynFov = GetPrivateProfileIntW(L"Camera", L"DynamicFOVPercent", 0, wcModulePath);
+			g_pitchFovPct = GetPrivateProfileIntW(L"Camera", L"PitchFOVPercent", 0, wcModulePath);
+			g_fovMulPtr = fovmul;
+			g_fovBase = fovoverride;
+			g_tuneFovPct = static_cast<int>(fovoverride * 100.0f + 0.5f);
+			if (dynFov > 0)
+			{
+				g_dynFovPct = dynFov;
+				LogF("[Camera] dynamic FOV: +%d%% at full turn speed", dynFov);
+			}
 		}
 
 		LogF("=== FFT0HD Unlocker init done ===");
@@ -1524,11 +2117,26 @@ void OnInitializeHook()
 		StartMovieTraceWatcher();
 		StartIntroSkipWatcher();
 		g_autoSkipSplash = GetPrivateProfileIntW(L"Intro", L"AutoSkipSplash", 0, wcModulePath) != 0;
+		g_camFree = GetPrivateProfileIntW(L"Camera", L"FreeCameraDistance", -9999, wcModulePath);
+		g_camLock = GetPrivateProfileIntW(L"Camera", L"LockCameraDistance", -9999, wcModulePath);
+		g_padTurnPct = GetPrivateProfileIntW(L"Camera", L"PadTurnSpeedPercent", -1, wcModulePath);
+		g_mouseTurnPct = GetPrivateProfileIntW(L"Camera", L"MouseTurnSpeedPercent", -1, wcModulePath);
+		g_vertTurnPct = GetPrivateProfileIntW(L"Camera", L"VerticalTurnSpeedPercent", -1, wcModulePath);
+		if (g_camFree != -9999 || g_camLock != -9999 || g_padTurnPct >= 0 || g_mouseTurnPct >= 0 || g_vertTurnPct >= 0)
+			LogF("[Camera] overrides: free=%d lock=%d padTurn=%d%% mouseTurn=%d%% vertTurn=%d%%", g_camFree, g_camLock, g_padTurnPct, g_mouseTurnPct, g_vertTurnPct);
+		g_tuneWindow = GetPrivateProfileIntW(L"Camera", L"TuneWindow", 0, wcModulePath) != 0;
+		StartCameraWatcher();
+		StartDynamicFovWatcher();
+		StartTuneWindow();
 		StartBootAutoSkipWatcher();
 		if (GetPrivateProfileIntW(L"Diagnostics", L"BootScan", 0, wcModulePath) != 0)
 			StartBootScanWatcher();
 		if (GetPrivateProfileIntW(L"Diagnostics", L"BootTrace", 0, wcModulePath) != 0)
 			StartBootTraceWatcher();
+		if (GetPrivateProfileIntW(L"Diagnostics", L"TraceSticks", 0, wcModulePath) != 0)
+			StartStickTraceWatcher();
+		if (GetPrivateProfileIntW(L"Diagnostics", L"TracePitch", 0, wcModulePath) != 0)
+			StartPitchTraceWatcher();
 
 		} // end try
 		catch (const std::exception& e)

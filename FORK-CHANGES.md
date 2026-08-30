@@ -18,6 +18,27 @@ SkipIntroVideos=1   ; don't play the two opening movies
 AutoSkipSplash=1    ; auto-confirm the autosave notice and flip through the logo screens
 ```
 
+## Modern camera
+
+The stock camera turns at one constant speed and can't be tuned per axis — it feels stiff,
+like the PSP game it came from. The `[Camera]` ini section makes it behave like a modern
+third-person game:
+
+- **Camera distance** beyond the launcher's "Far" (separately for normal play and lock-on).
+- **Separate turn speeds** for left/right and up/down (the game shares one speed for both).
+- **Stick response curve**: most of the stick travel is a calm, precise "slow zone", the last
+  bit ramps to full speed — with adjustable zone size, zone speed and start smoothness.
+  Diagonals count as full deflection on both axes, so circling a target feels right.
+- **Dynamic field of view**: the view widens slightly during fast turns and when looking
+  steeply up or down, which adds a lot to the modern feel.
+- **Live tuning window** (`TuneWindow=1`): a small always-on-top window with a slider for
+  every value above — drag or type a number, see the result instantly in-game, hover a
+  slider for a plain-language explanation, then hit "Save to ini". Works best with the game
+  in windowed or borderless mode.
+
+The shipped defaults are tuned for a **gamepad**. Mouse players: the defaults leave the mouse
+mostly stock — open the tuning window and pick your own numbers.
+
 ## The game no longer crashes silently on startup
 
 With the original mod, if your game version was slightly different from the one the mod expects,
@@ -55,9 +76,12 @@ Same as the original (`premake5 vs20xx`, build the `Master` configuration). Note
 
 Форк мода Banz99 для FF Type-0 HD. Всё из оригинала работает как раньше. Добавлено:
 пропуск всего вступления (уведомление, логотипы, 6 минут роликов — секция `[Intro]` в ini),
-защита от молчаливых вылетов на неожиданных версиях игры (+ лог-файл с причиной),
-исправлены тайминги на высоких fps: наложение катсцен, спешащие постановочные сцены
-и губы персонажей на 120 fps.
+современная камера (секция `[Camera]`: дистанция дальше «Far», раздельные скорости осей,
+кривая отклика стика как в современных шутерах, динамический FOV от скорости поворота и
+наклона, окно живой настройки поверх игры с кнопкой сохранения — `TuneWindow=1`; настройки
+по умолчанию подобраны под геймпад), защита от молчаливых вылетов на неожиданных версиях
+игры (+ лог-файл с причиной), исправлены тайминги на высоких fps: наложение катсцен,
+спешащие постановочные сцены и губы персонажей на 120 fps.
 
 ## Credits
 

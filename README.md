@@ -1,10 +1,15 @@
-# Remove rendering limitations from Final Fantasy Type 0 HD on PC!
+# FF Type-0 HD Toolbox
 
-> **This is a fork.** The original mod — and all the hard reverse-engineering work behind it — is by
-> [Banz99](https://github.com/Banz99/Final-Fantasy-Type-0-Hd-Unlocker). This fork keeps everything
-> the original does and adds intro skipping, high-framerate timing fixes and more —
-> see [FORK-CHANGES.md](FORK-CHANGES.md) for a plain-language list. Everything below is the
-> original README.
+Quality-of-life toolbox for Final Fantasy Type-0 HD on PC: custom resolution and framerate,
+FOV control, full intro skip, a modern tunable camera, analog movement speed and
+high-framerate timing fixes. One .asi plugin, no game files touched.
+
+> **Built on the work of [Banz99](https://github.com/Banz99/Final-Fantasy-Type-0-Hd-Unlocker).**
+> This project began as a fork of his FFT0HD Unlocker, which did the hard reverse-engineering
+> for resolution, framerate and FOV — everything it does still works exactly the same here.
+> See [FORK-CHANGES.md](FORK-CHANGES.md) for a plain-language list of what the toolbox adds
+> (intro skip, modern camera, analog movement, timing fixes, crash protection).
+> Everything below is the original README.
 
 ## Resolution
 

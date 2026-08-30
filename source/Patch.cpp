@@ -12,6 +12,7 @@
 #include <stdexcept>
 #include <thread>
 #include <commctrl.h>
+#include <tlhelp32.h>
 #pragma comment(lib, "Comctl32.lib")
 #include "Utils/Trampoline.h"
 #include "include/keystone/keystone.h"
@@ -416,6 +417,629 @@ static void StartPitchTraceWatcher()
 	}).detach();
 }
 
+// Movement telemetry ([Diagnostics] TraceMove=1): groundwork for analog
+// movement speed. Logs the left stick, the controlled character's current
+// mover speed, the walk-toggle tier counter (its holder object is captured
+// by a hook on the L3 handler), and any change in the static per-player
+// control-state block at base+0x658CE0..0x658D80. The 3-minute window starts
+// only once the player actor exists (i.e. after a save is loaded).
+// Protocol: stand still; tilt the left stick slightly and hold; tilt fully
+// and hold; then press L3 and move at each of the three speed tiers.
+static volatile uint64_t* g_moveCtxCell = nullptr;
+// Ring of {caller return address, mover ptr, speed} captured by hooks on the
+// two mover-speed setter sites, to find who applies the walk/run tier speeds.
+static volatile uint8_t* g_spdRing = nullptr;
+static volatile uint32_t* g_spdHead = nullptr;
+// counts the field action processor accepting a walk-toggle press (the real path)
+static volatile uint32_t* g_toggleAcceptCell = nullptr;
+// per-call-site "button check returned true" counters inside the field action
+// processor fn 0x1402d9240 - one of these sites is the walk toggle
+static volatile uint32_t* g_chkCells[9] = {};
+static void StartMoveTraceWatcher()
+{
+	if (!g_logEnabled || !g_gameBase)
+		return;
+	std::thread([] {
+		const auto ReadMover = [](uintptr_t* actorOut) -> uintptr_t {
+			*actorOut = 0;
+			const int chan = *reinterpret_cast<volatile int*>(g_gameBase + 0x658CF4);
+			const uintptr_t table = *reinterpret_cast<volatile uintptr_t*>(g_gameBase + 0x667E20);
+			if (!table || chan < 0 || chan > 0x41)
+				return 0;
+			const uintptr_t actor = *reinterpret_cast<volatile uintptr_t*>(table + chan * 8 + 0x18);
+			if (!actor)
+				return 0;
+			*actorOut = actor;
+			const int mi = *reinterpret_cast<volatile signed char*>(actor + 0x364);
+			if (mi < 0 || mi >= 8)
+				return 0;
+			return *reinterpret_cast<volatile uintptr_t*>(actor + 0x2D0 + mi * 0x38);
+		};
+		// arm only once the player is actually in the world
+		const ULONGLONG armDeadline = GetTickCount64() + 15 * 60000ULL;
+		uintptr_t actor = 0;
+		while (GetTickCount64() < armDeadline && ReadMover(&actor) == 0)
+			Sleep(250);
+		LogF("[Move] trace armed (actor=%p)", (void*)actor);
+		const ULONGLONG t0 = GetTickCount64();
+		uint32_t prevWin[40] = {};
+		bool havePrev = false;
+		int prevSx = 0, prevSy = 0, prevTier = -2;
+		float prevSpd = -2.0f;
+		uintptr_t prevActor = 0, prevMover = 0;
+		ULONGLONG lastLine = 0;
+		while (GetTickCount64() - t0 < 180000)
+		{
+			Sleep(100);
+			const ULONGLONG now = GetTickCount64() - t0;
+			const int sx = *reinterpret_cast<volatile int*>(g_gameBase + 0x638B20);
+			const int sy = *reinterpret_cast<volatile int*>(g_gameBase + 0x638B24);
+			float spd = -1.0f, spdmax = -1.0f;
+			const uintptr_t mover = ReadMover(&actor);
+			if (mover)
+			{
+				spd = *reinterpret_cast<volatile float*>(mover + 0x78);
+				spdmax = *reinterpret_cast<volatile float*>(mover + 0x488);
+			}
+			int tier = -1;
+			const uint64_t ctx = g_moveCtxCell ? *g_moveCtxCell : 0;
+			if (ctx)
+				tier = *reinterpret_cast<volatile int*>(static_cast<uintptr_t>(ctx) + 0x170);
+			uint32_t win[40];
+			for (int i = 0; i < 40; i++)
+				win[i] = *reinterpret_cast<volatile uint32_t*>(g_gameBase + 0x658CE0 + i * 4);
+			if (actor != prevActor || mover != prevMover)
+			{
+				LogF("[Move +%llu] actor=%p mover=%p", now, (void*)actor, (void*)mover);
+				prevActor = actor; prevMover = mover;
+			}
+			char delta[1024]; delta[0] = 0; size_t dl = 0;
+			for (int i = 0; i < 40; i++)
+			{
+				if (havePrev && win[i] == prevWin[i])
+					continue;
+				const int n = snprintf(delta + dl, sizeof(delta) - dl, " %X=%X", 0xCE0 + i * 4, win[i]);
+				if (n < 0 || dl + n >= sizeof(delta) - 1)
+					break;
+				dl += n;
+				prevWin[i] = win[i];
+			}
+			const bool stickMoved = (abs(sx - prevSx) > 2) || (abs(sy - prevSy) > 2);
+			if (dl || stickMoved || spd != prevSpd || tier != prevTier || now - lastLine >= 2000)
+			{
+				LogF("[Move +%llu] LS=%d,%d spd=%.3f max=%.3f tier=%d%s%s",
+					now, sx, sy, spd, spdmax, tier, dl ? " st:" : "", delta);
+				prevSx = sx; prevSy = sy; prevSpd = spd; prevTier = tier;
+				lastLine = now;
+				havePrev = true;
+			}
+			// drain the SetSpeed capture ring: log each distinct caller rva, and
+			// again when the (integer) speed it writes changes
+			if (g_spdRing)
+			{
+				static uint64_t seenRva[64];
+				static int seenSpd[64];
+				static int seenCnt = 0;
+				for (int slot = 0; slot < 32; slot++)
+				{
+					const uint64_t ret = *reinterpret_cast<volatile uint64_t*>(g_spdRing + slot * 24);
+					const uint64_t mv = *reinterpret_cast<volatile uint64_t*>(g_spdRing + slot * 24 + 8);
+					const float sv = *reinterpret_cast<volatile float*>(g_spdRing + slot * 24 + 16);
+					if (!ret)
+						continue;
+					const uint64_t rva = ret - g_gameBase;
+					const int svi = static_cast<int>(sv);
+					int k = 0;
+					for (; k < seenCnt; k++)
+						if (seenRva[k] == rva)
+							break;
+					if (k < seenCnt && seenSpd[k] == svi)
+						continue;
+					if (k == seenCnt && seenCnt < 64)
+						seenCnt++;
+					if (k < 64)
+					{
+						seenRva[k] = rva;
+						seenSpd[k] = svi;
+						LogF("[SetSpd +%llu] ret=+0x%llX spd=%.3f mover=%p%s",
+							now, rva, sv, (void*)mv, (mv == mover) ? " PLAYER" : "");
+					}
+				}
+			}
+		}
+		LogF("[Move] trace finished");
+	}).detach();
+	// Fast button-state probe v5: watches the whole virtual-button pressed
+	// array (base+0x658BA0, 96 ids) plus ALL 48 keyboard and 48 pad device
+	// records (24 bytes each) at 125Hz, logging changed bytes. Bytes that
+	// change many ticks in a row (frame counters etc) are muted after 3 ticks.
+	// Also reports the walk-toggle acceptance counter so a real L3 press can
+	// be matched to the exact bytes it flips.
+	std::thread([] {
+		Sleep(3000);
+		const int r1 = *reinterpret_cast<volatile int*>(g_gameBase + 0x6115F8 + 4);
+		const int r2 = *reinterpret_cast<volatile int*>(g_gameBase + 0x611638 + 8);
+		const int r3 = *reinterpret_cast<volatile int*>(g_gameBase + 0x61163C + 8);
+		LogF("[Btn] remaps for id1: 6115F8=%d 611638=%d 61163C=%d", r1, r2, r3);
+		const int NA = 96, NK = 48 * 24, NP = 48 * 24;
+		const int TOT = NA + NK + NP;
+		static uint8_t prev[96 + 48 * 24 * 2];
+		static uint8_t noise[96 + 48 * 24 * 2];
+		memset(noise, 0, sizeof(noise));
+		bool first = true;
+		const ULONGLONG t0 = GetTickCount64();
+		while (GetTickCount64() - t0 < 300000)
+		{
+			Sleep(8);
+			uint8_t cur[96 + 48 * 24 * 2];
+			for (int i = 0; i < NA; i++)
+				cur[i] = *reinterpret_cast<volatile uint8_t*>(g_gameBase + 0x658BA0 + i);
+			for (int i = 0; i < NK; i++)
+				cur[NA + i] = *reinterpret_cast<volatile uint8_t*>(g_gameBase + 0x638080 + i);
+			for (int i = 0; i < NP; i++)
+				cur[NA + NK + i] = *reinterpret_cast<volatile uint8_t*>(g_gameBase + 0x638640 + i);
+			{
+				static uint32_t lastChk[9];
+				uint32_t chk[9];
+				bool moved = false;
+				for (int i = 0; i < 9; i++)
+				{
+					chk[i] = g_chkCells[i] ? *g_chkCells[i] : 0;
+					if (chk[i] != lastChk[i])
+						moved = true;
+				}
+				if (moved)
+				{
+					LogF("[Btn +%llu] chk=%u,%u,%u,%u,%u,%u,%u,%u,%u", GetTickCount64() - t0,
+						chk[0], chk[1], chk[2], chk[3], chk[4], chk[5], chk[6], chk[7], chk[8]);
+					memcpy(lastChk, chk, sizeof(chk));
+				}
+			}
+			if (first)
+			{
+				memcpy(prev, cur, TOT);
+				first = false;
+				continue;
+			}
+			char line[700]; size_t ll = 0; line[0] = 0;
+			int shown = 0, hidden = 0;
+			for (int i = 0; i < TOT; i++)
+			{
+				if (cur[i] == prev[i])
+				{
+					noise[i] = 0;
+					continue;
+				}
+				if (noise[i] < 250)
+					noise[i]++;
+				if (noise[i] > 3)
+				{
+					hidden++;
+					continue;
+				}
+				char tag[24];
+				if (i < NA)
+					snprintf(tag, sizeof(tag), " a%X=%u", i, cur[i]);
+				else if (i < NA + NK)
+					snprintf(tag, sizeof(tag), " k%X.%d=%u", (i - NA) / 24, (i - NA) % 24, cur[i]);
+				else
+					snprintf(tag, sizeof(tag), " p%X.%d=%u", (i - NA - NK) / 24, (i - NA - NK) % 24, cur[i]);
+				const int n = snprintf(line + ll, sizeof(line) - ll, "%s", tag);
+				if (n < 0 || ll + n >= sizeof(line) - 1)
+					break;
+				ll += n;
+				if (++shown >= 40)
+					break;
+			}
+			if (ll)
+				LogF("[Btn +%llu]%s%s", GetTickCount64() - t0, line, hidden ? " (+muted)" : "");
+			memcpy(prev, cur, TOT);
+		}
+		LogF("[Btn] probe finished");
+	}).detach();
+}
+
+// Analog movement tiers ([Movement] AnalogTiers=1): the game moves at one of
+// three fixed speeds cycled by the walk-toggle button (L3) and ignores how far
+// the left stick is tilted. The current tier lives in the byte at
+// base+0x658BD8 (0/1/2, found by memory diff against real L3 presses); this
+// watcher simply writes it from the left-stick deflection, so tilt = speed
+// like in modern games. While enabled, manual L3 presses are overridden.
+static int g_analogTiers = 0;
+static int g_tiltWalk = 80;
+static int g_tiltSprint = 95;
+static int g_minSpeedPct = 40;
+// diagnostics: how often the hooked input check runs / runs with edx==1 /
+// eats our flag, and which of the game's two other toggle-execution paths fire
+static volatile uint32_t* g_walkPressCell = nullptr;
+static volatile uint32_t* g_tierReachCell = nullptr;
+static volatile uint32_t* g_tierExecCell = nullptr;
+static volatile uint32_t* g_tierEatenCell = nullptr;
+static volatile uint32_t* g_tierPathBCell = nullptr;
+static volatile uint32_t* g_tierPathCCell = nullptr;
+static void StartAutoTierWatcher()
+{
+	if (!g_analogTiers || !g_gameBase)
+		return;
+	std::thread([] {
+		// The walk-toggle press handler (found via hardware write-watch at
+		// rva +0x273Dxx) reads the multiplier row {m1,m2,m3,iconId} from the
+		// table at base+0x611668 (stride 16: 1.0 / 1.5 / 2.0), stores m1 to
+		// [0x611E8C] and calls the applier at base+0x19C960(actor, m1, m2,
+		// m3), which just writes the multiplier globals at [0x637004..0C] and
+		// the actor speed fields (+0x298..2A8, blend at +0x110/+0x124). We
+		// drive the same applier from the stick: the multiplier slides
+		// linearly from 1.0 to the cap as the tilt goes from WalkTilt% to
+		// SprintTilt%. The handler itself is rewired (see the patch) so L3
+		// toggles [0x658BD8] between 1 and 2 = the cap (1.5x or 2.0x),
+		// showing the matching speed icon natively.
+		using ApplySpeedFn = void(*)(uintptr_t actor, float m1, float m2, float m3);
+		const auto applySpeed = reinterpret_cast<ApplySpeedFn>(g_gameBase + 0x19C960);
+		uintptr_t appliedActor = 0;
+		for (;;)
+		{
+			Sleep(16);
+			uintptr_t actor = 0, mover = 0;
+			const int chan = *reinterpret_cast<volatile int*>(g_gameBase + 0x658CF4);
+			const uintptr_t table = *reinterpret_cast<volatile uintptr_t*>(g_gameBase + 0x667E20);
+			if (table && chan >= 0 && chan <= 0x41)
+			{
+				actor = *reinterpret_cast<volatile uintptr_t*>(table + chan * 8 + 0x18);
+				if (actor)
+				{
+					const int mi = *reinterpret_cast<volatile signed char*>(actor + 0x364);
+					if (mi >= 0 && mi < 8)
+						mover = *reinterpret_cast<volatile uintptr_t*>(actor + 0x2D0 + mi * 0x38);
+				}
+			}
+			// leave everything alone without a live player or in cutscenes
+			// (the toggle handler has the same [actor+0x965] gate)
+			if (!mover || *reinterpret_cast<volatile uint8_t*>(actor + 0x965) == 1)
+			{
+				appliedActor = 0;
+				continue;
+			}
+			const int sx = *reinterpret_cast<volatile int*>(g_gameBase + 0x638B20);
+			const int sy = *reinterpret_cast<volatile int*>(g_gameBase + 0x638B24);
+			float mag = sqrtf(static_cast<float>(sx * sx + sy * sy)) * 100.0f / 255.0f;
+			if (mag > 100.0f)
+				mag = 100.0f;
+			const float lo = static_cast<float>(g_tiltWalk);
+			const float hi = static_cast<float>(g_tiltSprint);
+			// the (rewired) L3 toggle picks which tier row caps the analog
+			// range: [0x658BD8]==2 -> the 2.0x row, anything else -> 1.5x
+			const int capRow = (*reinterpret_cast<volatile int*>(g_gameBase + 0x658BD8) == 2) ? 2 : 1;
+			const volatile float* rowLo = reinterpret_cast<volatile float*>(g_gameBase + 0x611668);
+			const volatile float* rowHi = reinterpret_cast<volatile float*>(g_gameBase + 0x611668 + capRow * 16);
+			float m1, m2, m3;
+			if (mag < lo)
+			{
+				// below the walk threshold: from MinSpeed% at a barely-tilted
+				// stick (~5%, the game's own movement deadzone) up to normal
+				const float minM = g_minSpeedPct / 100.0f;
+				float span0 = lo - 5.0f;
+				if (span0 < 1.0f)
+					span0 = 1.0f;
+				float t0 = (mag - 5.0f) / span0;
+				if (t0 < 0.0f) t0 = 0.0f;
+				if (t0 > 1.0f) t0 = 1.0f;
+				const float mm = minM + (1.0f - minM) * t0;
+				m1 = rowLo[0] * mm;
+				m2 = rowLo[1] * mm;
+				m3 = rowLo[2] * mm;
+			}
+			else
+			{
+				float span = hi - lo;
+				if (span < 1.0f)
+					span = 1.0f;
+				float t = (mag - lo) / span;
+				if (t > 1.0f) t = 1.0f;
+				m1 = rowLo[0] + (rowHi[0] - rowLo[0]) * t;
+				m2 = rowLo[1] + (rowHi[1] - rowLo[1]) * t;
+				m3 = rowLo[2] + (rowHi[2] - rowLo[2]) * t;
+			}
+			// re-apply when the target moved, the character changed, or the
+			// game (or the L3 toggle) applied something else behind our back
+			const float curM1 = *reinterpret_cast<volatile float*>(g_gameBase + 0x637004);
+			if (fabsf(curM1 - m1) < 0.02f && actor == appliedActor)
+				continue;
+			*reinterpret_cast<volatile float*>(g_gameBase + 0x611E8C) = m1;
+			applySpeed(actor, m1, m2, m3);
+			appliedActor = actor;
+		}
+	}).detach();
+}
+
+// Write-watch ([Diagnostics] WriteWatch=1): hardware data breakpoints on the
+// walk-toggle tier byte (base+0x658BD8, DR0) and its press counter
+// (base+0x658BD4, DR1) on every game thread, with a vectored exception
+// handler that rings the writer's RIP. A few real L3 presses reveal exactly
+// which code writes the tier - and therefore where the game applies it.
+static volatile uint64_t g_wwRing[64];
+static volatile LONG g_wwHead = 0;
+static uintptr_t g_wwAddr0 = 0, g_wwAddr1 = 0;
+static LONG CALLBACK WwHandler(PEXCEPTION_POINTERS ep)
+{
+	if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP)
+		return EXCEPTION_CONTINUE_SEARCH;
+	const DWORD64 dr6 = ep->ContextRecord->Dr6;
+	if (!(dr6 & 0x3))
+		return EXCEPTION_CONTINUE_SEARCH;
+	const uint64_t rip = ep->ContextRecord->Rip;
+	const uint8_t v0 = g_wwAddr0 ? *reinterpret_cast<volatile uint8_t*>(g_wwAddr0) : 0;
+	const LONG slot = (InterlockedIncrement(&g_wwHead) - 1) & 63;
+	// pack: rip | value<<48 | which-breakpoint<<56
+	g_wwRing[slot] = (rip & 0xFFFFFFFFFFFFull) | (static_cast<uint64_t>(v0) << 48)
+		| (static_cast<uint64_t>(dr6 & 0x3) << 56);
+	ep->ContextRecord->Dr6 = 0;
+	ep->ContextRecord->EFlags |= 0x10000; // resume flag: don't re-trigger
+	return EXCEPTION_CONTINUE_EXECUTION;
+}
+static void WwApplyToThreads(bool set)
+{
+	const DWORD self = GetCurrentThreadId();
+	const DWORD pid = GetCurrentProcessId();
+	HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+	if (snap == INVALID_HANDLE_VALUE)
+		return;
+	THREADENTRY32 te; te.dwSize = sizeof(te);
+	if (Thread32First(snap, &te))
+	{
+		do
+		{
+			if (te.th32OwnerProcessID != pid || te.th32ThreadID == self)
+				continue;
+			HANDLE h = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME, FALSE, te.th32ThreadID);
+			if (!h)
+				continue;
+			if (SuspendThread(h) != static_cast<DWORD>(-1))
+			{
+				CONTEXT ctx = {};
+				ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+				if (GetThreadContext(h, &ctx))
+				{
+					if (set)
+					{
+						ctx.Dr0 = g_wwAddr0;
+						ctx.Dr1 = g_wwAddr1;
+						// L0+L1 enabled, RW=write, LEN=1 byte
+						ctx.Dr7 = (ctx.Dr7 & ~0xFF00FFull) | 0x5 | (0x1ull << 16) | (0x1ull << 20);
+					}
+					else
+					{
+						ctx.Dr0 = 0; ctx.Dr1 = 0;
+						ctx.Dr7 &= ~0xFF00FFull;
+					}
+					SetThreadContext(h, &ctx);
+				}
+				ResumeThread(h);
+			}
+			CloseHandle(h);
+		} while (Thread32Next(snap, &te));
+	}
+	CloseHandle(snap);
+}
+static void StartWriteWatch()
+{
+	if (!g_logEnabled || !g_gameBase)
+		return;
+	g_wwAddr0 = g_gameBase + 0x658BD8;
+	g_wwAddr1 = g_gameBase + 0x658BD4;
+	std::thread([] {
+		PVOID veh = AddVectoredExceptionHandler(1, WwHandler);
+		LogF("[WW] armed: hardware write-watch on tier byte; press L3 a few times");
+		const ULONGLONG t0 = GetTickCount64();
+		LONG seen = 0;
+		uint64_t uniq[32]; int uniqSpd[32]; int nu = 0;
+		while (GetTickCount64() - t0 < 180000)
+		{
+			WwApplyToThreads(true); // cover newly created threads too
+			for (int t = 0; t < 20; t++)
+			{
+				Sleep(100);
+				const LONG head = g_wwHead;
+				while (seen < head && seen + 64 >= head)
+				{
+					const uint64_t e = g_wwRing[seen & 63];
+					seen++;
+					const uint64_t rip = e & 0xFFFFFFFFFFFFull;
+					const uint64_t rva = rip - (g_gameBase & 0xFFFFFFFFFFFFull);
+					const int val = static_cast<int>((e >> 48) & 0xFF);
+					const int which = static_cast<int>((e >> 56) & 0x3);
+					int k = 0;
+					for (; k < nu; k++)
+						if (uniq[k] == rva && uniqSpd[k] == val)
+							break;
+					if (k < nu)
+						continue;
+					if (nu < 32)
+					{
+						uniq[nu] = rva; uniqSpd[nu] = val; nu++;
+					}
+					LogF("[WW +%llu] writer rip=+0x%llX dr%d newval=%d",
+						GetTickCount64() - t0, rva, (which & 2) ? 1 : 0, val);
+				}
+				if (seen + 64 < g_wwHead)
+					seen = g_wwHead; // overflow: skip ahead
+			}
+		}
+		WwApplyToThreads(false);
+		if (veh)
+			RemoveVectoredExceptionHandler(veh);
+		LogF("[WW] done (%ld hits)", g_wwHead);
+	}).detach();
+}
+
+// Tier scan ([Diagnostics] TierScan=1): find the walk-toggle tier variable by
+// diffing the whole static data region while the user presses L3 exactly 4
+// times, ~4 seconds apart, standing still and touching nothing else. Reports
+// bytes that changed 2..10 times, >=1.2s apart, ending on small values.
+// TierScan=2: focused probe of the candidate windows found by the full scan.
+// Logs every byte change together with the player's current mover speed so
+// values can be matched to tiers.
+static void StartTierProbeWatcher()
+{
+	if (!g_logEnabled || !g_gameBase)
+		return;
+	std::thread([] {
+		struct Win { uint32_t rva, len; };
+		static const Win wins[] = {
+			{ 0x658BC0, 0x50 },   // input-control statics around 0x658BD5
+			{ 0x750660, 0x30 },   // single 0x750677
+			{ 0x7753F8, 0x20 },   // single 0x775409
+			{ 0x75B298, 0x20 },   // single 0x75B2A8
+			{ 0x62A590, 0x150 },  // HUD-ish cluster (icon anim?)
+		};
+		const int NW = sizeof(wins) / sizeof(wins[0]);
+		uint8_t prev[0x50 + 0x30 + 0x20 + 0x20 + 0x150];
+		int total = 0;
+		for (int w = 0; w < NW; w++)
+			total += wins[w].len;
+		const ULONGLONG armDeadline = GetTickCount64() + 15 * 60000ULL;
+		uintptr_t mover = 0;
+		for (;;)
+		{
+			if (GetTickCount64() > armDeadline)
+				return;
+			const int chan = *reinterpret_cast<volatile int*>(g_gameBase + 0x658CF4);
+			const uintptr_t table = *reinterpret_cast<volatile uintptr_t*>(g_gameBase + 0x667E20);
+			if (table && chan >= 0 && chan <= 0x41)
+			{
+				const uintptr_t actor = *reinterpret_cast<volatile uintptr_t*>(table + chan * 8 + 0x18);
+				if (actor)
+				{
+					const int mi = *reinterpret_cast<volatile signed char*>(actor + 0x364);
+					if (mi >= 0 && mi < 8)
+						mover = *reinterpret_cast<volatile uintptr_t*>(actor + 0x2D0 + mi * 0x38);
+					if (mover)
+						break;
+				}
+			}
+			Sleep(250);
+		}
+		int idx = 0;
+		for (int w = 0; w < NW; w++)
+			for (uint32_t i = 0; i < wins[w].len; i++, idx++)
+				prev[idx] = *reinterpret_cast<volatile uint8_t*>(g_gameBase + wins[w].rva + i);
+		LogF("[TierProbe] armed: press L3 / run / stop repeatedly");
+		const ULONGLONG t0 = GetTickCount64();
+		while (GetTickCount64() - t0 < 150000)
+		{
+			Sleep(50);
+			const float spd = mover ? *reinterpret_cast<volatile float*>(mover + 0x78) : -1.0f;
+			char line[600]; size_t ll = 0; line[0] = 0;
+			idx = 0;
+			for (int w = 0; w < NW; w++)
+				for (uint32_t i = 0; i < wins[w].len; i++, idx++)
+				{
+					const uint8_t v = *reinterpret_cast<volatile uint8_t*>(g_gameBase + wins[w].rva + i);
+					if (v == prev[idx])
+						continue;
+					prev[idx] = v;
+					const int n = snprintf(line + ll, sizeof(line) - ll, " %X=%u", wins[w].rva + i, v);
+					if (n < 0 || ll + n >= sizeof(line) - 1)
+						break;
+					ll += n;
+				}
+			if (ll)
+				LogF("[TierProbe +%llu] spd=%.1f%s", GetTickCount64() - t0, spd, line);
+		}
+		LogF("[TierProbe] done");
+	}).detach();
+}
+
+static void StartTierScanWatcher()
+{
+	if (!g_logEnabled || !g_gameBase)
+		return;
+	std::thread([] {
+		// wait for the player to be in the world
+		const ULONGLONG armDeadline = GetTickCount64() + 15 * 60000ULL;
+		for (;;)
+		{
+			if (GetTickCount64() > armDeadline)
+				return;
+			const int chan = *reinterpret_cast<volatile int*>(g_gameBase + 0x658CF4);
+			const uintptr_t table = *reinterpret_cast<volatile uintptr_t*>(g_gameBase + 0x667E20);
+			if (table && chan >= 0 && chan <= 0x41 &&
+				*reinterpret_cast<volatile uintptr_t*>(table + chan * 8 + 0x18))
+				break;
+			Sleep(250);
+		}
+		Sleep(2000);
+		const uint32_t start_rva = 0x60B000;
+		const uint32_t n = 0x3E2890;
+		auto lastv = static_cast<uint8_t*>(malloc(n));
+		auto lastt = static_cast<uint32_t*>(calloc(n, 4));
+		auto firstt = static_cast<uint32_t*>(calloc(n, 4));
+		auto cnt = static_cast<uint8_t*>(calloc(n, 1));
+		auto bad = static_cast<uint8_t*>(calloc(n, 1));
+		if (!lastv || !lastt || !firstt || !cnt || !bad)
+			return;
+		auto mem = reinterpret_cast<const volatile uint8_t*>(g_gameBase + start_rva);
+		for (uint32_t i = 0; i < n; i++)
+			lastv[i] = mem[i];
+		LogF("[TierScan] armed: press L3 exactly 4 times ~4s apart, then wait");
+		const ULONGLONG t0 = GetTickCount64();
+		for (;;)
+		{
+			Sleep(150);
+			const uint32_t now = static_cast<uint32_t>(GetTickCount64() - t0);
+			if (now > 60000)
+				break;
+			for (uint32_t i = 0; i < n; i++)
+			{
+				const uint8_t v = mem[i];
+				if (v == lastv[i])
+					continue;
+				if (v > 16)
+					bad[i] = 1;
+				else if (cnt[i] && now - lastt[i] < 1200)
+					bad[i] = 1;
+				if (!cnt[i])
+					firstt[i] = now;
+				if (cnt[i] < 250)
+					cnt[i]++;
+				lastt[i] = now;
+				lastv[i] = v;
+			}
+		}
+		auto hit = bad;
+		for (uint32_t i = 0; i < n; i++)
+			hit[i] = (!bad[i] && cnt[i] >= 2 && cnt[i] <= 10) ? 1 : (bad[i] = 0);
+		int singles = 0, regions = 0;
+		for (uint32_t i = 0; i < n; i++)
+		{
+			if (!hit[i])
+				continue;
+			uint32_t j = i;
+			while (j + 1 < n)
+			{
+				bool more = false;
+				for (uint32_t k = j + 1; k < j + 33 && k < n; k++)
+					if (hit[k]) { j = k; more = true; break; }
+				if (!more) break;
+			}
+			if (j == i)
+			{
+				if (singles < 80)
+					LogF("[TierScan] SINGLE rva=0x%X changes=%u final=%u t=%u..%ums",
+						start_rva + i, cnt[i], lastv[i], firstt[i], lastt[i]);
+				singles++;
+			}
+			else
+			{
+				if (regions < 30)
+					LogF("[TierScan] region 0x%X..0x%X (%u bytes)", start_rva + i, start_rva + j, j - i + 1);
+				regions++;
+			}
+			i = j;
+		}
+		LogF("[TierScan] done: %d singles, %d regions", singles, regions);
+	}).detach();
+}
+
 // Live-tunable knee curve state (dedicated trampoline floats, see the knee
 // patch; the tuner window rewrites them when sliders move)
 static volatile float* g_kneeKPtr = nullptr;
@@ -686,7 +1310,7 @@ static void StartTuneWindow()
 		wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
 		RegisterClassW(&wc);
 		const int rowH = 52;
-		HWND hwnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, L"FFT0HDTuner", L"FFT0HD Camera Tuner",
+		HWND hwnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, L"FFT0HDTuner", L"FFT0HD Tuner",
 			WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, 40, 40, 340, TUNE_COUNT * rowH + 90, nullptr, nullptr, wc.hInstance, nullptr);
 		const HFONT font = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
 		HWND tips = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr, WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
@@ -1176,6 +1800,81 @@ void OnInitializeHook()
 			pointers[0] = reinterpret_cast<uintptr_t>(sndring);
 			pointers[1] = reinterpret_cast<uintptr_t>(&sndring[256]);
 			ParametricASMJump("push rax; push rbx; mov eax, dword ptr [rip + ?1]; mov ebx, eax; inc eax; mov dword ptr [rip + ?1], eax; and ebx, 0xff; lea rax, [rip + ?0]; mov dword ptr [rax + rbx * 4], r8d; pop rbx; pop rax; mov rax, rsp; mov dword ptr [rax + 0x18], r8d", match, 0, 0x7);
+		}
+
+		// Movement telemetry: capture the player-control object at the walk-toggle
+		// (L3) handler so the movement trace can watch the speed-tier counter live.
+		if (GetPrivateProfileIntW(L"Diagnostics", L"TraceMove", 0, wcModulePath) != 0)
+		{
+			auto pctx = trampoline->Pointer<uint64_t>();
+			*pctx = 0;
+			g_moveCtxCell = pctx;
+			match = FindOne("FF 86 70 01 00 00 80 66 45 FC");
+			pointers[0] = reinterpret_cast<uintptr_t>(pctx);
+			ParametricASMJump("mov qword ptr [rip + ?0], rsi; inc dword ptr [rsi + 0x170]; and byte ptr [rsi + 0x45], 0xFC", match, 0, 0xA);
+
+			// Hook the two mover-speed setter sites and ring-log the caller's
+			// return address + the speed value, to locate the tier-speed code.
+			auto spdring = reinterpret_cast<uint8_t*>(trampoline->RawSpace(32 * 24));
+			memset(spdring, 0, 32 * 24);
+			auto spdhead = trampoline->Pointer<uint32_t>();
+			*spdhead = 0;
+			g_spdRing = spdring;
+			g_spdHead = spdhead;
+			// virtual Mover::SetSpeed (mover in rcx)
+			match = FindOne("83 A1 A8 00 00 00 F7 F3 0F 11 49 78 C3");
+			pointers[0] = reinterpret_cast<uintptr_t>(spdring);
+			pointers[1] = reinterpret_cast<uintptr_t>(spdhead);
+			ParametricASMJump("push rbx; mov eax, dword ptr [rip + ?1]; mov ebx, eax; inc eax; mov dword ptr [rip + ?1], eax; and ebx, 0x1f; imul ebx, ebx, 24; lea rax, [rip + ?0]; add rax, rbx; mov rbx, qword ptr [rsp + 8]; mov qword ptr [rax], rbx; mov qword ptr [rax + 8], rcx; movss dword ptr [rax + 0x10], xmm1; pop rbx; and dword ptr [rcx + 0xA8], 0xFFFFFFF7; movss dword ptr [rcx + 0x78], xmm1", match, 0, 0xC);
+			// inlined actor-level copy (mover in rdx)
+			match = FindOne("83 A2 A8 00 00 00 F7 F3 0F 11 4A 78");
+			pointers[0] = reinterpret_cast<uintptr_t>(spdring);
+			pointers[1] = reinterpret_cast<uintptr_t>(spdhead);
+			ParametricASMJump("push rbx; mov eax, dword ptr [rip + ?1]; mov ebx, eax; inc eax; mov dword ptr [rip + ?1], eax; and ebx, 0x1f; imul ebx, ebx, 24; lea rax, [rip + ?0]; add rax, rbx; mov rbx, qword ptr [rsp + 8]; mov qword ptr [rax], rbx; mov qword ptr [rax + 8], rdx; movss dword ptr [rax + 0x10], xmm1; pop rbx; and dword ptr [rdx + 0xA8], 0xFFFFFFF7; movss dword ptr [rdx + 0x78], xmm1", match, 0, 0xC);
+
+			// wrap every button-check call site inside the field action
+			// processor: count each one that returns true - the site whose
+			// counter moves on a real L3 press is the walk toggle
+			static const char* chkSigs[9] = {
+				"E8 1E 85 F9 FF", "E8 67 84 F9 FF", "E8 12 8E F9 FF",
+				"E8 A6 83 F9 FF", "E8 76 8D F9 FF", "E8 B2 82 F9 FF",
+				"E8 F6 81 F9 FF", "E8 C6 8B F9 FF", "E8 13 8B F9 FF" };
+			static const uint32_t chkTgt[9] = {
+				0x271830, 0x271830, 0x272250, 0x271830, 0x272250,
+				0x271830, 0x271830, 0x272250, 0x272250 };
+			for (int i = 0; i < 9; i++)
+			{
+				auto c = trampoline->Pointer<uint32_t>();
+				*c = 0;
+				g_chkCells[i] = c;
+				match = FindOne(chkSigs[i]);
+				pointers[0] = reinterpret_cast<uintptr_t>(c);
+				pointers[1] = baseaddress + chkTgt[i];
+				ParametricASMJump("call ?1; test al, al; je A; inc dword ptr [rip + ?0]; A: nop", match, 0, 0x5);
+			}
+			LogF("[TraceMove] enabled: context capture + speed ring + 9 check-site counters");
+		}
+
+		// Analog movement ([Movement] AnalogTiers=1): the left stick's tilt
+		// smoothly scales the movement-speed multiplier between the game's
+		// normal speed and a cap; L3 toggles the cap between the stock 1.5x and
+		// 2.0x tiers with the game's own speed icons. The watcher drives the
+		// game's native applier (see StartAutoTierWatcher); here the L3 handler
+		// is rewired from a 3-tier cycle into the 1<->2 cap toggle, keeping the
+		// icons and every built-in gate working exactly like the stock feature.
+		if (GetPrivateProfileIntW(L"Movement", L"AnalogTiers", 0, wcModulePath) != 0)
+		{
+			g_analogTiers = 1;
+			g_tiltWalk = GetPrivateProfileIntW(L"Movement", L"WalkTiltPercent", 80, wcModulePath);
+			g_tiltSprint = GetPrivateProfileIntW(L"Movement", L"SprintTiltPercent", 95, wcModulePath);
+			g_minSpeedPct = GetPrivateProfileIntW(L"Movement", L"MinSpeedPercent", 40, wcModulePath);
+			if (g_minSpeedPct < 20) g_minSpeedPct = 20;
+			if (g_minSpeedPct > 100) g_minSpeedPct = 100;
+			match = FindOne("8B 0D F3 4D 3E 00 B8 56 55 55 55");
+			pointers[0] = baseaddress + 0x658BD8;
+			ParametricASMJump("mov qword ptr [rsp + 0x50], rbp; mov qword ptr [rsp + 0x58], rsi; mov qword ptr [rsp + 0x60], rdi; mov qword ptr [rsp + 0x68], r14; mov ecx, dword ptr [rip + ?0]; cmp ecx, 2; je A; mov ecx, 2; jmp B; A: mov ecx, 1; B: mov dword ptr [rip + ?0], ecx; movsxd rax, ecx", match, 0, 0x38);
+			LogF("[Movement] analog speed on (min %d%%, ramp %d%%..%d%%), L3 toggles the 1.5x/2x cap",
+				g_minSpeedPct, g_tiltWalk, g_tiltSprint);
 		}
 
 		const int ResX = GetPrivateProfileIntW(L"OverrideRes", L"ResX", 0, wcModulePath);
@@ -2137,6 +2836,18 @@ void OnInitializeHook()
 			StartStickTraceWatcher();
 		if (GetPrivateProfileIntW(L"Diagnostics", L"TracePitch", 0, wcModulePath) != 0)
 			StartPitchTraceWatcher();
+		if (GetPrivateProfileIntW(L"Diagnostics", L"TraceMove", 0, wcModulePath) != 0)
+			StartMoveTraceWatcher();
+		{
+			const int tierScan = GetPrivateProfileIntW(L"Diagnostics", L"TierScan", 0, wcModulePath);
+			if (tierScan == 2)
+				StartTierProbeWatcher();
+			else if (tierScan != 0)
+				StartTierScanWatcher();
+		}
+		if (GetPrivateProfileIntW(L"Diagnostics", L"WriteWatch", 0, wcModulePath) != 0)
+			StartWriteWatch();
+		StartAutoTierWatcher();
 
 		} // end try
 		catch (const std::exception& e)

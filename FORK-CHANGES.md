@@ -1,8 +1,8 @@
-# What this fork adds
+# FF Type-0 HD Toolbox — what it adds
 
-This is a fork of [Banz99/Final-Fantasy-Type-0-Hd-Unlocker](https://github.com/Banz99/Final-Fantasy-Type-0-Hd-Unlocker) —
+This project started as a fork of [Banz99/Final-Fantasy-Type-0-Hd-Unlocker](https://github.com/Banz99/Final-Fantasy-Type-0-Hd-Unlocker) —
 the mod that unlocks custom resolutions, high framerates and FOV in Final Fantasy Type-0 HD on PC.
-Everything from the original mod still works exactly the same. This fork adds the things below.
+Everything from the original mod still works exactly the same. The toolbox adds the things below.
 No game files are touched — all changes happen in memory while the game runs, so Steam updates
 and file checks never break anything.
 
@@ -39,6 +39,30 @@ third-person game:
 The shipped defaults are tuned for a **gamepad**. Mouse players: the defaults leave the mouse
 mostly stock — open the tuning window and pick your own numbers.
 
+## Analog movement (new in 0.5)
+
+In the stock game how far you tilt the left stick doesn't matter — you always move at one
+of three fixed speeds cycled by clicking the stick (L3). The `[Movement]` ini section makes
+movement fully analog, like any modern game:
+
+- **Tilt = speed.** The multiplier slides smoothly from a slow stroll (`MinSpeedPercent`,
+  default 40% of the normal speed — slower than the game can normally go), through the normal
+  speed at `WalkTiltPercent`, up to the top speed at full tilt.
+- **L3 picks the top speed.** Clicking the stick toggles the cap between the game's own
+  1.5x and 2x boosts, showing the original speed-2/speed-3 icons. The 2x boost is very strong
+  in combat (the community rightly calls it near game-breaking), so keeping it a deliberate
+  button press preserves the balance — while the 1.5x range keeps towns comfortable.
+- Everything runs through the game's own speed system (the same tables, multipliers and
+  animation blending the L3 toggle uses), so animations and cutscenes behave exactly like stock.
+
+```ini
+[Movement]
+AnalogTiers=1        ; 0 = stock 3-speed toggle
+MinSpeedPercent=40   ; speed at a barely-tilted stick, % of normal
+WalkTiltPercent=80   ; tilt that gives exactly the normal speed
+SprintTiltPercent=95 ; tilt that gives the top (L3-chosen) speed
+```
+
 ## The game no longer crashes silently on startup
 
 With the original mod, if your game version was slightly different from the one the mod expects,
@@ -74,7 +98,10 @@ Same as the original (`premake5 vs20xx`, build the `Master` configuration). Note
 
 ## Кратко по-русски
 
-Форк мода Banz99 для FF Type-0 HD. Всё из оригинала работает как раньше. Добавлено:
+FF Type-0 HD Toolbox — вырос из форка мода Banz99. Всё из оригинала работает как раньше. Добавлено:
+аналоговое движение (секция `[Movement]`: наклон левого стика плавно задаёт скорость — от
+медленной прогулки ниже штатной до ускорения; L3 переключает потолок между 1.5x и 2x с
+родными иконками),
 пропуск всего вступления (уведомление, логотипы, 6 минут роликов — секция `[Intro]` в ini),
 современная камера (секция `[Camera]`: дистанция дальше «Far», раздельные скорости осей,
 кривая отклика стика как в современных шутерах, динамический FOV от скорости поворота и
@@ -86,5 +113,5 @@ Same as the original (`premake5 vs20xx`, build the `Master` configuration). Note
 ## Credits
 
 All original work by [Banz99](https://github.com/Banz99) and the upstream contributors
-(CookiePLMonster, LunaMoo, Keystone Engine, Ultimate ASI Loader). This fork only adds
-the changes described above.
+(CookiePLMonster, LunaMoo, Keystone Engine, Ultimate ASI Loader). The toolbox adds
+the changes described above on top of that foundation.

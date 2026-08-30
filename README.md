@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/logo.png" width="280" alt="FF Type-0 HD Toolbox"></p>
+
 # FF Type-0 HD Toolbox
 
 Quality-of-life toolbox for Final Fantasy Type-0 HD on PC: custom resolution and framerate,

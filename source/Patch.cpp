@@ -328,38 +328,26 @@ static void StartBootScanWatcher()
 // until the first movie starts (whose skip is handled separately) or 40s pass.
 static bool g_autoSkipSplash = false;
 
-// Real logo skip ([Intro] SkipIntroLogos=1): the boot splash sequencer keeps a
-// tick counter at base+0x6C4BCC (+2 per 30Hz tick, clamped by the game) and a
-// deque of pending slides (begin/end pointers at base+0x63D1D8/0x63D1E0).
-// Slides advance when the counter passes their thresholds, so while the deque
-// is non-empty we slam the counter to a huge value: every threshold is
-// instantly exceeded and the whole slide show resolves in a few frames.
-static bool g_skipIntroLogos = false;
-
-static void StartSlideSkipWatcher()
+// Boot trace ([Diagnostics] BootTrace=1): samples the boot sequencer's state
+// every 250ms for 30s — both tick counters, the pending-item deque pointers
+// and the movie state — to understand how the logo slides are actually timed.
+static void StartBootTraceWatcher()
 {
-	if (!g_skipIntroLogos || !g_gameBase)
+	if (!g_logEnabled || !g_gameBase)
 		return;
 	std::thread([] {
-		const ULONGLONG start = GetTickCount64();
-		bool announced = false;
-		while (!g_bootPhaseOver)
+		const ULONGLONG t0 = GetTickCount64();
+		while (GetTickCount64() - t0 < 30000)
 		{
-			Sleep(50);
-			if (GetTickCount64() - start > 60000)
-				break;
-			if (*reinterpret_cast<volatile uint8_t*>(g_gameBase + 0x655ECC) != 0)
-				break;
+			Sleep(250);
+			const uint32_t timerA = *reinterpret_cast<volatile uint32_t*>(g_gameBase + 0x6C4BCC);
+			const uint32_t timerB = *reinterpret_cast<volatile uint32_t*>(g_gameBase + 0x63F178);
 			const uint64_t qbegin = *reinterpret_cast<volatile uint64_t*>(g_gameBase + 0x63D1D8);
 			const uint64_t qend = *reinterpret_cast<volatile uint64_t*>(g_gameBase + 0x63D1E0);
-			if (!qbegin || qend == qbegin)
-				continue;
-			*reinterpret_cast<volatile uint32_t*>(g_gameBase + 0x6C4BCC) = 0x7FF00000;
-			if (!announced)
-			{
-				announced = true;
-				LogF("[SkipLogos] slide queue detected, fast-forwarding boot timer");
-			}
+			const uint8_t mstate = *reinterpret_cast<volatile uint8_t*>(g_gameBase + 0x655ECC);
+			LogF("[BootTrace +%llums] timerA=%u timerB=%u q=%llX..%llX movie=%u",
+				GetTickCount64() - t0, timerA, timerB,
+				static_cast<unsigned long long>(qbegin), static_cast<unsigned long long>(qend), mstate);
 		}
 	}).detach();
 }
@@ -392,7 +380,7 @@ static void StartBootAutoSkipWatcher()
 			// any movie activity = the slides are over; stop pressing for good
 			if (*reinterpret_cast<volatile uint8_t*>(g_gameBase + 0x655ECC) != 0)
 				break;
-			if (now - lastPress < 400)
+			if (now - lastPress < 200)
 				continue;
 			lastPress = now;
 			HWND fg = GetForegroundWindow();
@@ -1536,11 +1524,11 @@ void OnInitializeHook()
 		StartMovieTraceWatcher();
 		StartIntroSkipWatcher();
 		g_autoSkipSplash = GetPrivateProfileIntW(L"Intro", L"AutoSkipSplash", 0, wcModulePath) != 0;
-		g_skipIntroLogos = GetPrivateProfileIntW(L"Intro", L"SkipIntroLogos", 0, wcModulePath) != 0;
 		StartBootAutoSkipWatcher();
-		StartSlideSkipWatcher();
 		if (GetPrivateProfileIntW(L"Diagnostics", L"BootScan", 0, wcModulePath) != 0)
 			StartBootScanWatcher();
+		if (GetPrivateProfileIntW(L"Diagnostics", L"BootTrace", 0, wcModulePath) != 0)
+			StartBootTraceWatcher();
 
 		} // end try
 		catch (const std::exception& e)

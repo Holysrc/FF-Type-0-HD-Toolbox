@@ -15,8 +15,7 @@ hands free:
 ```ini
 [Intro]
 SkipIntroVideos=1   ; don't play the two opening movies
-AutoSkipSplash=1    ; press "OK" on the autosave notice for you
-SkipIntroLogos=1    ; skip the three logo screens
+AutoSkipSplash=1    ; auto-confirm the autosave notice and flip through the logo screens
 ```
 
 ## The game no longer crashes silently on startup

@@ -1,1 +1,7 @@
 /build/
+
+# Local tooling and copyrighted game files (never commit these)
+premake5.exe
+*.exe
+*.bin
+*.log

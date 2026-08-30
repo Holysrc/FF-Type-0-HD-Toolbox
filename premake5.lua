@@ -26,6 +26,7 @@ workspace "*"
 
 	cppdialect "C++20"
 	staticruntime "on"
+	exceptionhandling "On" -- required for the graceful pattern-not-found handling in Patch.cpp
 	buildoptions { "/sdl" }
 	warnings "Extra"
 
@@ -44,7 +45,7 @@ filter "configurations:Debug"
 filter "configurations:not Debug"
 	optimize "Speed"
 	functionlevellinking "on"
-	flags { "LinkTimeOptimization" }
+	linktimeoptimization "On"
 
 filter { "platforms:Win32" }
 	system "Windows"

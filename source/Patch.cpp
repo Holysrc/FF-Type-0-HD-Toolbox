@@ -648,7 +648,7 @@ static void StartMoveTraceWatcher()
 static int g_analogTiers = 0;
 static int g_tiltWalk = 80;
 static int g_tiltSprint = 95;
-static int g_minSpeedPct = 40;
+static int g_minSpeedPct = 60;
 // diagnostics: how often the hooked input check runs / runs with edx==1 /
 // eats our flag, and which of the game's two other toggle-execution paths fire
 static volatile uint32_t* g_walkPressCell = nullptr;
@@ -1867,7 +1867,7 @@ void OnInitializeHook()
 			g_analogTiers = 1;
 			g_tiltWalk = GetPrivateProfileIntW(L"Movement", L"WalkTiltPercent", 80, wcModulePath);
 			g_tiltSprint = GetPrivateProfileIntW(L"Movement", L"SprintTiltPercent", 95, wcModulePath);
-			g_minSpeedPct = GetPrivateProfileIntW(L"Movement", L"MinSpeedPercent", 40, wcModulePath);
+			g_minSpeedPct = GetPrivateProfileIntW(L"Movement", L"MinSpeedPercent", 60, wcModulePath);
 			if (g_minSpeedPct < 20) g_minSpeedPct = 20;
 			if (g_minSpeedPct > 100) g_minSpeedPct = 100;
 			match = FindOne("8B 0D F3 4D 3E 00 B8 56 55 55 55");
@@ -2293,10 +2293,12 @@ void OnInitializeHook()
 				ParametricASMJump(curveasm.c_str(), match, 0, 0x8);
 			}
 
-			//Vertical axis response curve (no framerate fix needed here, but the
-			//same ini exponent is applied; xmm1 holds |y|, pad path squares it,
-			//mouse path is linear times the mouse speed global)
-			if (curveExp > 0 || kneeCurve)
+			//Vertical axis: response curve AND framerate fix. The pad path adds
+			//its turn every REAL frame, so without a fix the stick's vertical
+			//camera speed multiplies with the framerate (4x too fast at 120).
+			//Mouse input is a per-frame delta and framerate-neutral, so only
+			//the pad branch gets the 30/framerate factor. xmm1 holds |y|; the
+			//stock pad path squares it, the ini curve replaces that shape.
 			{
 				match = FindOne("84 C9 75 0A F3 0F 59 C9 F3 0F 59 D1 EB 10 F3 0F 10 05 ? ? ? ? F3 0F 59 C1 F3 0F 59 D0");
 				{
@@ -2344,9 +2346,13 @@ void OnInitializeHook()
 						for (int i = 1; i < curveExp; i++)
 							curveasm += "mulss xmm1, xmm0; ";
 					}
-					curveasm += "mulss xmm2, xmm1";
+					else if (curveExp == 0)
+						curveasm = "mulss xmm1, xmm1; "; // stock quadratic shape
+					param_floats[3] = 30.0f / framerate;
+					curveasm += "mulss xmm1, %3; mulss xmm2, xmm1";
 					ParametricASMJump(curveasm.c_str(), match, 0x4, 0xC);
 				}
+				if (curveExp > 0 || kneeCurve)
 				{
 					pointers[0] = baseaddress + 0x611418;
 					std::string curveasm;

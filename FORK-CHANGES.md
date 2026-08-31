@@ -79,6 +79,9 @@ and keeps the game running — you just lose that one feature instead of the who
   fast at higher framerates. Fixed.
 - **Broken lip sync at 120 fps.** The original mod had a fix for lips at 60 fps only; the same
   problem happened at 120. Now fixed for any framerate.
+- **Vertical camera speed multiplying with the framerate.** The stick's up/down camera speed
+  was never framerate-corrected (not even in the original mod — the code path was unknown), so
+  at 120 fps it turned four times too fast. Now it feels the same at any framerate.
 
 ## For the curious: diagnostics
 

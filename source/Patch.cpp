@@ -234,6 +234,7 @@ static void PatchIAT(const char* funcName, void* hook, void** orig)
 static uintptr_t g_introBase = 0;
 
 static uintptr_t g_gameBase = 0;
+static float g_framerate = 30.0f; //effective framerate, for diagnostics that compare fps
 static volatile uint8_t g_bootPhaseOver; // set once the first movie is reached (defined below)
 
 // Boot-scan diagnostic ([Diagnostics] BootScan=1): during the first 30s the
@@ -430,11 +431,356 @@ static volatile uint64_t* g_moveCtxCell = nullptr;
 // two mover-speed setter sites, to find who applies the walk/run tier speeds.
 static volatile uint8_t* g_spdRing = nullptr;
 static volatile uint32_t* g_spdHead = nullptr;
+
+// Battle event-script "move actor" telemetry ([Diagnostics] TraceScriptMove=1).
+// The battle script VM drives a boss's scripted entrance with opcodes 0xE4 and
+// 0xE5 ("make the actor on channel N move for D frames"): both thunks read the
+// channel from float[record+0x38] and the DURATION, authored as a FRAME COUNT,
+// from float[record+0x3C]. Hooks on both thunks ring-log {tag|channel, frames}
+// so the wall-clock cadence of the script can be compared between 30fps and
+// 120fps - the open question being whether the VM issues the next command long
+// before the previous move has finished at high framerate.
+// Ring entries are 8 bytes: [0]=tag|channel, [4]=duration frames.
+static volatile uint8_t* g_smRing = nullptr;
+static volatile uint32_t* g_smHead = nullptr;
+// Chapter-2 stair sub-boss frame-budget watchdog trace ([Diagnostics] TraceWatchdog=1):
+// the battle movement steppers gate each scripted leg on a per-render-frame budget -
+// counter word[actor+0xcd6] (inc every rendered frame) vs budget word[actor+0xcd8].
+// With the mode-1 phase fix ON the profile advances 0.25/frame at 120fps, so a leg
+// needs 4x as many render frames, but the budget still counts raw render frames and
+// can time the leg out at ~25% completion; the kill zeroes [ccc]/[0x160]/[0x1a8] and
+// sets cd4|=0x10. These event hooks tag every dispatcher-state entry (ccc=1/2/3), every
+// leg kill (timeout vs arrival, state 1 = translation and state 3 = turn servo), and
+// every run-build attempt, so a 30fps capture can be diffed against a 120fps capture to
+// prove or disprove the truncation. Ring entries are 24 bytes:
+// [0]=tag [4]=v0 [8]=v1 [12]=v2 [16]=v3 [20]=actor low32.
+static volatile uint8_t* g_wdRing = nullptr;
+static volatile uint32_t* g_wdHead = nullptr;
 // counts the field action processor accepting a walk-toggle press (the real path)
 static volatile uint32_t* g_toggleAcceptCell = nullptr;
 // per-call-site "button check returned true" counters inside the field action
 // processor fn 0x1402d9240 - one of these sites is the walk toggle
 static volatile uint32_t* g_chkCells[9] = {};
+// Battle AI trace ([Diagnostics] TraceBattle=1): logs every non-player actor
+// (AI party members and enemies) so a boss whose AI freezes or misbehaves at
+// high fps can be compared against a working 30 fps run. Per actor it records
+// position, current motion ids and state, plus a change-diff over the actor
+// struct to expose frame-counted AI/timer fields. Run it once at FpsCap=120
+// (broken) and once at FpsCap=0 (working) and send both logs.
+// Boss placement/entrance trace ([Diagnostics] TraceBossPos=1): for boss/
+// leader-class actors (state [actor+0x360] low16 == 0x2019) logs candidate
+// WORLD-POSITION triples + velocity + motion from spawn, WITHOUT noise-muting,
+// so a frame-broken scripted spawn/entrance ("appears in wrong location and
+// runs into a wall at high fps, spawns on-spot at 30fps") can be pinned by
+// comparing a 120fps run to a 30fps run.
+static void StartBossPosTraceWatcher()
+{
+	if (!g_logEnabled || !g_gameBase)
+		return;
+	std::thread([] {
+		const ULONGLONG armDeadline = GetTickCount64() + 15 * 60000ULL;
+		for (;;) {
+			if (GetTickCount64() > armDeadline) return;
+			const int pc = *reinterpret_cast<volatile int*>(g_gameBase + 0x658CF4);
+			const uintptr_t tbl = *reinterpret_cast<volatile uintptr_t*>(g_gameBase + 0x667E20);
+			if (tbl && pc >= 0 && pc <= 0x41 && *reinterpret_cast<volatile uintptr_t*>(tbl + pc * 8 + 0x18))
+				break;
+			Sleep(200);
+		}
+		LogF("[BossPos] armed at framerate=%.0f", g_framerate);
+		const auto rf = [](uintptr_t a) -> float { return *reinterpret_cast<volatile float*>(a); };
+		struct Prev { uintptr_t mover; float x, z; };
+		static Prev prev[8];
+		int nprev = 0;
+		const ULONGLONG t0 = GetTickCount64();
+		//Long window (6 min): the interesting experiment is to shove a stuck boss
+		//off the geometry it beelined into and see whether it then enters the run
+		//state (mode 6), which needs time to set up in-fight.
+		while (GetTickCount64() - t0 < 360000) {
+			Sleep(40);
+			const unsigned long long now = GetTickCount64() - t0;
+			const uintptr_t tbl = *reinterpret_cast<volatile uintptr_t*>(g_gameBase + 0x667E20);
+			if (!tbl) continue;
+			for (int ch = 0; ch <= 0x41; ch++) {
+				const uintptr_t a = *reinterpret_cast<volatile uintptr_t*>(tbl + ch * 8 + 0x18);
+				if (!a) continue;
+				if ((*reinterpret_cast<volatile uint16_t*>(a + 0x360)) != 0x2019) continue; // boss/leader only
+				const int mi = *reinterpret_cast<volatile signed char*>(a + 0x364);
+				uintptr_t mv = 0;
+				if (mi >= 0 && mi < 8) mv = *reinterpret_cast<volatile uintptr_t*>(a + 0x2D0 + mi * 0x38);
+				if (!mv) continue;
+				const float px = rf(mv + 0x08), py = rf(mv + 0x0c), pz = rf(mv + 0x10);   // world pos
+				const float fx = rf(mv + 0x58), fy = rf(mv + 0x5c), fz = rf(mv + 0x60);   // facing dir
+				const float spd = rf(mv + 0x78);                                          // speed
+				const uint32_t mode = *reinterpret_cast<volatile uint32_t*>(mv + 0xa8);   // mover mode flags
+				const float gdx = rf(mv + 0x18), gdy = rf(mv + 0x1c), gdz = rf(mv + 0x20); // applied per-frame delta
+				const float gdmag = sqrtf(gdx * gdx + gdy * gdy + gdz * gdz);             // its magnitude
+				const float dx = rf(a + 0x18), dy = rf(a + 0x1c), dz = rf(a + 0x20);      // destination
+				// movement delta since last sample (actual travel direction)
+				int slot = -1;
+				for (int i = 0; i < nprev; i++) if (prev[i].mover == mv) { slot = i; break; }
+				float mvx = 0, mvz = 0;
+				if (slot >= 0) { mvx = px - prev[slot].x; mvz = pz - prev[slot].z; }
+				else if (nprev < 8) { slot = nprev++; prev[slot].mover = mv; }
+				if (slot >= 0) { prev[slot].x = px; prev[slot].z = pz; }
+				LogF("[BossPos +%llu] ch=%d motion=%X mode=%X spd=%.2f gdelta=%.2f,%.2f,%.2f gmag=%.2f pos=%.0f,%.0f,%.0f move=%.1f,%.1f face=%.2f,%.2f,%.2f dest=%.0f,%.0f,%.0f",
+					now, ch, *reinterpret_cast<volatile uint16_t*>(a + 0x884), mode, spd,
+					gdx, gdy, gdz, gdmag,
+					px, py, pz, mvx, mvz, fx, fy, fz, dx, dy, dz);
+				// Step E (read-only): translation + turn motion-profile internals, read
+				// straight from the actor struct (no asm inject). Profile is embedded at
+				// actor+0x160 (translation) / actor+0x1a8 (turn); the clock steps phase
+				// (+0x04), ends at duration (+0x08), writes cumulative (+0x2c) and a per-call
+				// velocity (+0x30) that a mode-0 clock arm consumes directly. The evaluator
+				// forms velocity = cumul - [actor+0x290] then divides by xmm9 = [actor+0xdc].
+				// At 30 vs 120 this pins whether phase is scaled (0.25/frame), whether the
+				// divisor is ~1, and which quantity carries the 4x walk overshoot. Active only.
+				{
+					const uint32_t tmode = *reinterpret_cast<volatile uint32_t*>(a + 0x160);
+					const uint32_t rmode = *reinterpret_cast<volatile uint32_t*>(a + 0x1a8);
+					if (tmode != 0 || rmode != 0 || (mode & 3) != 0 || gdmag > 0.01f)
+						LogF("[BossProf +%llu] ch=%d tMode=%u tPhase=%.3f tDur=%.3f cumul=%.4f vel30=%.4f fd290=%.4f vel=%.3f,%.3f,%.3f div9dc=%.4f | rMode=%u rPhase=%.3f",
+							now, ch, tmode,
+							rf(a + 0x164), rf(a + 0x168), rf(a + 0x18c), rf(a + 0x190), rf(a + 0x290),
+							rf(a + 0xdc), rf(a + 0xe0), rf(a + 0xe4), rf(a + 0xdc),
+							rmode, rf(a + 0x1ac));
+				}
+			}
+		}
+		LogF("[BossPos] trace finished");
+	}).detach();
+}
+
+static void StartBattleTraceWatcher()
+{
+	if (!g_logEnabled || !g_gameBase)
+		return;
+	std::thread([] {
+		const int WIN = 0xE00;          // struct window in bytes
+		const int WINDW = WIN / 4;
+		struct Tracked {
+			uintptr_t actor;
+			uint32_t prev[0xE00 / 4];
+			uint8_t noise[0xE00 / 4];
+			bool have;
+			bool seen;
+			int chan;
+			int px, pz, pa, lastState;
+			unsigned long long lastLine;
+		};
+		static Tracked tr[16];
+		int nTr = 0;
+		// wait until the player exists in the world
+		const ULONGLONG armDeadline = GetTickCount64() + 15 * 60000ULL;
+		for (;;) {
+			if (GetTickCount64() > armDeadline)
+				return;
+			const int pc = *reinterpret_cast<volatile int*>(g_gameBase + 0x658CF4);
+			const uintptr_t tbl = *reinterpret_cast<volatile uintptr_t*>(g_gameBase + 0x667E20);
+			if (tbl && pc >= 0 && pc <= 0x41 && *reinterpret_cast<volatile uintptr_t*>(tbl + pc * 8 + 0x18))
+				break;
+			Sleep(250);
+		}
+		LogF("[Battle] trace armed at framerate=%.0f (compare a 120fps run vs a 30fps run)", g_framerate);
+		const ULONGLONG t0 = GetTickCount64();
+		while (GetTickCount64() - t0 < 300000) {
+			Sleep(40);
+			const unsigned long long now = GetTickCount64() - t0;
+			const int pc = *reinterpret_cast<volatile int*>(g_gameBase + 0x658CF4);
+			const uintptr_t tbl = *reinterpret_cast<volatile uintptr_t*>(g_gameBase + 0x667E20);
+			if (!tbl)
+				continue;
+			for (int i = 0; i < nTr; i++)
+				tr[i].seen = false;
+			for (int ch = 0; ch <= 0x41; ch++) {
+				if (ch == pc)
+					continue;
+				const uintptr_t actor = *reinterpret_cast<volatile uintptr_t*>(tbl + ch * 8 + 0x18);
+				if (!actor)
+					continue;
+				int idx = -1;
+				for (int i = 0; i < nTr; i++)
+					if (tr[i].actor == actor) { idx = i; break; }
+				if (idx < 0) {
+					for (int i = 0; i < nTr; i++)
+						if (tr[i].actor == 0) { idx = i; break; }
+					if (idx < 0) {
+						if (nTr >= 16)
+							continue;
+						idx = nTr++;
+					}
+					tr[idx].actor = actor;
+					tr[idx].have = false;
+					memset(tr[idx].noise, 0, sizeof(tr[idx].noise));
+					tr[idx].px = tr[idx].pz = tr[idx].pa = tr[idx].lastState = -1000000;
+					tr[idx].lastLine = 0;
+					LogF("[Battle +%llu] new actor chan=%d ptr=%p", now, ch, (void*)actor);
+				}
+				Tracked& T = tr[idx];
+				T.seen = true;
+				T.chan = ch;
+				const float fx = *reinterpret_cast<volatile float*>(actor + 0x1dc);
+				const float fy = *reinterpret_cast<volatile float*>(actor + 0x1e0);
+				const float fz = *reinterpret_cast<volatile float*>(actor + 0x1e4);
+				const int st = *reinterpret_cast<volatile uint16_t*>(actor + 0x360);
+				const int a0 = *reinterpret_cast<volatile uint16_t*>(actor + 0x884);
+				const int a1 = *reinterpret_cast<volatile uint16_t*>(actor + 0x88a);
+				const int a2 = *reinterpret_cast<volatile uint16_t*>(actor + 0x88c);
+				int spd = -1;
+				const int mi = *reinterpret_cast<volatile signed char*>(actor + 0x364);
+				if (mi >= 0 && mi < 8) {
+					const uintptr_t mover = *reinterpret_cast<volatile uintptr_t*>(actor + 0x2D0 + mi * 0x38);
+					if (mover)
+						spd = static_cast<int>(*reinterpret_cast<volatile float*>(mover + 0x78) * 100.0f);
+				}
+				const int ix = static_cast<int>(fx), iz = static_cast<int>(fz);
+				const bool changed = (ix != T.px) || (iz != T.pz) || (a0 != T.pa) || (st != T.lastState);
+				if (changed || now - T.lastLine >= 1000) {
+					LogF("[Battle +%llu] ch=%d pos=%.1f,%.1f,%.1f st=%X anim=%X/%X/%X spd=%d",
+						now, ch, fx, fy, fz, st, a0, a1, a2, spd);
+					T.px = ix; T.pz = iz; T.pa = a0; T.lastState = st; T.lastLine = now;
+				}
+				char line[700]; size_t ll = 0; line[0] = 0; int shown = 0;
+				for (int o = 0; o < WINDW; o++) {
+					const uint32_t v = *reinterpret_cast<volatile uint32_t*>(actor + o * 4);
+					if (!T.have) { T.prev[o] = v; continue; }
+					if (v == T.prev[o]) { T.noise[o] = 0; continue; }
+					if (T.noise[o] < 250) T.noise[o]++;
+					T.prev[o] = v;
+					if (T.noise[o] > 4) continue;
+					if (shown < 30) {
+						const float fv = *reinterpret_cast<const float*>(&v);
+						int n;
+						if (fv > -1e6f && fv < 1e6f && (v & 0x7f800000) != 0 && (v & 0x7f800000) != 0x7f800000)
+							n = snprintf(line + ll, sizeof(line) - ll, " %X=%.2f", o * 4, fv);
+						else
+							n = snprintf(line + ll, sizeof(line) - ll, " %X=%d", o * 4, static_cast<int>(v));
+						if (n > 0 && ll + static_cast<size_t>(n) < sizeof(line) - 1) ll += n;
+						shown++;
+					}
+				}
+				if (T.have && ll)
+					LogF("[Battle +%llu] ch=%d d:%s", now, ch, line);
+				T.have = true;
+			}
+			for (int i = 0; i < nTr; i++)
+				if (tr[i].actor && !tr[i].seen) {
+					LogF("[Battle +%llu] actor gone chan=%d", now, tr[i].chan);
+					tr[i].actor = 0;
+				}
+		}
+		LogF("[Battle] trace finished");
+	}).detach();
+}
+
+// Drains the battle-script move-command ring into the log, timestamped, so the
+// issue cadence can be diffed between a 30fps and a 120fps capture.
+static void StartScriptMoveTraceWatcher()
+{
+	if (!g_logEnabled)
+		return;
+	std::thread([] {
+		const ULONGLONG t0 = GetTickCount64();
+		uint32_t seen = 0;
+		LogF("[ScriptMove] armed at framerate=%.0f (tag 0xE4/0xE5 = script move opcode)", g_framerate);
+		while (GetTickCount64() - t0 < 360000)
+		{
+			Sleep(10);
+			if (!g_smRing || !g_smHead)
+				continue;
+			const uint32_t head = *g_smHead;
+			while (seen != head)
+			{
+				const uint32_t slot = seen & 0x3F;
+				const uint32_t tagch = *reinterpret_cast<volatile uint32_t*>(g_smRing + slot * 8);
+				const uint32_t frames = *reinterpret_cast<volatile uint32_t*>(g_smRing + slot * 8 + 4);
+				LogF("[ScriptMove +%llu] op=0x%02X ch=%d frames=%u",
+					GetTickCount64() - t0, 0xE4 + ((tagch >> 16) & 1), tagch & 0xFFFF, frames);
+				seen++;
+			}
+		}
+		LogF("[ScriptMove] trace finished");
+	}).detach();
+}
+
+// Drains the frame-budget watchdog event ring (see g_wdRing) into the log. Each
+// entry is tagged; the actor low32 is mapped back to its channel via the battle
+// channel table so a 30fps capture can be diffed against a 120fps one. The key
+// question: at 120fps do state-1 legs die by TIMEOUT (cd6 reaching cd8 while the
+// translation phase is far below its duration = truncated at ~25%) rather than by
+// ARRIVAL, and does the run state (ENTER_S2) then never appear even though the
+// script keeps issuing RUN_ATTEMPTs.
+static void StartWatchdogTraceWatcher()
+{
+	if (!g_logEnabled || !g_gameBase)
+		return;
+	std::thread([] {
+		const ULONGLONG t0 = GetTickCount64();
+		uint32_t seen = 0;
+		LogF("[Watchdog] armed at framerate=%.0f (compare a 120fps run vs a 30fps run)", g_framerate);
+		while (GetTickCount64() - t0 < 360000)
+		{
+			Sleep(10);
+			if (!g_wdRing || !g_wdHead)
+				continue;
+			const uint32_t head = *g_wdHead;
+			while (seen != head)
+			{
+				const uint32_t slot = seen & 0x1FF;
+				volatile uint8_t* e = g_wdRing + slot * 24;
+				const uint32_t tag = *reinterpret_cast<volatile uint32_t*>(e + 0);
+				const uint32_t v0 = *reinterpret_cast<volatile uint32_t*>(e + 4);
+				const uint32_t v1 = *reinterpret_cast<volatile uint32_t*>(e + 8);
+				const uint32_t v2 = *reinterpret_cast<volatile uint32_t*>(e + 12);
+				const uint32_t v3 = *reinterpret_cast<volatile uint32_t*>(e + 16);
+				const uint32_t alow = *reinterpret_cast<volatile uint32_t*>(e + 20);
+				int ch = -1;
+				const uintptr_t tbl = *reinterpret_cast<volatile uintptr_t*>(g_gameBase + 0x667E20);
+				if (tbl)
+					for (int c = 0; c <= 0x41; c++)
+					{
+						const uintptr_t a = *reinterpret_cast<volatile uintptr_t*>(tbl + c * 8 + 0x18);
+						if (a && static_cast<uint32_t>(a) == alow) { ch = c; break; }
+					}
+				const float f2 = *reinterpret_cast<const float*>(&v2);
+				const float f3 = *reinterpret_cast<const float*>(&v3);
+				const unsigned long long now = GetTickCount64() - t0;
+				switch (tag)
+				{
+				case 1: case 2: case 3:
+					LogF("[Watchdog +%llu] ch=%d ENTER_S%u trans=%X turn=%X cd6=%u cd8=%u",
+						now, ch, tag, v0, v1, v2, v3);
+					break;
+				case 0x11:
+					LogF("[Watchdog +%llu] ch=%d KILL_TIMEOUT_S1 cd6=%u cd8=%u transPhase=%.3f transDur=%.3f",
+						now, ch, v0, v1, f2, f3);
+					break;
+				case 0x12:
+					LogF("[Watchdog +%llu] ch=%d KILL_ARRIVAL_S1 cd6=%u cd8=%u transPhase=%.3f transDur=%.3f",
+						now, ch, v0, v1, f2, f3);
+					break;
+				case 0x31:
+					LogF("[Watchdog +%llu] ch=%d KILL_TIMEOUT_S3turn cd6=%u cd8=%u turnPhase=%.3f turnDur=%.3f",
+						now, ch, v0, v1, f2, f3);
+					break;
+				case 0x32:
+					LogF("[Watchdog +%llu] ch=%d KILL_ARRIVAL_S3turn cd6=%u cd8=%u turnPhase=%.3f turnDur=%.3f",
+						now, ch, v0, v1, f2, f3);
+					break;
+				case 0x50:
+					LogF("[Watchdog +%llu] ch=%d RUN_ATTEMPT authoredFrames=%u", now, ch, v0);
+					break;
+				default:
+					LogF("[Watchdog +%llu] ch=%d tag=%X %X %X %X %X", now, ch, tag, v0, v1, v2, v3);
+					break;
+				}
+				seen++;
+			}
+		}
+		LogF("[Watchdog] trace finished");
+	}).detach();
+}
+
 static void StartMoveTraceWatcher()
 {
 	if (!g_logEnabled || !g_gameBase)
@@ -1802,6 +2148,43 @@ void OnInitializeHook()
 			ParametricASMJump("push rax; push rbx; mov eax, dword ptr [rip + ?1]; mov ebx, eax; inc eax; mov dword ptr [rip + ?1], eax; and ebx, 0xff; lea rax, [rip + ?0]; mov dword ptr [rax + rbx * 4], r8d; pop rbx; pop rax; mov rax, rsp; mov dword ptr [rax + 0x18], r8d", match, 0, 0x7);
 		}
 
+		// Battle event-script "move actor" telemetry ([Diagnostics] TraceScriptMove=1).
+		// Hooks the two script-VM opcodes that command an actor to move (0xE4 at
+		// 0x3633B0, 0xE5 at 0x3633E0). Both are thunks that read channel from
+		// float[rax+0x38] and a FRAME-COUNT duration from float[rax+0x3C], then tail-jmp
+		// to the handler. We replace those two cvttss2si (11 bytes, nothing branches
+		// into them) with the same two conversions plus a ring-log. r10/r11 are
+		// volatile scratch and are not argument registers, so clobbering them across
+		// the tail jump is safe; rax/rcx/rdx/r8 are left exactly as the handler expects.
+		if (GetPrivateProfileIntW(L"Diagnostics", L"TraceScriptMove", 0, wcModulePath) != 0)
+		{
+			auto smring = reinterpret_cast<uint8_t*>(trampoline->RawSpace(64 * 8));
+			memset(smring, 0, 64 * 8);
+			auto smhead = trampoline->Pointer<uint32_t>();
+			*smhead = 0;
+			g_smRing = smring;
+			g_smHead = smhead;
+			static const char* kSmAsm =
+				"cvttss2si r8d, dword ptr [rax + 0x3c]; cvttss2si edx, dword ptr [rax + 0x38]; "
+				"mov r10d, dword ptr [rip + ?1]; lea r11, [rip + ?0]; inc dword ptr [rip + ?1]; "
+				"and r10d, 0x3f; shl r10d, 3; "
+				"mov dword ptr [r11 + r10 * 1], edx; or dword ptr [r11 + r10 * 1], $0; "
+				"mov dword ptr [r11 + r10 * 1 + 4], r8d";
+			// opcode 0xE5
+			match = FindOne("48 8B C1 48 8B 0D ? ? ? ? 48 85 C9 74 10 F3 44 0F 2C 40 3C F3 0F 2C 50 38 E9 01 97 E4 FF");
+			pointers[0] = reinterpret_cast<uintptr_t>(smring);
+			pointers[1] = reinterpret_cast<uintptr_t>(smhead);
+			constants[0] = 0x10000;
+			ParametricASMJump(kSmAsm, match, 0x0F, 0x1A);
+			// opcode 0xE4
+			match = FindOne("48 8B C1 48 8B 0D ? ? ? ? 48 85 C9 74 10 F3 44 0F 2C 40 3C F3 0F 2C 50 38 E9 81 98 E4 FF");
+			pointers[0] = reinterpret_cast<uintptr_t>(smring);
+			pointers[1] = reinterpret_cast<uintptr_t>(smhead);
+			constants[0] = 0;
+			ParametricASMJump(kSmAsm, match, 0x0F, 0x1A);
+			LogF("[ScriptMove] hooks installed on battle script move opcodes 0xE4/0xE5");
+		}
+
 		// Movement telemetry: capture the player-control object at the walk-toggle
 		// (L3) handler so the movement trace can watch the speed-tier counter live.
 		if (GetPrivateProfileIntW(L"Diagnostics", L"TraceMove", 0, wcModulePath) != 0)
@@ -1853,6 +2236,97 @@ void OnInitializeHook()
 				ParametricASMJump("call ?1; test al, al; je A; inc dword ptr [rip + ?0]; A: nop", match, 0, 0x5);
 			}
 			LogF("[TraceMove] enabled: context capture + speed ring + 9 check-site counters");
+		}
+
+		// Chapter-2 stair sub-boss frame-budget watchdog trace ([Diagnostics] TraceWatchdog=1).
+		// See the g_wdRing comment for the mechanism. Installs 8 event hooks - three
+		// dispatcher-state entries (ccc=1/2/3), four leg kills tagged timeout-vs-arrival
+		// for state 1 (translation) and state 3 (turn servo), and the run-build attempt -
+		// each writing a 24-byte ring, then starts the watcher that drains it. Every hook
+		// filters to the boss/leader actor (word[actor+0x360]==0x2019) and re-executes the
+		// exact instruction it displaced; rax/r10/r11/flags are saved and restored so
+		// injecting mid-stepper is safe. All signatures were verified unique and byte-exact
+		// against the module image, and every asm block was test-assembled with keystone.
+		if (GetPrivateProfileIntW(L"Diagnostics", L"TraceWatchdog", 0, wcModulePath) != 0)
+		{
+			auto wdring = reinterpret_cast<uint8_t*>(trampoline->RawSpace(512 * 24));
+			memset(wdring, 0, 512 * 24);
+			auto wdhead = trampoline->Pointer<uint32_t>();
+			*wdhead = 0;
+			g_wdRing = wdring;
+			g_wdHead = wdhead;
+			pointers[0] = reinterpret_cast<uintptr_t>(wdring);
+			pointers[1] = reinterpret_cast<uintptr_t>(wdhead);
+
+			// rbx=actor prologue: filter to boss, reserve a 24-byte slot, write tag($0) and
+			// actor low32 (ebx), leave r11=&entry. Label A is the not-boss skip target.
+			const std::string P =
+				"push rax; push r10; push r11; pushfq; "
+				"movzx r11d, word ptr [rbx + 0x360]; cmp r11d, 0x2019; jne A; "
+				"mov r10d, dword ptr [rip + ?1]; inc dword ptr [rip + ?1]; and r10d, 0x1ff; imul r10d, r10d, 24; "
+				"lea r11, [rip + ?0]; add r11, r10; "
+				"mov dword ptr [r11], $0; mov dword ptr [r11 + 20], ebx; ";
+			const std::string EPI = "A: popfq; pop r11; pop r10; pop rax; ";
+			// state entry: v0=translation profile mode[0x160], v1=turn mode[0x1a8], v2=cd6, v3=cd8
+			const std::string payEnter =
+				"mov eax, dword ptr [rbx + 0x160]; mov dword ptr [r11 + 4], eax; "
+				"mov eax, dword ptr [rbx + 0x1a8]; mov dword ptr [r11 + 8], eax; "
+				"movzx eax, word ptr [rbx + 0xcd6]; mov dword ptr [r11 + 12], eax; "
+				"movzx eax, word ptr [rbx + 0xcd8]; mov dword ptr [r11 + 16], eax; ";
+			// leg kill: v0=cd6, v1=cd8, v2=profile phase, v3=profile duration (raw f32 bits)
+			auto payKill = [](const char* poff, const char* doff) {
+				return "movzx eax, word ptr [rbx + 0xcd6]; mov dword ptr [r11 + 4], eax; "
+					   "movzx eax, word ptr [rbx + 0xcd8]; mov dword ptr [r11 + 8], eax; "
+					   "mov eax, dword ptr [rbx + " + std::string(poff) + "]; mov dword ptr [r11 + 12], eax; "
+					   "mov eax, dword ptr [rbx + " + doff + "]; mov dword ptr [r11 + 16], eax; ";
+			};
+
+			// --- dispatcher-state entries (tag = state number) ---
+			constants[0] = 1;
+			match = FindOne("C7 83 CC 0C 00 00 01 00 00 00");
+			ParametricASMJump((P + payEnter + EPI + "mov dword ptr [rbx + 0xccc], 1").c_str(), match, 0, 0xA);
+			constants[0] = 2;
+			match = FindOne("C7 83 CC 0C 00 00 02 00 00 00");
+			ParametricASMJump((P + payEnter + EPI + "mov dword ptr [rbx + 0xccc], 2").c_str(), match, 0, 0xA);
+			constants[0] = 3;
+			match = FindOne("C7 83 CC 0C 00 00 03 00 00 00");
+			ParametricASMJump((P + payEnter + EPI + "mov dword ptr [rbx + 0xccc], 3").c_str(), match, 0, 0xA);
+
+			// --- state-1 leg kills (translation profile +0x160/phase+0x164/dur+0x168) ---
+			// signatures anchored on the preceding cmp[ccc]/je so the byte-identical timeout
+			// and arrival kill blocks are told apart by the je displacement (0x19 vs 0x1f);
+			// inject at the 'or byte[rbx+0xcd4],0x10' and re-execute it.
+			constants[0] = 0x11; // KILL_TIMEOUT_S1
+			match = FindOne("21 39 B3 CC 0C 00 00 74 19 80 8B D4 0C 00 00 10");
+			ParametricASMJump((P + payKill("0x164", "0x168") + EPI + "or byte ptr [rbx + 0xcd4], 0x10").c_str(), match, 0x9, 0x10);
+			constants[0] = 0x12; // KILL_ARRIVAL_S1
+			match = FindOne("B3 CC 0C 00 00 74 1F 80 8B D4 0C 00 00 10");
+			ParametricASMJump((P + payKill("0x164", "0x168") + EPI + "or byte ptr [rbx + 0xcd4], 0x10").c_str(), match, 0x7, 0xE);
+
+			// --- state-3 servo kills (turn profile +0x1a8/phase+0x1ac/dur+0x1b0) ---
+			constants[0] = 0x31; // KILL_TIMEOUT_S3
+			match = FindOne("AB CC 0C 00 00 74 19 80 8B D4 0C 00 00 10");
+			ParametricASMJump((P + payKill("0x1ac", "0x1b0") + EPI + "or byte ptr [rbx + 0xcd4], 0x10").c_str(), match, 0x7, 0xE);
+			constants[0] = 0x32; // KILL_ARRIVAL_S3
+			match = FindOne("AB CC 0C 00 00 74 1F 80 8B D4 0C 00 00 10");
+			ParametricASMJump((P + payKill("0x1ac", "0x1b0") + EPI + "or byte ptr [rbx + 0xcd4], 0x10").c_str(), match, 0x7, 0xE);
+
+			// --- run-build attempt (builder entry; rcx=actor, r8d=authored frame count) ---
+			// separate prologue: filter on rcx, store rcx low32, log r8d, re-execute the
+			// displaced 'mov [rsp+0x18], rbx' prologue store.
+			constants[0] = 0x50; // RUN_ATTEMPT
+			match = FindOne("48 89 5C 24 18 56 57 41 56 48 81 EC F0 00 00 00 48 8B D9 48 8B 49 08");
+			ParametricASMJump(
+				"push rax; push r10; push r11; pushfq; "
+				"movzx r11d, word ptr [rcx + 0x360]; cmp r11d, 0x2019; jne A; "
+				"mov r10d, dword ptr [rip + ?1]; inc dword ptr [rip + ?1]; and r10d, 0x1ff; imul r10d, r10d, 24; "
+				"lea r11, [rip + ?0]; add r11, r10; "
+				"mov dword ptr [r11], $0; mov dword ptr [r11 + 20], ecx; "
+				"mov dword ptr [r11 + 4], r8d; mov dword ptr [r11 + 8], 0; mov dword ptr [r11 + 12], 0; mov dword ptr [r11 + 16], 0; "
+				"A: popfq; pop r11; pop r10; pop rax; "
+				"mov qword ptr [rsp + 0x18], rbx", match, 0, 0x5);
+
+			LogF("[Watchdog] enabled: 8 event hooks (3 state entries, 4 s1/s3 kills, run attempts)");
 		}
 
 		// Analog movement ([Movement] AnalogTiers=1): the left stick's tilt
@@ -2005,6 +2479,7 @@ void OnInitializeHook()
 			if (disableTriggerDedup)
 				LogF("[Framerate] trigger dedup patches DISABLED via ini (bisect mode)");
 			float framerate = framerateint;
+			g_framerate = framerate;
 			if (framerate > 120.0f)
 			{
 				MessageBox(
@@ -2109,11 +2584,121 @@ void OnInitializeHook()
 			ParametricASMJump("mov [rax + 0xD0], cl; cmp cl, 0; je A; cmp dword ptr [rip + ?0], 1; je A; mov dword ptr [rip + ?1], 0x3D088889; jmp B; A: mov dword ptr [rip + ?1], $0; B: nop", movielimit, 0xA, 0x10);
 
 			//Characters walking speeds (with check for cutscenes) [ref: 0x00083CF8]
+			// The scaled function (0x1403C0C12) writes the per-frame delta to the mover:
+			// on the RUN branch (mover flag bit 0x2 set) it stores X=xmm1 (@0xC0C47),
+			// Y=xmm0 (@0xC0C42) and Z=xmm6 (@0xC0C59). The stock patch scales xmm1 (X)
+			// and xmm6 (Z) by 30/fps but NOT xmm0 (Y): xmm0 is computed at 0x1403C0C33,
+			// BEFORE our inject at 0x1403C0C3C, and flows straight to the Y store. So at
+			// 120fps the vertical delta of a run is 4x the horizontal - harmless on flat
+			// ground (Y=0 unless bit 0x2), but it wrecks a scripted stair climb like the
+			// ch2 sub-boss. [Movement] BossVerticalFix=1 also scales xmm0, completing the
+			// fix. On this branch xmm0 feeds only the Y store (X uses xmm1), so scaling it
+			// cannot double-scale X; bit-exact no-op at 30fps.
+			const bool bossVerticalFix = GetPrivateProfileIntW(L"Movement", L"BossVerticalFix", 0, wcModulePath) != 0;
 			match = FindOne("24 0F 28 CE F3 0F 59 4C 24 20 F3 0F 11 43 1C F3");
 			param_floats[0] = 30.0f / framerate;
 			pointers[0] = baseaddress + 0x658F70;
 			pointers[1] = baseaddress + 0x6D1CEC;
-			ParametricASMJump("mulss xmm1, dword ptr [rsp + 0x20]; cmp dword ptr [rip + ?0], 1; jnz A; cmp dword ptr [rip + ?1], 0; jnz B; A: mulss xmm1, %0; mulss xmm6, %0; B: nop", match, 0x4, 0xA);
+			{
+				std::string walkAsm = "mulss xmm1, dword ptr [rsp + 0x20]; cmp dword ptr [rip + ?0], 1; jnz A; cmp dword ptr [rip + ?1], 0; jnz B; A: mulss xmm1, %0; mulss xmm6, %0; ";
+				if (bossVerticalFix)
+					walkAsm += "mulss xmm0, %0; ";
+				walkAsm += "B: nop";
+				ParametricASMJump(walkAsm.c_str(), match, 0x4, 0xA);
+			}
+			if (bossVerticalFix)
+				LogF("[Movement] BossVerticalFix on: run vertical delta scaled to 30/%.0f", framerate);
+
+			//---- Experimental high-fps boss-movement fixes -------------------
+			//All four are EXPERIMENTAL and default to OFF, so the stock high-fps
+			//behaviour is the baseline. Trace evidence (30fps vs 120fps) shows the
+			//boss's scripted run state (mover flag bit 0x2 -> "mode 6", the only
+			//state in which [mover+0x78] is ever non-zero) is never entered at
+			//120fps at all, which none of these address; they are kept switchable
+			//so a clean baseline can be captured without a rebuild.
+			//  [Movement] BossFixPace / BossFixNav / BossFixTurn / BossFixProfile
+			const bool bossFixPace    = GetPrivateProfileIntW(L"Movement", L"BossFixPace", 0, wcModulePath) != 0;
+			const bool bossFixNav     = GetPrivateProfileIntW(L"Movement", L"BossFixNav", 0, wcModulePath) != 0;
+			const bool bossFixTurn    = GetPrivateProfileIntW(L"Movement", L"BossFixTurn", 0, wcModulePath) != 0;
+			const bool bossFixProfile = GetPrivateProfileIntW(L"Movement", L"BossFixProfile", 0, wcModulePath) != 0;
+			LogF("[Movement] boss experimental fixes: pace=%d nav=%d turn=%d profile=%d",
+				bossFixPace, bossFixNav, bossFixTurn, bossFixProfile);
+
+			//Boss/leader AI action pacing (high-fps freeze fix). The enemy-brain
+			//update (0x45C020) advances a boss's action-step counter [actor+0x934]
+			//once per [brain+0x1C4] countdown; that countdown decrements every
+			//RENDERED frame and reloads from a 30Hz-designed global [0x76D7D8], so
+			//above 30fps a scripted boss/leader runs out its action sequence
+			//~framerate/30x too fast and freezes (regular enemies skip this block
+			//via the class-bit fork at 0x45C2EA, so they are unaffected). Scale the
+			//reload by framerate/30 to restore the intended 30Hz cadence.
+			//NOTE: tested, did NOT fix the 120fps boss bug. Off by default.
+			if (bossFixPace)
+			{
+				int bossPace = static_cast<int>(framerate / 30.0f + 0.5f);
+				if (bossPace < 1) bossPace = 1;
+				match = FindOne("66 FF 8E C4 01 00 00 66 44 39 B6 C4 01 00 00 7F 6D 0F B7 05 80 15 31 00 66 89 86 C4 01 00 00");
+				constants[0] = static_cast<uintptr_t>(bossPace);
+				//eax already holds the reload value (from the preceding movzx at +0x11);
+				//scale it and store. Injecting on the store avoids re-reading the global.
+				ParametricASMJump("imul eax, eax, $0; mov word ptr [rsi + 0x1c4], ax", match, 0x18, 0x1f);
+				LogF("[Movement] boss AI pacing fix applied (action-step reload x%d for 30Hz)", bossPace);
+			}
+
+			//Boss navmesh path-following (high-fps beeline fix). The boss scripted
+			//"move to position" action steps a lead GUIDE point toward each route
+			//waypoint over a fixed FRAME COUNT (word[action+0x1bc], decremented
+			//1/frame, no dt) while the body chases the guide at a wall-clock-correct
+			//(30/fps-scaled) speed. Above 30fps the guide sprints ~fps/30x ahead of
+			//the body, so the steering vector aims at the FINAL destination and the
+			//boss beelines into geometry instead of hugging the route (only bosses
+			//run this scripted navmesh move; regulars chase the player live). Gate
+			//the two guide steppers to 30Hz so the guide advances in lockstep with
+			//the body. Ref: nav hunt wf_0a1dd08b; steppers 0x455A50 (curved) /
+			//0x455900 (linear), guide-apply 0x472900, integrator 0x3C0C80.
+			//NOTE: tested, did NOT fix the 120fps boss bug. Off by default. It also
+			//uses ONE shared beat counter for every actor that calls a stepper, so
+			//with two bosses on screen the gate fires erratically per actor.
+			if (bossFixNav)
+			{
+				int navStep = static_cast<int>(framerate / 30.0f + 0.5f);
+				if (navStep < 1) navStep = 1;
+				if (navStep > 1)
+				{
+					auto navPhase = trampoline->Pointer<uint32_t>();
+					*navPhase = 0;
+					constants[0] = static_cast<uintptr_t>(navStep);
+					//curved stepper 0x140455A50 (rcx=action): on a non-30Hz-beat
+					//frame return immediately (advance nothing); else run prologue.
+					match = FindOne("48 8B C4 48 89 58 10 55 48 8D 68 A1");
+					pointers[0] = reinterpret_cast<uintptr_t>(navPhase);
+					ParametricASMJump("push rcx; mov eax, dword ptr [rip + ?0]; inc eax; mov dword ptr [rip + ?0], eax; xor edx, edx; mov ecx, $0; div ecx; pop rcx; test edx, edx; je A; ret; A: mov rax, rsp; mov qword ptr [rax + 0x10], rbx", match, 0, 0x7);
+					//linear stepper 0x140455900 (rcx=action)
+					match = FindOne("40 53 48 81 EC A0 00 00 00 0F 29 B4");
+					pointers[0] = reinterpret_cast<uintptr_t>(navPhase);
+					ParametricASMJump("push rcx; mov eax, dword ptr [rip + ?0]; inc eax; mov dword ptr [rip + ?0], eax; xor edx, edx; mov ecx, $0; div ecx; pop rcx; test edx, edx; je A; ret; A: push rbx; sub rsp, 0xa0", match, 0, 0x8);
+					LogF("[Movement] boss navmesh path-follow fix applied (guide gated to 30Hz, step=%d)", navStep);
+				}
+			}
+
+			//Enemy navmesh STEERING turn (high-fps beeline fix, part 2). The AI
+			//move-to-position steering (0x449A50) turns the actor's heading toward
+			//the target by a FIXED +/-0.03 rad step per frame (and snaps within
+			//0.03 rad), with NO time term -> 0.9 rad/s at 30fps but 3.6 rad/s at
+			//120fps, so at high fps the actor instantly faces the FINAL target and
+			//beelines instead of lagging into the curve. Scale the step AND the
+			//snap threshold by 30/fps so angular velocity matches 30fps at any
+			//framerate (restores 30fps behavior for every actor that uses it).
+			//Ref: nav hunt wf_0a1dd08b candidate 0x44a0af.
+			//NOTE: tested, did NOT fix the 120fps boss bug. Off by default.
+			if (bossFixTurn && framerate > 30.0f)
+			{
+				match = FindOne("F3 0F 10 0D F5 5A 13 00 F3 0F 10 15 35 64 13 00 0F 2F C8 72 0B");
+				param_floats[0] = 0.03f * 30.0f / framerate;   //+step (and +threshold)
+				param_floats[1] = -0.03f * 30.0f / framerate;  //-step (and -threshold)
+				ParametricASMJump("movss xmm1, %0; movss xmm2, %1", match, 0, 0x10);
+				LogF("[Movement] enemy nav turn step scaled to 30Hz (%.4f rad/frame)", param_floats[0]);
+			}
 
 			//Controlled character turning speed (a bit broken above 90 fps) [ref: 0x00006734 to 0x00006744]
 			match = FindOne("F3 0F 59 49 40 F3 0F 59 CA F3 0F 59 51 34 F3 0F 59 0D 1F C4 3A 00");
@@ -2121,9 +2706,153 @@ void OnInitializeHook()
 			ParametricASMJump("movss xmm1, dword ptr [rcx + 0x40]; movss xmm2, dword ptr [rcx + 0x34]; mulss xmm1, %0", match, 0, 0x16);
 
 			//First cutscene slow-motion walk speed [ref: 0x00006998]
-			match = FindOne("20 5B C3 F3 0F 10 41 04 F3 0F 58 05 69 BE 3A 00");
-			param_floats[0] = 30.0f / framerate;
-			ParametricASMJump("addss xmm0, %0", match, 0x8, 0x10);
+			//This is the mode1 branch of the scripted motion-profile clock 0x1D3F00,
+			//which advances phase [rcx+4] by a hardcoded +1.0 per rendered frame.
+			//IMPORTANT: the same mode-1 profiles are what the battle event-script
+			//"move actor" opcodes (0xE4/0xE5) build for a scripted boss entrance, so
+			//this fix stretches those moves to their authored wall-clock length while
+			//the script VM's own per-command wait may still be counted in frames.
+			//That asymmetry is a live suspect for the 120fps sub-boss stair bug, hence
+			//the switch: [Movement] CutsceneWalkFix=0 disables it for A/B testing.
+			//Default 1 = the original mod's shipped behaviour.
+			if (GetPrivateProfileIntW(L"Movement", L"CutsceneWalkFix", 1, wcModulePath) != 0)
+			{
+				match = FindOne("20 5B C3 F3 0F 10 41 04 F3 0F 58 05 69 BE 3A 00");
+				// [Movement] TurnPhaseFullRate=1: the actual ch2 sub-boss carrier.
+				// Step E proved the boss's TRANSLATION profile (actor+0x160) is dead
+				// (mode 0) while its TURN profile (actor+0x1a8) is the only live mode-1
+				// profile - and this clock fix scales EVERY mode-1 profile, so it
+				// quartered the boss's turn phase at 120fps (traced rPhase steps 0.25 vs
+				// 1.0 at 30fps). The facing servo then never converges, the boss can't
+				// face its corridor and runs down the stairs; CutsceneWalkFix=0 "fixes"
+				// it only by returning EVERY turn to full rate (global cutscene speedup).
+				// The turn profile reaches the clock from exactly one site, 0x1401b960f
+				// (verified: no other caller leas actor+0x1a8). So run that one call at
+				// full rate and leave the other 8 - the cutscene TRANSLATION walk at
+				// 0x1401b9792 included - at 30/fps. A shared cell defaults to 30/fps
+				// (identical to the stock fix for all callers) and is briefly forced to
+				// 1.0 around the turn call, then restored; the region 0x1401b95f2..b9614
+				// is linear so the wrap is safe. Net: the boss's turn behaves as with
+				// CutsceneWalkFix=0, with none of its global side effect.
+				if (framerate > 30.0f && GetPrivateProfileIntW(L"Movement", L"TurnPhaseFullRate", 1, wcModulePath) != 0)
+				{
+					// Refined split (traced): running the WHOLE +0x1a8 turn at full rate
+					// regressed the player - a scripted "turn, then hand control over" step
+					// (state-4 waiter 0x14019c01a waits on [actor+0x1a8]==0 then zeroes
+					// [0x160]) self-terminates 4x early at h=1, so the tier-speed apply that
+					// follows lands before the analog watcher re-blends -> low initial speed.
+					// The right axis is NOT actor but PROFILE TYPE, told apart by entry phase:
+					// the facing SERVO (boss state 3, player stick-turn) is rebuilt every frame
+					// and reaches the clock with phase [rcx+4]==0; a scripted turn arrives with
+					// phase>0 from its 2nd frame. Rule in the arm: step 1.0 when phase==0
+					// (servo, full rate - kills decay/spin), else g_step=30/fps (scripted turn
+					// completes at the right wall-clock time). Gated to the +0x1a8 call only by
+					// g_phaseRule, set around 0x1401b960f, so the other 8 clock callers are
+					// untouched. At 30fps g_step==1.0 so both arms match: bit-exact no-op.
+					auto gStep = trampoline->Pointer<float>();     *gStep = 30.0f / framerate;
+					auto gPhaseRule = trampoline->Pointer<uint32_t>(); *gPhaseRule = 0;
+					auto gZero = trampoline->Pointer<float>();     *gZero = 0.0f;
+					auto gOne = trampoline->Pointer<float>();      *gOne = 1.0f;
+					pointers[0] = reinterpret_cast<uintptr_t>(gStep);
+					pointers[1] = reinterpret_cast<uintptr_t>(gPhaseRule);
+					pointers[2] = reinterpret_cast<uintptr_t>(gZero);
+					pointers[3] = reinterpret_cast<uintptr_t>(gOne);
+					ParametricASMJump("cmp dword ptr [rip + ?1], 0; je G; ucomiss xmm0, dword ptr [rip + ?2]; jne G; addss xmm0, dword ptr [rip + ?3]; jmp D; G: addss xmm0, dword ptr [rip + ?0]; D: nop", match, 0x8, 0x10);
+					// enable the phase rule only across the lone +0x1a8 clock call (E8 @0x1401b960f)
+					match = FindOne("F3 0F 10 1D 00 66 3C 00 0F 28 D0");
+					pointers[0] = reinterpret_cast<uintptr_t>(gPhaseRule);
+					pointers[1] = baseaddress + 0x1D3F00;          // clock 0x1401d3f00
+					// call via register: the framework's "call ?N" only resolves as the FIRST
+					// asm instruction; mid-block, load the target and call the register (r11 is
+					// volatile and the clock clobbers it anyway).
+					ParametricASMJump("mov dword ptr [rip + ?0], 1; lea r11, [rip + ?1]; call r11; mov dword ptr [rip + ?0], 0", match, 0xB, 0x10);
+					LogF("[Movement] TurnPhaseFullRate on: turn servo at full rate, scripted turns + translation kept at 30/%.0f", framerate);
+				}
+				else
+				{
+					param_floats[0] = 30.0f / framerate;
+					ParametricASMJump("addss xmm0, %0", match, 0x8, 0x10);
+					LogF("[Movement] cutscene/scripted-move profile clock scaled to 30/%.0f", framerate);
+				}
+			}
+			else
+				LogF("[Movement] cutscene/scripted-move profile clock fix DISABLED (A/B test)");
+
+			//Scripted motion-profile VELOCITY-UNIT fix -- the missing companion to
+			//the phase fix above, and the actual cause of the 120fps boss beeline.
+			//
+			//The profile's +0x30 field is the engine's velocity carrier. The curve
+			//evaluator 0x1D3890 writes it as the per-CALL displacement (s(t)-s_prev,
+			//at 0x1D38D2/0x1D390A/0x1D3957), EXCEPT on the terminal frame (0x1D3960)
+			//where it stores [rcx+0x3C], already a velocity. But every consumer reads
+			//it back as a per-30Hz-frame VELOCITY and uses it as the v0 seed when it
+			//REBUILDS the profile - e.g. the facing servo, rebuilt every single frame:
+			//  0x19BD7E lea rcx,[rbx+0x1A8] / 0x19BD9F movss xmm3,[rbx+0x1D8] (=+0x30)
+			//  / 0x19BDD4 call 0x1D3BF0, which zeroes the accumulator (0x1D3C67) and
+			//  the phase and re-seeds +0x30/+0x34 from that argument.
+			//So the recurrence is v(n+1) = v(n)*h + 0.5*a*h^2 for phase step h.
+			//At h=1.0 (30fps) it ramps linearly to the authored cap. Once the phase fix
+			//makes h=30/fps, it becomes a GEOMETRIC DECAY to a fixed point ~0.167*a per
+			//30Hz-frame at 120fps - roughly a 20x loss of turn authority. The actor can
+			//no longer turn, so it drives straight at its goal and ploughs into geometry
+			//it would normally walk around (the ch2 stair sub-boss jams on the railing).
+			//With the phase fix off, turn rate and translation are compressed by the
+			//same 4x, so the path SHAPE survives and only the wall-clock speed is wrong
+			//- exactly what the A/B test showed.
+			//Fix: rescale +0x30 back to per-30Hz-frame velocity units after each step,
+			//skipping the terminal frame (where it is already a velocity). Then
+			//v(n+1) = v(n) + 0.5*a*h, i.e. +0.5*a per 30Hz-frame at any framerate.
+			//Identity at 30fps (factor 1.0). Ref: hunt wf_0641a583.
+			//DEFAULT OFF: this over-reached. +0x30 is read BOTH as a v0 seed on
+			//profile rebuild (the facing servo) AND directly as this-frame's motion
+			//by most consumers, so scaling it globally x(fps/30) quadruples ALL actor
+			//movement and turning at 120fps and wrecks player control. Left switchable
+			//for further investigation only. Ref: broke everything, user test.
+			if (GetPrivateProfileIntW(L"Movement", L"ProfileVelocityFix", 0, wcModulePath) != 0)
+			{
+				//sig starts at 0x1D3F53 (movss [rcx+4],xmm0 / call 0x1D3890 / the two
+				//instructions we replace / jb). Inject 10 -> 0x1D3F5D, jumpback 19 ->
+				//0x1D3F66, a 9-byte region nothing branches into. rcx survives the
+				//call (0x1D3890 only uses it as a base); xmm0 holds the return value
+				//and is untouched; xmm5 is dead across the region; the trailing comiss
+				//re-establishes the flags the original jb consumes.
+				match = FindOne("F3 0F 11 41 04 E8 ? ? ? ? F3 0F 10 69 04 0F 2F 69 08 72");
+				param_floats[0] = framerate / 30.0f;
+				ParametricASMJump(
+					"movss xmm5, dword ptr [rcx + 4]; comiss xmm5, dword ptr [rcx + 8]; jae A; "
+					"movss xmm5, dword ptr [rcx + 0x30]; mulss xmm5, %0; "
+					"movss dword ptr [rcx + 0x30], xmm5; "
+					"A: movss xmm5, dword ptr [rcx + 4]; comiss xmm5, dword ptr [rcx + 8]",
+					match, 10, 19);
+				LogF("[Movement] scripted-profile velocity-unit fix applied (+0x30 x%.2f)", param_floats[0]);
+			}
+
+			//Scripted motion-profile clock, mode2 (edx==2) branch [0x1D3F1F] --
+			//the SIBLING of the cutscene-walk fix above, in the same function
+			//0x1D3F00, left unpatched by the original mod. This trapezoidal profile
+			//(accel/cruise/decel) is what drives a boss/leader's scripted "run to
+			//battle position" speed: the caller (0x1B9580) evaluates it and hands the
+			//FINITE DIFFERENCE of its output to SetSpeed 0x3C09A0 -> [mover+0x78].
+			//Because phase counts RENDERED frames (+1.0/frame, no dt) but the profile
+			//durations are authored for 30Hz, above 30fps the profile saturates
+			//~fps/30x too soon; once saturated its per-frame delta -> 0, so the boss'
+			//move speed collapses to 0, the speed-mover 0x3C0BC0 takes its zero
+			//branch and the boss freezes / falls back to the guide-delta and beelines
+			//into geometry (30fps trace: clean trapezoid plateaus at 19.000 & 72.000;
+			//120fps trace: a few accel blips then speed==0 for 993/996 samples).
+			//Scale the phase step by 30/fps exactly like the mode1 fix -> the profile
+			//spans the full wall-clock route at any framerate and the finite-diff
+			//speed stays healthy. Identity (x1.0) at 30fps. Ref: hunt wf_26440db7.
+			//NOTE: tested, did NOT fix the 120fps boss bug -- the trace shows the boss
+			//never enters the run state at all at 120fps, so rescaling the run's own
+			//profile cannot help. Kept switchable; off by default.
+			if (bossFixProfile)
+			{
+				match = FindOne("F3 0F 10 41 04 F3 0F 58 05 95 BE 3A 00");
+				param_floats[0] = 30.0f / framerate;
+				ParametricASMJump("addss xmm0, %0", match, 0x5, 0xD);
+				LogF("[Movement] boss scripted-move profile fix applied (mode2 phase step 30/%.0f)", framerate);
+			}
 
 			//Camera distance in the first cutscene [ref: 0x00155CB0]
 			match = FindOne("00 44 0F 29 44 24 70 F3 44 0F 10 05 DC BF 29 00");
@@ -2844,6 +3573,14 @@ void OnInitializeHook()
 			StartPitchTraceWatcher();
 		if (GetPrivateProfileIntW(L"Diagnostics", L"TraceMove", 0, wcModulePath) != 0)
 			StartMoveTraceWatcher();
+		if (GetPrivateProfileIntW(L"Diagnostics", L"TraceBattle", 0, wcModulePath) != 0)
+			StartBattleTraceWatcher();
+		if (GetPrivateProfileIntW(L"Diagnostics", L"TraceBossPos", 0, wcModulePath) != 0)
+			StartBossPosTraceWatcher();
+		if (GetPrivateProfileIntW(L"Diagnostics", L"TraceScriptMove", 0, wcModulePath) != 0)
+			StartScriptMoveTraceWatcher();
+		if (GetPrivateProfileIntW(L"Diagnostics", L"TraceWatchdog", 0, wcModulePath) != 0)
+			StartWatchdogTraceWatcher();
 		{
 			const int tierScan = GetPrivateProfileIntW(L"Diagnostics", L"TierScan", 0, wcModulePath);
 			if (tierScan == 2)

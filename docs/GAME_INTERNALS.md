@@ -144,6 +144,17 @@ cutscene gate reads the dead cell `0x6D1CEC`, so it is always active.
 - **Run builder** `0x14019B530` (state 2 trapezoid), walk setter `0x14019B8E0` (state 1),
   turn setter `0x14019B480` (state 3, budget 8 frames). Their callers are the ops above.
 
+### Lock-on camera (verified 2026-09-05)
+- Camera update function `0x1402f1ef0`; lock-on branch runs when `[0x658f48] == 4`. The stock code has
+  NO smoothing: each frame it computes the yaw error to the target and applies it fully (instant snap),
+  which is why the camera whips when an enemy circles the player.
+- Patched site `0x1402f278a` (signature `F3 0F 10 4C 24 30 41 0F 28 C1 41 0F 47 C0 F3 41 0F 58 CC`,
+  19 bytes): error `e` (xmm1) becomes `sign(e) * max(|e| - dead, 0) * gain`, with `dead` in radians and
+  `gain = 1 - (1 - p)^(30/fps)` recomputed by the camera watcher so the feel is fps-independent
+  (`p = LockFollowPercent/100`, `p >= 1` → gain 1 = stock).
+- Tuner window: the host exe has no comctl v6 manifest, so `TOOLINFOW.cbSize` must be `TTTOOLINFOW_V2_SIZE`
+  or `TTM_ADDTOOL` fails silently (no tooltips). Fixed in 0.5.4.
+
 ## 5. Enemy AI scheduler and events
 
 - **Tick** `0x140194A16`: gates = `[0x1406578F4]!=0`, game state, `[0x1406579BC]==0`,
@@ -239,5 +250,6 @@ leader's channel across in-field switches (traced: the controlled actor moved on
 | 0.5.1 | `TurnPhaseFullRate` | Commander Schmitz stair entrance: servo at full rate |
 | 0.5.2 | `AiEventKeepFix`, `EnemyTurnFullRate` | General Qator Bashtar freeze |
 | 0.5.3 | `AnalogGlobalsFix`, controlled-character lookup, `DashAtCap`, `AiCountdownFix` | analog movement after character switches, dash speed, enemy decision pacing |
+| 0.5.4 | `[Camera] LockFollowPercent`, `LockDeadZoneDegrees`; `[Movement] StickSaturationPercent` | lock-on camera soft follow + dead zone; diagonal stick saturation; tuner window regrouped, tooltips fixed |
 | — | `AnimLastFrameFix` (default 0) | superseded; its asm form is rejected at runtime |
 | — | `BossFixPace/Nav/Turn/Profile`, `ProfileVelocityFix`, `BossVerticalFix` (default 0) | dead or superseded experiments |

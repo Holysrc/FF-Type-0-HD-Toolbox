@@ -29,6 +29,9 @@ third-person game:
 - **Stick response curve**: most of the stick travel is a calm, precise "slow zone", the last
   bit ramps to full speed — with adjustable zone size, zone speed and start smoothness.
   Diagonals count as full deflection on both axes, so circling a target feels right.
+- **Calm lock-on camera**: the stock lock-on snaps the camera onto the enemy every frame and
+  whips around when it circles you. Now it follows smoothly, with adjustable follow strength
+  and a dead zone where the camera stays still while the enemy is near the center of the screen.
 - **Dynamic field of view**: the view widens slightly during fast turns and when looking
   steeply up or down, which adds a lot to the modern feel.
 - **Live tuning window** (`TuneWindow=1`): a small always-on-top window with a slider for

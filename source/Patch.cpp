@@ -365,6 +365,14 @@ static void StartBootTraceWatcher()
 // undo them. Values below the Far preset (negative) are experimental.
 static int g_camFree = -9999;
 static int g_camLock = -9999;
+// Lock-on camera follow ([Camera] LockFollowPercent / LockDeadZoneDegrees): the lock-on
+// camera has NO smoothing - every frame yaw = current + clamp(angle to target) (fn
+// 0x1402f1ef0, site 0x1402f278a). The hook turns the relative angle into
+// sign(rel)*max(|rel|-deadzone,0)*gain before it is added. gain is recomputed per fps so
+// the camera catches up in the same wall-clock time at 30 and 120 (100% = stock snap).
+static int g_lockFollowX10 = 1000, g_lockDeadDeg = 0;   // follow strength in tenths of a percent (1000 = 100% = stock)
+static volatile float* g_lockGainCell = nullptr;
+static volatile float* g_lockDeadCell = nullptr;
 static int g_padTurnPct = -1;
 static int g_mouseTurnPct = -1;
 static int g_vertTurnPct = -1; // vertical axis multiplier at base+0x611C8C, shared by pad and mouse
@@ -1901,11 +1909,20 @@ static void StartDynamicFovWatcher()
 
 static void StartCameraWatcher()
 {
-	if ((g_camFree == -9999 && g_camLock == -9999 && g_padTurnPct < 0 && g_mouseTurnPct < 0 && g_vertTurnPct < 0 && !g_tuneWindow) || !g_gameBase)
+	if ((g_camFree == -9999 && g_camLock == -9999 && g_padTurnPct < 0 && g_mouseTurnPct < 0 && g_vertTurnPct < 0 && !g_tuneWindow && !g_lockGainCell) || !g_gameBase)
 		return;
 	std::thread([] {
 		for (;;)
 		{
+			if (g_lockGainCell && g_lockDeadCell)
+			{
+				int x10 = g_lockFollowX10; if (x10 < 1) x10 = 1; if (x10 > 1000) x10 = 1000;
+				const float g = x10 / 1000.0f;
+				const float fps = g_framerate > 30.0f ? g_framerate : 30.0f;
+				*g_lockGainCell = (x10 >= 1000) ? 1.0f : 1.0f - powf(1.0f - g, 30.0f / fps);
+				int deg = g_lockDeadDeg; if (deg < 0) deg = 0; if (deg > 120) deg = 120;
+				*g_lockDeadCell = deg * 3.14159265f / 180.0f;
+			}
 			if (g_camFree != -9999)
 				*reinterpret_cast<volatile float*>(g_gameBase + 0x6BD128) = static_cast<float>(g_camFree);
 			if (g_camLock != -9999)
@@ -1928,8 +1945,10 @@ static void StartCameraWatcher()
 // dedicated trampoline floats). CurveInnerExponent still needs a restart.
 struct TuneParam
 {
+	const wchar_t* group;  // header shown above the first slider of each group
 	const wchar_t* label;
-	const wchar_t* tip;
+	const wchar_t* hint;   // one short line shown under the label
+	const wchar_t* tip;    // longer text in the hover tooltip
 	const wchar_t* section;
 	const wchar_t* iniKey;
 	int minV, maxV;
@@ -1940,42 +1959,62 @@ struct TuneParam
 static int g_tuneKneePos = 90, g_tuneKneeSpd = 40, g_tuneSat = 85;
 static int g_tuneInnerX10 = 20, g_tuneFovPct = 0;
 static TuneParam g_tuneParams[] = {
-	{ L"Camera distance",
-	  L"How far the camera sits from your character while exploring. Lower = farther away; negative values go beyond the launcher's \"Far\".",
+	{ L"Camera distance", L"Exploring",
+	  L"Lower = farther from the character",
+	  L"Camera distance while exploring. Lower values move the camera away; negative values go beyond the launcher's \"Far\" setting.",
 	  L"Camera", L"FreeCameraDistance",       -500, 300,  1, reinterpret_cast<volatile int*>(&g_camFree) },
-	{ L"Camera distance (lock-on)",
-	  L"Same as above, but while locked onto an enemy.",
+	{ L"Camera distance", L"Locked on",
+	  L"Same, while locked onto an enemy",
+	  L"Camera distance while locked onto an enemy. Lower = farther.",
 	  L"Camera", L"LockCameraDistance",       -500, 300,  1, reinterpret_cast<volatile int*>(&g_camLock) },
-	{ L"Turn speed \x2014 pad %",
-	  L"Fastest left/right camera speed on the gamepad, as % of the game's default (100 = unchanged).",
+	{ L"Lock-on camera", L"Follow strength %",
+	  L"100 = instant snap, 1 or less = slow drift",
+	  L"How hard the lock-on camera chases the enemy. 100 = the game's original instant snap. 1 or less = a slow, calm drift. Steps of 0.1.",
+	  L"Camera", L"LockFollowPercent",           1, 1000, 10, reinterpret_cast<volatile int*>(&g_lockFollowX10) },
+	{ L"Lock-on camera", L"Dead zone (degrees)",
+	  L"No camera motion while enemy is near center",
+	  L"While the enemy is within this many degrees of the screen center the lock-on camera does not move. 0 = always follow.",
+	  L"Camera", L"LockDeadZoneDegrees",          0, 120,  1, reinterpret_cast<volatile int*>(&g_lockDeadDeg) },
+	{ L"Turn speed", L"Gamepad %",
+	  L"Left/right speed, 100 = original",
+	  L"Fastest left/right camera speed on the gamepad, as % of the game's default.",
 	  L"Camera", L"PadTurnSpeedPercent",        10, 300,  1, reinterpret_cast<volatile int*>(&g_padTurnPct) },
-	{ L"Turn speed \x2014 mouse %",
+	{ L"Turn speed", L"Mouse %",
+	  L"Left/right speed, 100 = original",
 	  L"Fastest left/right camera speed with the mouse, as % of the game's default.",
 	  L"Camera", L"MouseTurnSpeedPercent",      10, 300,  1, reinterpret_cast<volatile int*>(&g_mouseTurnPct) },
-	{ L"Turn speed \x2014 up/down %",
-	  L"Fastest up/down camera speed (pad and mouse), as % of the game's default.",
+	{ L"Turn speed", L"Up/down %",
+	  L"Pad and mouse, 100 = original",
+	  L"Fastest up/down camera speed for both pad and mouse, as % of the game's default.",
 	  L"Camera", L"VerticalTurnSpeedPercent",    5, 200,  1, reinterpret_cast<volatile int*>(&g_vertTurnPct) },
-	{ L"Slow zone size %",
-	  L"How much of the stick's travel stays slow and precise. Example: 90 means the first 90% of the tilt is the calm zone, and only the last 10% ramps up to full speed.",
+	{ L"Right stick response", L"Slow zone size %",
+	  L"Share of the tilt that stays slow",
+	  L"Share of the stick travel that stays slow. 90 = the first 90% of the tilt is the calm zone, the last 10% ramps up to full speed.",
 	  L"Camera", L"CurveKneeDeflection",         5,  95,  1, reinterpret_cast<volatile int*>(&g_tuneKneePos) },
-	{ L"Slow zone speed %",
-	  L"Camera speed at the edge of the slow zone, as % of maximum. Lower = calmer, more precise aiming inside the zone.",
+	{ L"Right stick response", L"Slow zone speed %",
+	  L"Speed at the edge of the slow zone",
+	  L"Camera speed at the edge of the slow zone, as % of maximum. Lower = calmer aiming inside the zone.",
 	  L"Camera", L"CurveKneeSpeed",              1,  99,  1, reinterpret_cast<volatile int*>(&g_tuneKneeSpd) },
-	{ L"Start smoothness (1-3)",
-	  L"How gently the camera starts moving near the stick center: 1 = even response, 3 = very soft start (tiny tilts barely move the camera). Fractions like 2.5 work.",
+	{ L"Right stick response", L"Start softness (1-3)",
+	  L"1 = even, 3 = tiny tilts barely move",
+	  L"How gently the camera starts moving near the stick center. 1 = even response, 3 = very soft start. Fractions like 2.5 work.",
 	  L"Camera", L"CurveInnerExponent",         10,  30, 10, reinterpret_cast<volatile int*>(&g_tuneInnerX10) },
-	{ L"Full-tilt threshold %",
-	  L"Stick tilt that already counts as 100%. Real pads don't reach the full range on diagonals \x2014 lowering this keeps slightly-off-axis tilts at full speed.",
+	{ L"Right stick response", L"Full-tilt threshold %",
+	  L"Tilt that already counts as 100%",
+	  L"Stick tilt that already counts as full. Real pads do not reach 100% on diagonals; lowering this keeps slightly off-axis tilts at full speed.",
 	  L"Camera", L"CurveSaturation",            50, 100,  1, reinterpret_cast<volatile int*>(&g_tuneSat) },
-	{ L"FOV boost when turning %",
-	  L"Widens the view a little while the camera spins fast, for a modern sense of speed. 0 = off.",
+	{ L"Field of view", L"Base FOV %",
+	  L"100 = original",
+	  L"Base field of view as % of the game's original.",
+	  L"FOV",    L"FOVPercentage",              60, 150,  1, reinterpret_cast<volatile int*>(&g_tuneFovPct) },
+	{ L"Field of view", L"Boost when turning %",
+	  L"Widens the view during fast turns, 0 = off",
+	  L"Widens the view a little while the camera spins fast, for a sense of speed. 0 = off.",
 	  L"Camera", L"DynamicFOVPercent",           0,  30,  1, reinterpret_cast<volatile int*>(&g_dynFovPct) },
-	{ L"FOV boost looking up/down %",
+	{ L"Field of view", L"Boost looking up/down %",
+	  L"Widens the view at steep angles, 0 = off",
 	  L"Widens the view as you tilt the camera steeply up or down. 0 = off.",
 	  L"Camera", L"PitchFOVPercent",             0, 100,  1, reinterpret_cast<volatile int*>(&g_pitchFovPct) },
-	{ L"Field of view %",
-	  L"Base field of view. 100 = the game's original.",
-	  L"FOV",    L"FOVPercentage",              60, 150,  1, reinterpret_cast<volatile int*>(&g_tuneFovPct) },
 };
 const int TUNE_COUNT = sizeof(g_tuneParams) / sizeof(g_tuneParams[0]);
 static HWND g_tuneSliders[TUNE_COUNT];
@@ -2077,6 +2116,17 @@ static LRESULT CALLBACK TuneWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 			LogF("[Tuner] settings saved to ini");
 		}
 		return 0;
+	case WM_CTLCOLORSTATIC:
+	{
+		const int id = GetDlgCtrlID(reinterpret_cast<HWND>(lp));
+		if (id >= 3000 && id < 3000 + TUNE_COUNT) // hint lines in grey
+		{
+			SetTextColor(reinterpret_cast<HDC>(wp), RGB(96, 96, 96));
+			SetBkMode(reinterpret_cast<HDC>(wp), TRANSPARENT);
+			return reinterpret_cast<LRESULT>(GetSysColorBrush(COLOR_BTNFACE));
+		}
+		break;
+	}
 	case WM_CLOSE:
 		ShowWindow(hwnd, SW_MINIMIZE);
 		return 0;
@@ -2098,47 +2148,96 @@ static void StartTuneWindow()
 		wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
 		wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
 		RegisterClassW(&wc);
-		const int rowH = 52;
-		HWND hwnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, L"FFT0HDTuner", L"FFT0HD Tuner",
-			WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, 40, 40, 340, TUNE_COUNT * rowH + 90, nullptr, nullptr, wc.hInstance, nullptr);
+		// Layout: two columns of groups; each param = label + edit, a hint line, a slider.
+		const int colW = 320, gap = 14, margin = 10, rowH = 64, headH = 24;
+		int colOf[TUNE_COUNT], yOf[TUNE_COUNT];
+		bool headAt[TUNE_COUNT];
+		int total = 0;
+		for (int i = 0; i < TUNE_COUNT; i++)
+			total += rowH + ((i == 0 || wcscmp(g_tuneParams[i].group, g_tuneParams[i - 1].group) != 0) ? headH : 0);
+		int col = 0, y = margin, colH[2] = { 0, 0 };
+		for (int i = 0; i < TUNE_COUNT; i++)
+		{
+			const bool head = i == 0 || wcscmp(g_tuneParams[i].group, g_tuneParams[i - 1].group) != 0;
+			if (head && col == 0 && y - margin >= total / 2) // start the second column at a group boundary
+			{
+				colH[0] = y;
+				col = 1;
+				y = margin;
+			}
+			headAt[i] = head;
+			if (head)
+				y += headH;
+			colOf[i] = col;
+			yOf[i] = y;
+			y += rowH;
+		}
+		colH[col] = y;
+		const int bodyH = colH[0] > colH[1] ? colH[0] : colH[1];
+		const int clientW = margin * 2 + colW * 2 + gap, clientH = bodyH + 46;
+		RECT wr = { 0, 0, clientW, clientH };
+		AdjustWindowRectEx(&wr, WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, FALSE, WS_EX_TOPMOST | WS_EX_TOOLWINDOW);
+		HWND hwnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, L"FFT0HDTuner", L"FFT0HD Camera Tuner",
+			WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, 40, 40, wr.right - wr.left, wr.bottom - wr.top, nullptr, nullptr, wc.hInstance, nullptr);
 		const HFONT font = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+		LOGFONTW lf = {};
+		GetObjectW(font, sizeof(lf), &lf);
+		lf.lfWeight = FW_BOLD;
+		const HFONT bold = CreateFontIndirectW(&lf);
+		// Tooltip control. The host has no comctl v6 manifest, so TOOLINFOW must be passed with the
+		// v2 size or TTM_ADDTOOL silently fails (that is why no tips ever showed before).
 		HWND tips = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr, WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
 			CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, hwnd, nullptr, wc.hInstance, nullptr);
-		SendMessageW(tips, TTM_SETMAXTIPWIDTH, 0, 320);
+		SendMessageW(tips, TTM_SETMAXTIPWIDTH, 0, 300);
 		SendMessageW(tips, TTM_SETDELAYTIME, TTDT_AUTOPOP, 30000); // keep tips up long enough to read
+		SendMessageW(tips, TTM_SETDELAYTIME, TTDT_INITIAL, 300);
 		auto addTip = [&](HWND ctl, const wchar_t* text) {
 			TOOLINFOW ti = {};
-			ti.cbSize = sizeof(ti);
+			ti.cbSize = TTTOOLINFOW_V2_SIZE;
 			ti.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
 			ti.hwnd = hwnd;
 			ti.uId = reinterpret_cast<UINT_PTR>(ctl);
 			ti.lpszText = const_cast<wchar_t*>(text);
-			SendMessageW(tips, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&ti));
+			if (!SendMessageW(tips, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&ti)))
+				LogF("[Tuner] TTM_ADDTOOL failed for '%ls'", text);
 		};
 		for (int i = 0; i < TUNE_COUNT; i++)
 		{
+			const int x = margin + colOf[i] * (colW + gap);
+			const int yy = yOf[i];
+			if (headAt[i])
+			{
+				HWND h = CreateWindowExW(0, L"STATIC", g_tuneParams[i].group, WS_CHILD | WS_VISIBLE,
+					x, yy - headH + 4, colW, 18, hwnd, nullptr, wc.hInstance, nullptr);
+				SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(bold), TRUE);
+			}
 			g_tuneLabels[i] = CreateWindowExW(0, L"STATIC", g_tuneParams[i].label, WS_CHILD | WS_VISIBLE | SS_NOTIFY,
-				12, 10 + i * rowH, 228, 18, hwnd, nullptr, wc.hInstance, nullptr);
+				x + 4, yy + 3, colW - 84, 18, hwnd, nullptr, wc.hInstance, nullptr);
+			HWND hint = CreateWindowExW(0, L"STATIC", g_tuneParams[i].hint, WS_CHILD | WS_VISIBLE | SS_NOTIFY,
+				x + 4, yy + 20, colW - 84, 16, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(3000 + i)), wc.hInstance, nullptr);
 			g_tuneEdits[i] = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_RIGHT,
-				248, 7 + i * rowH, 68, 20, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(2000 + i)), wc.hInstance, nullptr);
-			g_tuneSliders[i] = CreateWindowExW(0, TRACKBAR_CLASSW, L"", WS_CHILD | WS_VISIBLE | TBS_HORZ,
-				8, 28 + i * rowH, 308, 22, hwnd, nullptr, wc.hInstance, nullptr);
+				x + colW - 72, yy + 2, 68, 20, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(2000 + i)), wc.hInstance, nullptr);
+			g_tuneSliders[i] = CreateWindowExW(0, TRACKBAR_CLASSW, L"", WS_CHILD | WS_VISIBLE | TBS_HORZ | TBS_NOTICKS,
+				x, yy + 38, colW, 22, hwnd, nullptr, wc.hInstance, nullptr);
 			SendMessageW(g_tuneSliders[i], TBM_SETRANGE, TRUE, MAKELPARAM(g_tuneParams[i].minV, g_tuneParams[i].maxV));
 			int v = *g_tuneParams[i].value;
 			if (v < g_tuneParams[i].minV) v = g_tuneParams[i].minV;
 			if (v > g_tuneParams[i].maxV) v = g_tuneParams[i].maxV;
 			SendMessageW(g_tuneSliders[i], TBM_SETPOS, TRUE, v);
 			SendMessageW(g_tuneLabels[i], WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+			SendMessageW(hint, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
 			SendMessageW(g_tuneEdits[i], WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
 			SetWindowSubclass(g_tuneEdits[i], TuneEditProc, 1, i);
 			TuneSetEditText(i);
 			addTip(g_tuneLabels[i], g_tuneParams[i].tip);
+			addTip(hint, g_tuneParams[i].tip);
 			addTip(g_tuneSliders[i], g_tuneParams[i].tip);
 			addTip(g_tuneEdits[i], g_tuneParams[i].tip);
 		}
 		HWND saveBtn = CreateWindowExW(0, L"BUTTON", L"Save to ini", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
-			90, 12 + TUNE_COUNT * rowH, 150, 30, hwnd, reinterpret_cast<HMENU>(1000), wc.hInstance, nullptr);
+			(clientW - 150) / 2, bodyH + 8, 150, 30, hwnd, reinterpret_cast<HMENU>(1000), wc.hInstance, nullptr);
 		SendMessageW(saveBtn, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+		addTip(saveBtn, L"Writes every value above into FFT0HD Unlocker.ini. Changes apply live even without saving.");
 		ShowWindow(hwnd, SW_SHOWNOACTIVATE);
 		MSG m;
 		while (GetMessageW(&m, nullptr, 0, 0) > 0)
@@ -3956,6 +4055,34 @@ void OnInitializeHook()
 					curveasm += "movss xmm0, dword ptr [rip + ?0]; mulss xmm0, xmm1; mulss xmm2, xmm0";
 					ParametricASMJump(curveasm.c_str(), match, 0xE, 0x1A);
 				}
+			}
+
+			//Lock-on camera soft follow ([Camera] LockFollowPercent, LockDeadZoneDegrees;
+			//live in the tuner). See the g_lockFollowPct comment. Installed only when a
+			//non-default value is set or the tuner is on, so stock stays byte-identical.
+			{
+				wchar_t lf[32] = L"100";
+				GetPrivateProfileStringW(L"Camera", L"LockFollowPercent", L"100", lf, 32, wcModulePath);
+				g_lockFollowX10 = static_cast<int>(wcstof(lf, nullptr) * 10.0f + 0.5f);
+				if (g_lockFollowX10 < 1) g_lockFollowX10 = 1;
+				if (g_lockFollowX10 > 1000) g_lockFollowX10 = 1000;
+			}
+			g_lockDeadDeg = GetPrivateProfileIntW(L"Camera", L"LockDeadZoneDegrees", 0, wcModulePath);
+			if (g_lockFollowX10 != 1000 || g_lockDeadDeg != 0 || g_tuneWindow)
+			{
+				auto lockDead = trampoline->Pointer<float>(); *lockDead = 0.0f;
+				auto lockGain = trampoline->Pointer<float>(); *lockGain = 1.0f;
+				match = FindOne("F3 0F 10 4C 24 30 41 0F 28 C1 41 0F 47 C0 F3 41 0F 58 CC");
+				pointers[0] = reinterpret_cast<uintptr_t>(lockDead);
+				pointers[1] = reinterpret_cast<uintptr_t>(lockGain);
+				ParametricASMJump(
+					"movss xmm1, dword ptr [rsp + 0x30]; movaps xmm0, xmm9; cmova eax, r8d; "
+					"movaps xmm2, xmm1; mulss xmm2, xmm2; sqrtss xmm2, xmm2; subss xmm2, dword ptr [rip + ?0]; maxss xmm2, xmm9; "
+					"comiss xmm1, xmm9; jae P; xorps xmm3, xmm3; subss xmm3, xmm2; movaps xmm2, xmm3; "
+					"P: mulss xmm2, dword ptr [rip + ?1]; movaps xmm1, xmm2; addss xmm1, xmm12", match, 0, 0x13);
+				g_lockDeadCell = lockDead;
+				g_lockGainCell = lockGain;
+				LogF("[Camera] lock-on soft follow: strength %.1f%%, dead zone %d deg", g_lockFollowX10 / 10.0f, g_lockDeadDeg);
 			}
 
 			//Fix controller camera speed (when transitioning to lock-on)

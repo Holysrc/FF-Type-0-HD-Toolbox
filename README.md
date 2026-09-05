@@ -13,6 +13,14 @@ high-framerate timing fixes. One .asi plugin, no game files touched.
 > (intro skip, modern camera, analog movement, timing fixes, crash protection).
 > Everything below is the original README.
 
+## Camera tuning window
+
+Set `TuneWindow = 1` in `FFT0HD Unlocker.ini` and a small always-on-top settings window
+opens next to the game: camera distance, lock-on follow, turn speeds, stick response and
+field of view, each as a slider with a one-line explanation and a longer hover tip.
+Drag a slider and the camera changes instantly in-game; press **Save to ini** to keep the
+values. Works best with the game in windowed or borderless mode.
+
 ## Resolution
 
 This tool allows you inject your own resolution into the game, freeing it from the hardcoded list of resolutions that it normally ships with.

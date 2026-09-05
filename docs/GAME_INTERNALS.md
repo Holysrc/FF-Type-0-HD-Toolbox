@@ -188,7 +188,9 @@ cutscene gate reads the dead cell `0x6D1CEC`, so it is always active.
   publishes only for the controlled channel (7 sites).
 - **Native L3 handler** `0x140273D10`: finds the controlled actor (see §7), cycles
   `[0x658BD8]`, applies the row. The mod rewires it into a 1↔2 cap toggle.
-- **Analog watcher** (`StartAutoTierWatcher`, 16 ms): m1 = lerp by stick magnitude, m2/m3
+- Pad stick gate is not circular: full tilt reads 94–99 % on the axes but ~85 % on diagonals
+  (`LS 241..252,0` vs `175,127`). `StickSaturationPercent` (default 85) treats ≥ 85 % as full.
+- **Analog watcher** (`StartAutoTierWatcher`, 16 ms): m1 = lerp by (saturated) stick magnitude, m2/m3
   = cap row (`DashAtCap`), re-applies when the global m1 or the actor's live `+0x298`
   deviates from `const[mode]·m1`, skips outside modes 7..9 and in cutscenes.
 
@@ -225,6 +227,9 @@ leader's channel across in-field switches (traced: the controlled actor moved on
 - Analog speed drops were not the applier's mode trap alone and not party-global pollution
   alone: the decisive part was the wrong controlled-character cell (§7).
 - Kill/Break Sight windows are real-time-correct at 60/120 fps (measured by sound bursts).
+- Combat A/B with the mod (same area, 30 vs 120 fps, 2026-09-05): damage per hit identical (183 vs 184),
+  Kill Sight window 1.00 s both (30 vs 118 sound requests), hits taken 6 vs 3 — no evidence that 120 fps
+  makes fights harder. Perceived difficulty = the game's accuracy/RNG. (`TraceCombat` + `TraceSounds`.)
 - The end-of-chapter-1 voice cutoff happens at vanilla 30 fps too.
 
 ## 10. Fixes shipped in this fork (post-0.5)

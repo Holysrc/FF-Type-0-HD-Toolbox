@@ -5,3 +5,6 @@ premake5.exe
 *.exe
 *.bin
 *.log
+
+# runtime dump of the game module (game code, never commit)
+dump/

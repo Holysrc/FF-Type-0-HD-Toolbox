@@ -16,7 +16,7 @@ All patches live in `source/Patch.cpp`. Released at https://github.com/Holysrc/F
   (find MSBuild via `vswhere` if the path differs). Output: `build/bin/Win64/Release/FFT0HD Unlocker.asi`.
   `source/Utils` (submodule) needs two local MSVC-compat edits (no `stdext::make_checked_array_iterator`,
   add `<string>`); they are intentionally not committed.
-- Deploy directly to the TEST PC over the LAN: `\192.168.1.214\FINAL FANTASY TYPE-0 HD\WIN\` (host ALIEN; use the IP,
+- Deploy directly to the TEST PC over the LAN: `\\192.168.1.214\FINAL FANTASY TYPE-0 HD\WIN\` (host ALIEN; use the IP,
   the name resolves to Tailscale and SMB fails; use the PowerShell tool for UNC paths). Copy the `.asi` there,
   edit `FFT0HD Unlocker.ini` there, read `FFT0HD Unlocker.log` there. The game must be closed while copying.
   Fallback local install: `C:\Program Files (x86)\Steam\steamapps\common\FINAL FANTASY TYPE-0 HD\WIN\`.

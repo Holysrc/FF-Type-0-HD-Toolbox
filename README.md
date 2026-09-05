@@ -21,6 +21,8 @@ field of view, each as a slider with a one-line explanation and a longer hover t
 Drag a slider and the camera changes instantly in-game; press **Save to ini** to keep the
 values. Works best with the game in windowed or borderless mode.
 
+<p align="center"><img src="docs/tuner.png" width="900" alt="Camera tuning window next to the game"></p>
+
 ## Resolution
 
 This tool allows you inject your own resolution into the game, freeing it from the hardcoded list of resolutions that it normally ships with.

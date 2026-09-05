@@ -473,6 +473,99 @@ static volatile uint32_t* g_chkCells[9] = {};
 // so a frame-broken scripted spawn/entrance ("appears in wrong location and
 // runs into a wall at high fps, spawns on-spot at 30fps") can be pinned by
 // comparing a 120fps run to a 30fps run.
+// Hardware write watch ([Diagnostics] WatchAiEvent=1): a DR0 data breakpoint on the
+// AI-block event word [aib(ch)+0x1a0] of the boss (armed by the BossPos watcher once
+// the 0x200B boss exists), with a vectored exception handler that records the RIP of
+// every instruction writing it. Names the code that raises the "attack now" event bit
+// (bit 1) that General Qator Bashtar's idle loop waits on and that stops arriving at 120fps.
+static bool g_watchAiEvent = false;
+static volatile uint32_t g_hwHitRip[64];
+static volatile uint32_t g_hwHitCnt[64];
+static volatile uint32_t g_hwHitVal[64];
+static LONG CALLBACK HwWatchVEH(PEXCEPTION_POINTERS ep)
+{
+	if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_SINGLE_STEP && (ep->ContextRecord->Dr6 & 1))
+	{
+		const uint32_t rip = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(ep->ExceptionRecord->ExceptionAddress));
+		const uint32_t val = *reinterpret_cast<volatile uint32_t*>(static_cast<uintptr_t>(ep->ContextRecord->Dr0));
+		for (int i = 0; i < 64; i++)
+		{
+			if (g_hwHitRip[i] == rip) { g_hwHitCnt[i]++; g_hwHitVal[i] = val; break; }
+			if (g_hwHitRip[i] == 0) { g_hwHitRip[i] = rip; g_hwHitCnt[i] = 1; g_hwHitVal[i] = val; break; }
+		}
+		ep->ContextRecord->Dr6 = 0;
+		ep->ContextRecord->EFlags |= 0x10000; // RF
+		return EXCEPTION_CONTINUE_EXECUTION;
+	}
+	return EXCEPTION_CONTINUE_SEARCH;
+}
+static void ArmHwWatch(uintptr_t addr)
+{
+	AddVectoredExceptionHandler(1, HwWatchVEH);
+	const DWORD pid = GetCurrentProcessId(), me = GetCurrentThreadId();
+	HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+	if (snap == INVALID_HANDLE_VALUE) return;
+	THREADENTRY32 te; te.dwSize = sizeof(te);
+	int armed = 0;
+	if (Thread32First(snap, &te))
+		do {
+			if (te.th32OwnerProcessID != pid || te.th32ThreadID == me) continue;
+			HANDLE h = OpenThread(THREAD_ALL_ACCESS, FALSE, te.th32ThreadID);
+			if (!h) continue;
+			if (SuspendThread(h) != (DWORD)-1)
+			{
+				CONTEXT ctx; memset(&ctx, 0, sizeof(ctx)); ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+				if (GetThreadContext(h, &ctx))
+				{
+					ctx.Dr0 = addr;
+					ctx.Dr7 = (ctx.Dr7 & ~0xF0003ull) | 0x1 | (0x1 << 16) | (0x3 << 18); // L0, write, 4 bytes
+					if (SetThreadContext(h, &ctx)) armed++;
+				}
+				ResumeThread(h);
+			}
+			CloseHandle(h);
+		} while (Thread32Next(snap, &te));
+	CloseHandle(snap);
+	LogF("[HwWatch] DR0 write watch on %p armed in %d threads", (void*)addr, armed);
+	std::thread([] {
+		uint32_t seen[64] = {};
+		for (;;)
+		{
+			Sleep(1000);
+			for (int i = 0; i < 64; i++)
+			{
+				const uint32_t rip = g_hwHitRip[i];
+				if (!rip) break;
+				const uint32_t c = g_hwHitCnt[i];
+				if (c != seen[i]) { LogF("[HwWatch] writer rip=%X hits=%u lastval=%X", rip, c, g_hwHitVal[i]); seen[i] = c; }
+			}
+		}
+	}).detach();
+}
+
+// F10 live frame-cap toggle ([Diagnostics] FpsToggleKey=1) - see the frameratelimit patch.
+static volatile float* g_fpsCapCell = nullptr;
+static float g_fpsCapValue = 1.0f / 30.0f;
+static void StartFpsToggleWatcher()
+{
+	if (!g_fpsCapCell)
+		return;
+	std::thread([] {
+		bool at30 = false;
+		LogF("[FpsToggle] F10 toggles the live frame cap %.0f <-> 30", 1.0f / g_fpsCapValue);
+		for (;;)
+		{
+			Sleep(50);
+			if (GetAsyncKeyState(VK_F10) & 1)
+			{
+				at30 = !at30;
+				*g_fpsCapCell = at30 ? (1.0f / 30.0f) : g_fpsCapValue;
+				LogF("[FpsToggle +%llu] cap now %.0f", GetTickCount64(), at30 ? 30.0f : 1.0f / g_fpsCapValue);
+			}
+		}
+	}).detach();
+}
+
 static void StartBossPosTraceWatcher()
 {
 	if (!g_logEnabled || !g_gameBase)
@@ -501,10 +594,49 @@ static void StartBossPosTraceWatcher()
 			const unsigned long long now = GetTickCount64() - t0;
 			const uintptr_t tbl = *reinterpret_cast<volatile uintptr_t*>(g_gameBase + 0x667E20);
 			if (!tbl) continue;
+			// [Roster] once per second: EVERY actor in the channel table (any class), so the
+			// visible boss can be identified even when it is not a 0x2019-class actor.
+			{
+				static uint32_t rosterTick = 0;
+				if ((++rosterTick % 25) == 0)
+					for (int ch = 0; ch <= 0x41; ch++) {
+						const uintptr_t a = *reinterpret_cast<volatile uintptr_t*>(tbl + ch * 8 + 0x18);
+						if (!a) continue;
+						const int mi = *reinterpret_cast<volatile signed char*>(a + 0x364);
+						uintptr_t mv = 0;
+						if (mi >= 0 && mi < 8) mv = *reinterpret_cast<volatile uintptr_t*>(a + 0x2D0 + mi * 0x38);
+						LogF("[Roster +%llu] ch=%d state=%04X mode12=%u pos=%.0f,%.0f,%.0f motion=%X hp=%u/%u f95c=%02X f95d=%02X c64=%u",
+							now, ch, *reinterpret_cast<volatile uint16_t*>(a + 0x360), *reinterpret_cast<volatile uint8_t*>(a + 0x12),
+							mv ? rf(mv + 0x08) : 0.f, mv ? rf(mv + 0x0c) : 0.f, mv ? rf(mv + 0x10) : 0.f,
+							*reinterpret_cast<volatile uint16_t*>(a + 0x884),
+							*reinterpret_cast<volatile uint32_t*>(a + 0x934), *reinterpret_cast<volatile uint32_t*>(a + 0x938),
+							*reinterpret_cast<volatile uint8_t*>(a + 0x95c), *reinterpret_cast<volatile uint8_t*>(a + 0x95d),
+							*reinterpret_cast<volatile uint32_t*>(a + 0xc64));
+					}
+			}
 			for (int ch = 0; ch <= 0x41; ch++) {
 				const uintptr_t a = *reinterpret_cast<volatile uintptr_t*>(tbl + ch * 8 + 0x18);
 				if (!a) continue;
-				if ((*reinterpret_cast<volatile uint16_t*>(a + 0x360)) != 0x2019) continue; // boss/leader only
+				{
+					const uint16_t st = *reinterpret_cast<volatile uint16_t*>(a + 0x360);
+					if (st != 0x2019 && st != 0x200B) continue; // boss/leader classes (0x200B = General Qator Bashtar)
+					// [Diagnostics] WatchAiEvent=1: arm the DR0 write watch on this boss's AI-block
+					// event word once (see ArmHwWatch)
+					static bool hwArmed = false;
+					if (g_watchAiEvent && !hwArmed && st == 0x200B)
+					{
+						const uintptr_t aitbl = *reinterpret_cast<volatile uintptr_t*>(g_gameBase + 0x658840);
+						if (aitbl)
+						{
+							const uintptr_t aib = aitbl + static_cast<uintptr_t>(ch) * 0x5a8;
+							if (*reinterpret_cast<volatile int8_t*>(aib + 8) == ch)
+							{
+								hwArmed = true;
+								ArmHwWatch(aib + 0x1a0);
+							}
+						}
+					}
+				}
 				const int mi = *reinterpret_cast<volatile signed char*>(a + 0x364);
 				uintptr_t mv = 0;
 				if (mi >= 0 && mi < 8) mv = *reinterpret_cast<volatile uintptr_t*>(a + 0x2D0 + mi * 0x38);
@@ -538,12 +670,121 @@ static void StartBossPosTraceWatcher()
 				{
 					const uint32_t tmode = *reinterpret_cast<volatile uint32_t*>(a + 0x160);
 					const uint32_t rmode = *reinterpret_cast<volatile uint32_t*>(a + 0x1a8);
-					if (tmode != 0 || rmode != 0 || (mode & 3) != 0 || gdmag > 0.01f)
-						LogF("[BossProf +%llu] ch=%d tMode=%u tPhase=%.3f tDur=%.3f cumul=%.4f vel30=%.4f fd290=%.4f vel=%.3f,%.3f,%.3f div9dc=%.4f | rMode=%u rPhase=%.3f",
+					// Bug-1 (General Qator Bashtar jams): dispatcher state ccc, the per-render-frame
+					// budget watchdog counter/budget cd6/cd8 (a leg killed by timeout at 120 zeroes
+					// ccc and sets cd4|=0x10), and the third profile - the time-multiplier +0x238.
+					const uint32_t ccc = *reinterpret_cast<volatile uint32_t*>(a + 0xccc);
+					const uint32_t smode = *reinterpret_cast<volatile uint32_t*>(a + 0x238);
+					if (true) // Qator jams in the AIR with ccc/tMode/rMode possibly 0 - emit every sample so the frozen state (cd6/cd8/ccc) is captured, not just active motion
+						LogF("[BossProf +%llu] ch=%d tMode=%u tPhase=%.3f tDur=%.3f cumul=%.4f vel30=%.4f fd290=%.4f vel=%.3f,%.3f,%.3f div9dc=%.4f | rMode=%u rPhase=%.3f | ccc=%u cd6=%u cd8=%u sMode=%u sPhase=%.3f",
 							now, ch, tmode,
 							rf(a + 0x164), rf(a + 0x168), rf(a + 0x18c), rf(a + 0x190), rf(a + 0x290),
 							rf(a + 0xdc), rf(a + 0xe0), rf(a + 0xe4), rf(a + 0xdc),
-							rmode, rf(a + 0x1ac));
+							rmode, rf(a + 0x1ac),
+							ccc, *reinterpret_cast<volatile uint16_t*>(a + 0xcd6),
+							*reinterpret_cast<volatile uint16_t*>(a + 0xcd8), smode, rf(a + 0x23c));
+				}
+				// [BossAI] (General Qator Bashtar lock-on freeze): the AI action scheduler and
+				// every gate in front of its countdown tick (fn 0x140194a16), sampled in ALL
+				// mover modes so the R1 transition itself is captured. Scheduler: state c64
+				// (0 wait / 1 issue / 2 running), flags byte c68 (bit1 running, bit4 issued),
+				// countdown word c6a (-1 per RENDERED frame), reload word c6c. Tick gates: type
+				// field of cfc (bits 18..25, must be 2..5), cf8&0x40, 874&2 (AI alive), and the
+				// predicate 0x140026b20 = [95c]&1 && !([9b7]&2) && [a09]==0 && [a17]==0.
+				// AI block (table [0x658840], stride 0x5a8, channel byte at +8): behaviour id
+				// +0x550 and its flags +0x48. Globals: tick gates 0x6578F4 (!=0), 0x6579BC (==0),
+				// 0x6585F0 (state-2 wait), lock-on target channel 0x658D30 (-1 none) and its
+				// frame timer 0x658D34. Logged on change, plus a 1 s heartbeat.
+				{
+					struct AiSnap { uint32_t c64, c68, cfc, cf8, b874, pred, ccc, cd4, aid, aflags, g1, g2, g3, lockT, lockF, hp, ev0, ev8, evc; };
+					static AiSnap aiPrev[0x42]; static uint8_t aiHave[0x42]; static uint32_t aiTick[0x42];
+					if (ch >= 0 && ch < 0x42)
+					{
+						const auto r8 = [](uintptr_t p) -> uint32_t { return *reinterpret_cast<volatile uint8_t*>(p); };
+						const auto r32 = [](uintptr_t p) -> uint32_t { return *reinterpret_cast<volatile uint32_t*>(p); };
+						AiSnap s;
+						s.c64 = r32(a + 0xc64); s.hp = r32(a + 0x934);
+						s.c68 = r8(a + 0xc68) | (static_cast<uint32_t>(*reinterpret_cast<volatile uint16_t*>(a + 0xc6a)) << 8)
+							| (static_cast<uint32_t>(*reinterpret_cast<volatile uint16_t*>(a + 0xc6c) & 0xFF) << 24); // flags | countdown<<8 | reload.lo<<24
+						s.cfc = r32(a + 0xcfc);
+						s.cf8 = r8(a + 0xcf8);
+						s.b874 = r8(a + 0x874);
+						s.pred = r8(a + 0x95c) | (r8(a + 0x9b7) << 8) | (r8(a + 0xa09) << 16) | (r8(a + 0xa17) << 24);
+						s.ccc = r32(a + 0xccc);
+						s.cd4 = r8(a + 0xcd4);
+						s.aid = 0xFFFFFFFF; s.aflags = 0; s.ev0 = s.ev8 = s.evc = 0;
+						{
+							const uintptr_t aitbl = *reinterpret_cast<volatile uintptr_t*>(g_gameBase + 0x658840);
+							if (aitbl)
+							{
+								const uintptr_t aib = aitbl + static_cast<uintptr_t>(ch) * 0x5a8;
+								if (*reinterpret_cast<volatile int8_t*>(aib + 8) == ch)
+								{
+									s.aid = r8(aib + 0x550);
+									s.aflags = r32(aib + 0x48);
+									// script op 0x15F polls bits of these three event words (arg 0 -> +0x1ac,
+									// 1 -> +0x1a0, 2 -> +0x1a8); the boss idle loop exits when one is set
+									s.ev0 = r32(aib + 0x1a0); s.ev8 = r32(aib + 0x1a8); s.evc = r32(aib + 0x1ac);
+								}
+							}
+						}
+						s.g1 = r8(g_gameBase + 0x6578F4);
+						s.g2 = r8(g_gameBase + 0x6579BC);
+						s.g3 = r8(g_gameBase + 0x6585F0);
+						s.lockT = r32(g_gameBase + 0x658D30);
+						s.lockF = r32(g_gameBase + 0x658D34);
+						const bool changed = !aiHave[ch] || memcmp(&s, &aiPrev[ch], sizeof(s)) != 0;
+						const bool heartbeat = (++aiTick[ch] % 25) == 0;
+						if (changed || heartbeat)
+						{
+							const int cfcType = static_cast<int>(static_cast<int32_t>(s.cfc << 6) >> 24);
+							LogF("[BossAI +%llu] ch=%d%s mode=%X c64=%u c68=%02X cnt=%u reload=%u hp=%u/%u cfcType=%d cf8=%02X f874=%02X pred=%08X ccc=%u cd4=%02X | ai id=%u flags=%X ev1a0=%08X ev1a8=%08X ev1ac=%08X | g1=%u g2=%u g3=%u lockT=%d lockF=%d",
+								now, ch, changed ? "" : " hb", mode,
+								s.c64, s.c68 & 0xFF, (s.c68 >> 8) & 0xFFFF, (s.c68 >> 24) | (r8(a + 0xc6d) << 8),
+								r32(a + 0x934), r32(a + 0x938),
+								cfcType, s.cf8, s.b874, s.pred, s.ccc, s.cd4,
+								s.aid, s.aflags, s.ev0, s.ev8, s.evc, s.g1, s.g2, s.g3, static_cast<int>(s.lockT), static_cast<int>(s.lockF));
+						}
+						aiPrev[ch] = s; aiHave[ch] = 1;
+					}
+				}
+				// [BossDiff]: while the boss hovers/idles (mover mode==4), diff its actor struct vs
+				// the previous IDLE snapshot and log changed dwords with NO muting - to catch an AI
+				// timer that ticks in a healthy hover but stalls/overshoots when Qator (ch13, flying)
+				// freezes in the air at 120fps (fine at 30fps). Only idle->idle diffs (the move->idle
+				// transition is skipped as noise). Same TraceBossPos gate.
+				{
+					static uint32_t bdSnap[0x42][0xE00 / 4];
+					static uint8_t  bdPrevIdle[0x42];
+					static uint8_t  bdHave[0x42];
+					const int BDW = 0xE00 / 4;
+					if (ch >= 0 && ch < 0x42)
+					{
+						const bool idle = (mode == 4);
+						if (idle && bdHave[ch] && bdPrevIdle[ch])
+						{
+							char bl[1000]; size_t bll = 0; bl[0] = 0; int bshown = 0;
+							for (int o = 0; o < BDW; o++)
+							{
+								const uint32_t v = *reinterpret_cast<volatile uint32_t*>(a + o * 4);
+								if (v == bdSnap[ch][o]) continue;
+								if (bshown < 48)
+								{
+									const int n = snprintf(bl + bll, sizeof(bl) - bll, " %X:%X>%X", o * 4, bdSnap[ch][o], v);
+									if (n > 0 && bll + static_cast<size_t>(n) < sizeof(bl) - 1) bll += n;
+									bshown++;
+								}
+								bdSnap[ch][o] = v;
+							}
+							if (bll) LogF("[BossDiff +%llu] ch=%d%s", now, ch, bl);
+						}
+						else
+						{
+							for (int o = 0; o < BDW; o++) bdSnap[ch][o] = *reinterpret_cast<volatile uint32_t*>(a + o * 4);
+						}
+						bdPrevIdle[ch] = idle ? 1 : 0;
+						bdHave[ch] = 1;
+					}
 				}
 			}
 		}
@@ -769,6 +1010,42 @@ static void StartWatchdogTraceWatcher()
 					break;
 				case 0x50:
 					LogF("[Watchdog +%llu] ch=%d RUN_ATTEMPT authoredFrames=%u", now, ch, v0);
+					break;
+				case 0x60:
+					LogF("[Watchdog +%llu] ch=%d AI_BEHAVIOUR id=%u flags=%02X c64=%u entry=%X", now, ch, v0, v1 & 0xFF, v2, v3);
+					break;
+				case 0x72:
+					LogF("[Watchdog +%llu] ch=%d FLAG95C_CLEAR site=72(TakeDamage kill) hp934=%u dmgFlags=%X amount=%u caller=%X", now, ch, v0, v1, v2, v3);
+					break;
+				case 0x80:
+					LogF("[Watchdog +%llu] ch=%d APPLY_HIT flags=%X attacker=%d caller=%X hp=%u", now, ch, v0, static_cast<int>(v1), v2, v3);
+					break;
+				case 0x90:
+					LogF("[Script +%llu] ch=%d op=%02X pc=%X thr=%u", now, static_cast<int>(v1), v0, v2, v3);
+					break;
+				case 0x91:
+					LogF("[Script +%llu] ch=%d PROP idx=%u val=%d pc=%X", now, static_cast<int>(v2), v0, static_cast<int>(v1), v3);
+					break;
+				case 0x92:
+					LogF("[Script +%llu] ch=%d AITBL sub=%u val=%d pc=%X", now, static_cast<int>(v2), v0, static_cast<int>(v1), v3);
+					break;
+				case 0x93:
+					LogF("[Script +%llu] ch=%d EVBIT word=%u bit=%u SET pc=%X", now, static_cast<int>(v2), v0, v1, v3);
+					break;
+				case 0x94:
+					LogF("[Script +%llu] ch=%d EVBIT word=%u bit=%u clear pc=%X", now, static_cast<int>(v2), v0, v1, v3);
+					break;
+				case 0x95:
+					LogF("[AiRaise +%llu] ch=%d kind=%u bit=%u caller=%X", now, static_cast<int>(v2), v0, v1, v3);
+					break;
+				case 0x96:
+					LogF("[Anim +%llu] frame=%.2f rate=%.3f last=%d anim=%X player=%X", now, v0 / 256.0f, *reinterpret_cast<const float*>(&v1), static_cast<int>(v2), v3, alow);
+					break;
+				case 0x97:
+					LogF("[AiClear +%llu] ch=%d wiping ev1a0=%08X ev1a8=%08X keep=%u", now, static_cast<int>(v3), v0, v1, v2);
+					break;
+				case 0x71: case 0x73: case 0x74: case 0x75: case 0x76:
+					LogF("[Watchdog +%llu] ch=%d FLAG95C_CLEAR site=%X old95c=%02X step934=%u c64=%u motion=%X", now, ch, tag, v0, v1, v2, v3);
 					break;
 				default:
 					LogF("[Watchdog +%llu] ch=%d tag=%X %X %X %X %X", now, ch, tag, v0, v1, v2, v3);
@@ -2262,7 +2539,7 @@ void OnInitializeHook()
 			// actor low32 (ebx), leave r11=&entry. Label A is the not-boss skip target.
 			const std::string P =
 				"push rax; push r10; push r11; pushfq; "
-				"movzx r11d, word ptr [rbx + 0x360]; cmp r11d, 0x2019; jne A; "
+				"movzx r11d, word ptr [rbx + 0x360]; cmp r11d, 0x2019; je B; cmp r11d, 0x200B; jne A; B: "
 				"mov r10d, dword ptr [rip + ?1]; inc dword ptr [rip + ?1]; and r10d, 0x1ff; imul r10d, r10d, 24; "
 				"lea r11, [rip + ?0]; add r11, r10; "
 				"mov dword ptr [r11], $0; mov dword ptr [r11 + 20], ebx; ";
@@ -2318,7 +2595,7 @@ void OnInitializeHook()
 			match = FindOne("48 89 5C 24 18 56 57 41 56 48 81 EC F0 00 00 00 48 8B D9 48 8B 49 08");
 			ParametricASMJump(
 				"push rax; push r10; push r11; pushfq; "
-				"movzx r11d, word ptr [rcx + 0x360]; cmp r11d, 0x2019; jne A; "
+				"movzx r11d, word ptr [rcx + 0x360]; cmp r11d, 0x2019; je B; cmp r11d, 0x200B; jne A; B: "
 				"mov r10d, dword ptr [rip + ?1]; inc dword ptr [rip + ?1]; and r10d, 0x1ff; imul r10d, r10d, 24; "
 				"lea r11, [rip + ?0]; add r11, r10; "
 				"mov dword ptr [r11], $0; mov dword ptr [r11 + 20], ecx; "
@@ -2326,7 +2603,235 @@ void OnInitializeHook()
 				"A: popfq; pop r11; pop r10; pop rax; "
 				"mov qword ptr [rsp + 0x18], rbx", match, 0, 0x5);
 
-			LogF("[Watchdog] enabled: 8 event hooks (3 state entries, 4 s1/s3 kills, run attempts)");
+			// --- AI behaviour issue (General Qator Bashtar lock-on freeze) ---
+			// 0x14027eb20 is the AI branch taken when the action-decide fn 0x140193dd4
+			// hands it a flags byte (bit built from "player lock-on target == my
+			// channel", read from [0x658D30]); it picks a behaviour via 0x140280ba0 and
+			// stores its id at [aiBlock+0x550] (rbx = AI block, rdi = actor, rsi = entry,
+			// flags byte saved at [rsp+0x6c] before our 4 pushes -> [rsp+0x8c]).
+			// v0 = behaviour id (al), v1 = flags byte, v2 = scheduler state [actor+0xc64],
+			// v3 = entry id word[rsi]. Re-executes the displaced 6-byte store.
+			constants[0] = 0x60; // AI_BEHAVIOUR
+			match = FindOne("88 83 50 05 00 00 3C FF 74 0B 0F B7 16 48 8B CF");
+			ParametricASMJump(
+				"push rax; push r10; push r11; pushfq; "
+				"movzx r11d, word ptr [rdi + 0x360]; cmp r11d, 0x2019; je B; cmp r11d, 0x200B; jne A; B: "
+				"mov r10d, dword ptr [rip + ?1]; inc dword ptr [rip + ?1]; and r10d, 0x1ff; imul r10d, r10d, 24; "
+				"lea r11, [rip + ?0]; add r11, r10; "
+				"mov dword ptr [r11], $0; mov dword ptr [r11 + 20], edi; "
+				"movzx eax, al; mov dword ptr [r11 + 4], eax; "
+				"mov eax, dword ptr [rsp + 0x8c]; mov dword ptr [r11 + 8], eax; "
+				"mov eax, dword ptr [rdi + 0xc64]; mov dword ptr [r11 + 12], eax; "
+				"movzx eax, word ptr [rsi]; mov dword ptr [r11 + 16], eax; "
+				"A: popfq; pop r11; pop r10; pop rax; "
+				"mov byte ptr [rbx + 0x550], al", match, 0, 0x6);
+
+			// --- [actor+0x95c] bit-0 clears (Qator freeze) ---
+			// The AI tick 0x140194a16 is gated by predicate 0x140026b20, whose first test is
+			// [actor+0x95c]&1. The 120fps trace showed that bit dropping (0x0D->0x8C) on both
+			// boss actors mid-fight, after which the scheduler sits in state 1 forever. Six
+			// code sites clear it; tag each one so the log names the culprit. v0 = old
+			// byte 0x95c, v1 = action-step [0x934], v2 = scheduler state [0xc64], v3 = motion
+			// id word[0x7f0]. Each re-executes its own displaced 'and byte [reg+0x95c],0xfe'.
+			{
+				struct ClrSite { const char* sig; const char* reg; const char* low; uint32_t tag; uint32_t len; };
+				static const ClrSite clrSites[] = {
+					{ "41 80 A1 5C 09 00 00 FE 41 80 A1 76",                            "r9",  "r9d", 0x71, 8 }, // SetMode fn 0x140191ff0 branch
+					{ "80 A1 5C 09 00 00 FE 80 89 5F 09 00 00 40 80 A1 BA 06 00 00 EF C7", "rcx", "ecx", 0x73, 7 }, // 0x14019d2ba (+[0x934]=0)
+					{ "80 A3 5C 09 00 00 FE 80 8B 5F 09 00",                            "rbx", "ebx", 0x74, 7 }, // 0x14019fb94 (+[0x934]=0)
+					{ "80 A7 5C 09 00 00 FE 48 8B CF E8 E9",                            "rdi", "edi", 0x75, 7 }, // 0x1401a1c58
+					{ "80 A6 5C 09 00 00 FE 45 22 CD 44 89",                            "rsi", "esi", 0x76, 7 }, // 0x1401a4631 (apply params)
+				};
+				for (const auto& cs : clrSites)
+				{
+					constants[0] = cs.tag;
+					match = FindOne(cs.sig);
+					const std::string R = cs.reg;
+					const std::string asmStr =
+						"push rax; push r10; push r11; pushfq; "
+						"movzx r11d, word ptr [" + R + " + 0x360]; cmp r11d, 0x2019; je B; cmp r11d, 0x200B; jne A; B: "
+						"mov r10d, dword ptr [rip + ?1]; inc dword ptr [rip + ?1]; and r10d, 0x1ff; imul r10d, r10d, 24; "
+						"lea r11, [rip + ?0]; add r11, r10; "
+						"mov dword ptr [r11], $0; mov dword ptr [r11 + 20], " + std::string(cs.low) + "; "
+						"movzx eax, byte ptr [" + R + " + 0x95c]; mov dword ptr [r11 + 4], eax; "
+						"mov eax, dword ptr [" + R + " + 0x934]; mov dword ptr [r11 + 8], eax; "
+						"mov eax, dword ptr [" + R + " + 0xc64]; mov dword ptr [r11 + 12], eax; "
+						"movzx eax, word ptr [" + R + " + 0x7f0]; mov dword ptr [r11 + 16], eax; "
+						"A: popfq; pop r11; pop r10; pop rax; "
+						"and byte ptr [" + R + " + 0x95c], 0xfe";
+					ParametricASMJump(asmStr.c_str(), match, 0, cs.len);
+				}
+				// Site 0x72 = the kill path inside TakeDamage 0x140198560 (the one the Qator
+				// trace hit). Its frame is 8 pushes + sub rsp,0x58, so with our 4 pushes the
+				// return address sits at [rsp+0xb8] and the r8d home slot (damage amount,
+				// stored by the prologue at entry+0x18) at [rsp+0xd0]; r15d holds the damage
+				// flags. v0 = [0x934] before the write, v1 = flags, v2 = amount, v3 = caller low32.
+				constants[0] = 0x72;
+				match = FindOne("80 A3 5C 09 00 00 FE 0F B6 83 5D 09");
+				ParametricASMJump(
+					"push rax; push r10; push r11; pushfq; "
+					"movzx r11d, word ptr [rbx + 0x360]; cmp r11d, 0x2019; je B; cmp r11d, 0x200B; jne A; B: "
+					"mov r10d, dword ptr [rip + ?1]; inc dword ptr [rip + ?1]; and r10d, 0x1ff; imul r10d, r10d, 24; "
+					"lea r11, [rip + ?0]; add r11, r10; "
+					"mov dword ptr [r11], $0; mov dword ptr [r11 + 20], ebx; "
+					"mov eax, dword ptr [rbx + 0x934]; mov dword ptr [r11 + 4], eax; "
+					"mov dword ptr [r11 + 8], r15d; "
+					"mov eax, dword ptr [rsp + 0xd0]; mov dword ptr [r11 + 12], eax; "
+					"mov eax, dword ptr [rsp + 0xb8]; mov dword ptr [r11 + 16], eax; "
+					"A: popfq; pop r11; pop r10; pop rax; "
+					"and byte ptr [rbx + 0x95c], 0xfe", match, 0, 0x7);
+			}
+
+			// --- ApplyHit entry 0x1401969b0 (who is hitting the boss, and how often) ---
+			// rcx = victim actor, edx = hit flags, r8d = attacker channel, [rsp] = return
+			// address of the attack code path (after our 4 pushes: [rsp+0x20]). The Qator
+			// trace showed party members (ch 1/2) draining 604 HP at 1-2 per RENDERED frame.
+			// v0 = flags, v1 = attacker ch, v2 = caller low32, v3 = HP before. Re-executes
+			// the displaced 5-byte prologue store 'mov [rsp+0x18], r8d'.
+			constants[0] = 0x80; // APPLY_HIT
+			match = FindOne("44 89 44 24 18 89 54 24 10 53 56 57 41 54 48 81 EC 88 00 00 00");
+			ParametricASMJump(
+				"push rax; push r10; push r11; pushfq; "
+				"movzx r11d, word ptr [rcx + 0x360]; cmp r11d, 0x2019; je B; cmp r11d, 0x200B; jne A; B: "
+				"mov r10d, dword ptr [rip + ?1]; inc dword ptr [rip + ?1]; and r10d, 0x1ff; imul r10d, r10d, 24; "
+				"lea r11, [rip + ?0]; add r11, r10; "
+				"mov dword ptr [r11], $0; mov dword ptr [r11 + 20], ecx; "
+				"mov dword ptr [r11 + 4], edx; mov dword ptr [r11 + 8], r8d; "
+				"mov rax, qword ptr [rsp + 0x20]; mov dword ptr [r11 + 12], eax; "
+				"mov eax, dword ptr [rcx + 0x934]; mov dword ptr [r11 + 16], eax; "
+				"A: popfq; pop r11; pop r10; pop rax; "
+				"mov dword ptr [rsp + 0x18], r8d", match, 0, 0x5);
+
+			// --- battle-script opcode stream (dispatcher 0x140370c70) ---
+			// At 0x140370d64 the thread record (rbx) holds opcode [rbx+0x24], the owner
+			// channel as float (xmm0, about to be stored at [rbx+0x34]) and the script PC
+			// [rbx+0x28]; the thread index (edx at entry, homed at entry+0x10) sits at
+			// [rsp+0x128] after our 4 pushes (frame = 6 pushes + 0xc8). Enemy channels
+			// (>=6) only. v0 = opcode, v1 = channel, v2 = PC, v3 = thread index. Used to
+			// diff General Qator Bashtar's AI script flow between 30 and 120 fps.
+			constants[0] = 0x90; // SCRIPT_OP
+			match = FindOne("F3 0F 11 43 34 0F B7 47 02 A8 03 74 0E");
+			ParametricASMJump(
+				"push rax; push r10; push r11; pushfq; "
+				"cvttss2si r11d, xmm0; cmp r11d, 6; jl A; "
+				"mov r10d, dword ptr [rip + ?1]; inc dword ptr [rip + ?1]; and r10d, 0x1ff; imul r10d, r10d, 24; "
+				"lea r11, [rip + ?0]; add r11, r10; "
+				"mov dword ptr [r11], $0; mov eax, dword ptr [rbx + 0x24]; mov dword ptr [r11 + 4], eax; "
+				"cvttss2si eax, xmm0; mov dword ptr [r11 + 8], eax; "
+				"mov eax, dword ptr [rbx + 0x28]; mov dword ptr [r11 + 12], eax; "
+				"mov eax, dword ptr [rsp + 0x128]; mov dword ptr [r11 + 16], eax; mov dword ptr [r11 + 20], ebx; "
+				"A: popfq; pop r11; pop r10; pop rax; "
+				"movss dword ptr [rbx + 0x34], xmm0; movzx eax, word ptr [rdi + 2]", match, 0, 0x9);
+
+			// --- script query results: op 0x122 (actor property getter 0x1401a2080, index
+			// float[rec+0x38]) and op 0x153 (AI-block per-target table word, sub 1/2/3)
+			// - the values the boss AI loop branches on. Hooked at each handler's result
+			// store; enemy channels only. v0 = index/sub, v1 = value, v2 = channel, v3 = PC.
+			constants[0] = 0x91; // PROP_GET
+			match = FindOne("C2 0F 5B C0 F3 0F 11 43 30 48 83 C4 20 5B C3 CC CC CC CC CC CC CC CC CC CC CC CC CC CC CC CC 40");
+			ParametricASMJump(
+				"push rax; push r10; push r11; pushfq; cvttss2si r11d, dword ptr [rbx + 0x34]; cmp r11d, 6; jl A; "
+				"mov r10d, dword ptr [rip + ?1]; inc dword ptr [rip + ?1]; and r10d, 0x1ff; imul r10d, r10d, 24; lea r11, [rip + ?0]; add r11, r10; "
+				"mov dword ptr [r11], $0; cvttss2si eax, dword ptr [rbx + 0x38]; mov dword ptr [r11 + 4], eax; mov dword ptr [r11 + 8], edx; "
+				"cvttss2si eax, dword ptr [rbx + 0x34]; mov dword ptr [r11 + 12], eax; mov eax, dword ptr [rbx + 0x28]; mov dword ptr [r11 + 16], eax; mov dword ptr [r11 + 20], ebx; "
+				"A: popfq; pop r11; pop r10; pop rax; movss dword ptr [rbx + 0x30], xmm0; add rsp, 0x20", match, 4, 13);
+			{
+				struct TSite { const char* sig; uint32_t sub; };
+				static const TSite tsites[] = {
+					{ "F3 41 0F 11 43 30 48 83 C4 28 C3 49 8B CA E8 A9", 3 },
+					{ "F3 41 0F 11 43 30 48 83 C4 28 C3 49 8B CA E8 80", 2 },
+					{ "F3 41 0F 11 43 30 48 83 C4 28 C3 49 8B CA E8 57", 1 },
+				};
+				for (const auto& ts : tsites)
+				{
+					constants[0] = ts.sub;
+					match = FindOne(ts.sig);
+					ParametricASMJump(
+						"push rax; push r10; push rcx; pushfq; cvttss2si ecx, dword ptr [r11 + 0x34]; cmp ecx, 6; jl A; "
+						"mov r10d, dword ptr [rip + ?1]; inc dword ptr [rip + ?1]; and r10d, 0x1ff; imul r10d, r10d, 24; lea rcx, [rip + ?0]; add rcx, r10; "
+						"mov dword ptr [rcx], 0x92; mov dword ptr [rcx + 4], $0; mov dword ptr [rcx + 8], edx; "
+						"cvttss2si eax, dword ptr [r11 + 0x34]; mov dword ptr [rcx + 12], eax; mov eax, dword ptr [r11 + 0x28]; mov dword ptr [rcx + 16], eax; mov dword ptr [rcx + 20], r11d; "
+						"A: popfq; pop rcx; pop r10; pop rax; movss dword ptr [r11 + 0x30], xmm0; add rsp, 0x28", match, 0, 10);
+				}
+			}
+
+			// --- script op 0x15F "event bit set?" TRUE result (0x1403541bc). The boss idle
+			// loop polls 4 such bits and only leaves when one is set. v0 = word sel
+			// (0:+0x1ac 1:+0x1a0 2:+0x1a8), v1 = bit, v2 = channel, v3 = PC. Enemy only.
+			constants[0] = 0x93; // EVBIT_TRUE
+			match = FindOne("45 0F A3 D1 73 08 C7 41 30 00 00 80 3F C3");
+			ParametricASMJump(
+				"push rax; push r10; push r11; pushfq; cvttss2si r11d, dword ptr [rcx + 0x34]; cmp r11d, 6; jl A; "
+				"mov r10d, dword ptr [rip + ?1]; inc dword ptr [rip + ?1]; and r10d, 0x1ff; imul r10d, r10d, 24; lea r11, [rip + ?0]; add r11, r10; "
+				"mov dword ptr [r11], $0; cvttss2si eax, dword ptr [rcx + 0x38]; mov dword ptr [r11 + 4], eax; cvttss2si eax, dword ptr [rcx + 0x3c]; mov dword ptr [r11 + 8], eax; "
+				"cvttss2si eax, dword ptr [rcx + 0x34]; mov dword ptr [r11 + 12], eax; mov eax, dword ptr [rcx + 0x28]; mov dword ptr [r11 + 16], eax; mov dword ptr [r11 + 20], ecx; "
+				"A: popfq; pop r11; pop r10; pop rax; mov dword ptr [rcx + 0x30], 0x3f800000", match, 6, 13);
+
+			// FALSE result of the same op (0x1403541c4), restricted to the boss idle loop's
+			// four polls (PC 0x3EF0..0x3FD0) so the log names the (word, bit) pairs it waits on.
+			// (signature must not overlap the TRUE-site patch above, which already replaced
+			// the preceding bytes with a jmp - anchor on the site + padding + next fn start)
+			constants[0] = 0x94; // EVBIT_FALSE
+			match = FindOne("C7 41 30 00 00 00 00 C3 CC CC CC CC CC CC CC CC CC CC CC CC CC CC CC CC CC CC CC CC F3 0F 2C 41 34 45 33 C9");
+			ParametricASMJump(
+				"push rax; push r10; push r11; pushfq; cvttss2si r11d, dword ptr [rcx + 0x34]; cmp r11d, 6; jl A; "
+				"mov eax, dword ptr [rcx + 0x28]; cmp eax, 0x3EF0; jl A; cmp eax, 0x3FD0; jg A; "
+				"mov r10d, dword ptr [rip + ?1]; inc dword ptr [rip + ?1]; and r10d, 0x1ff; imul r10d, r10d, 24; lea r11, [rip + ?0]; add r11, r10; "
+				"mov dword ptr [r11], $0; cvttss2si eax, dword ptr [rcx + 0x38]; mov dword ptr [r11 + 4], eax; cvttss2si eax, dword ptr [rcx + 0x3c]; mov dword ptr [r11 + 8], eax; "
+				"cvttss2si eax, dword ptr [rcx + 0x34]; mov dword ptr [r11 + 12], eax; mov eax, dword ptr [rcx + 0x28]; mov dword ptr [r11 + 16], eax; mov dword ptr [r11 + 20], ecx; "
+				"A: popfq; pop r11; pop r10; pop rax; mov dword ptr [rcx + 0x30], 0", match, 0, 7);
+
+			// --- RaiseAiEvent 0x140265750 (ecx=channel, edx=kind 1..5, r8d=bit): the ONLY
+			// writer that sets bits in the AI-block event words (kind 4 -> +0x1a0, 5 -> +0x1a8),
+			// proven by a DR0 write watch. v0 = kind, v1 = bit, v2 = channel, v3 = caller low32
+			// ([rsp+0x20] after our 4 pushes). Re-executes the displaced rip-relative
+			// 'cmp byte ptr [0x140658663], 0' via ?2. Enemy channels only.
+			constants[0] = 0x95; // AI_RAISE
+			match = FindOne("80 3D ? ? ? ? 00 4C 63 C9 0F 84");
+			pointers[2] = baseaddress + 0x658663;
+			ParametricASMJump(
+				"push rax; push r10; push r11; pushfq; cmp ecx, 6; jl A; "
+				"mov r10d, dword ptr [rip + ?1]; inc dword ptr [rip + ?1]; and r10d, 0x1ff; imul r10d, r10d, 24; lea r11, [rip + ?0]; add r11, r10; "
+				"mov dword ptr [r11], $0; mov dword ptr [r11 + 4], edx; mov dword ptr [r11 + 8], r8d; mov dword ptr [r11 + 12], ecx; "
+				"mov rax, qword ptr [rsp + 0x20]; mov dword ptr [r11 + 16], eax; mov dword ptr [r11 + 20], ecx; "
+				"A: popfq; pop r11; pop r10; pop rax; cmp byte ptr [rip + ?2], 0", match, 0, 7);
+
+			// --- animation event-track player 0x1403bd780 (rcx = player: frame 24.8 at
+			// +0x6c, rate +0x74, last processed frame +0x70, anim data +8; owner actor at
+			// [[rcx]+0x478]). RaiseAiEvent is called from here (kind/bit = keyframe events),
+			// so the boss's "attack now" bit is an animation keyframe. Log the boss's player
+			// whenever its integer frame changes. v0 = frame(24.8), v1 = rate bits,
+			// v2 = last frame, v3 = anim data low32.
+			{
+				auto lastFrame = trampoline->Pointer<uint32_t>(); *lastFrame = 0xFFFFFFFF;
+				constants[0] = 0x96; // ANIM_FRAME
+				match = FindOne("40 57 48 83 EC 40 48 8B 01 48 8B F9 48 83 B8 80 04 00 00 00");
+				pointers[2] = reinterpret_cast<uintptr_t>(lastFrame);
+				ParametricASMJump(
+					"push rax; push r10; push r11; pushfq; "
+					"mov rax, qword ptr [rcx]; mov rax, qword ptr [rax + 0x478]; test rax, rax; je A; movzx r11d, word ptr [rax + 0x360]; cmp r11d, 0x200B; jne A; "
+					"mov eax, dword ptr [rcx + 0x6c]; shr eax, 8; cvttss2si r10d, dword ptr [rcx + 0x7c]; dec r10d; cmp eax, r10d; je L; cmp eax, dword ptr [rip + ?2]; je A; L: mov dword ptr [rip + ?2], eax; "
+					"mov r10d, dword ptr [rip + ?1]; inc dword ptr [rip + ?1]; and r10d, 0x1ff; imul r10d, r10d, 24; lea r11, [rip + ?0]; add r11, r10; "
+					"mov dword ptr [r11], $0; mov eax, dword ptr [rcx + 0x6c]; mov dword ptr [r11 + 4], eax; mov eax, dword ptr [rcx + 0x74]; mov dword ptr [r11 + 8], eax; "
+					"mov eax, dword ptr [rcx + 0x70]; mov dword ptr [r11 + 12], eax; mov rax, qword ptr [rcx + 8]; mov dword ptr [r11 + 16], eax; mov dword ptr [r11 + 20], ecx; "
+					"A: popfq; pop r11; pop r10; pop rax; push rdi; sub rsp, 0x40; mov rax, qword ptr [rcx]", match, 0, 9);
+			}
+
+			// --- AI-block begin-frame clear 0x14027caf0 (rcx = AI block, channel byte at +8):
+			// zeroes the event words unless the keep flag +0x1b4 is set. Log only when it is
+			// about to wipe a NON-ZERO +0x1a0 of an enemy block: v0 = +0x1a0, v1 = +0x1a8,
+			// v2 = keep flag, v3 = channel. Re-executes 'mov eax,[rcx+0x1ac]'.
+			constants[0] = 0x97; // AI_CLEAR
+			match = FindOne("8B 81 AC 01 00 00 33 D2 89 81 B0 01 00 00");
+			ParametricASMJump(
+				"push rax; push r10; push r11; pushfq; movsx r11d, byte ptr [rcx + 8]; cmp r11d, 6; jl A; "
+				"mov eax, dword ptr [rcx + 0x1a0]; test eax, eax; je A; "
+				"mov r10d, dword ptr [rip + ?1]; inc dword ptr [rip + ?1]; and r10d, 0x1ff; imul r10d, r10d, 24; lea r11, [rip + ?0]; add r11, r10; "
+				"mov dword ptr [r11], $0; mov dword ptr [r11 + 4], eax; mov eax, dword ptr [rcx + 0x1a8]; mov dword ptr [r11 + 8], eax; "
+				"movzx eax, byte ptr [rcx + 0x1b4]; mov dword ptr [r11 + 12], eax; movsx eax, byte ptr [rcx + 8]; mov dword ptr [r11 + 16], eax; mov dword ptr [r11 + 20], ecx; "
+				"A: popfq; pop r11; pop r10; pop rax; mov eax, dword ptr [rcx + 0x1ac]", match, 0, 6);
+
+			LogF("[Watchdog] enabled: 26 event hooks (3 state entries, 4 s1/s3 kills, run attempts, AI behaviour issue, 6 flag95c clears, apply-hit, script opcodes, prop/ai-table queries, event-bit true/false, ai-raise, anim-frame, ai-clear)");
 		}
 
 		// Analog movement ([Movement] AnalogTiers=1): the left stick's tilt
@@ -2498,6 +3003,17 @@ void OnInitializeHook()
 			Patch<float>(frameratelimit.get<void>(0x4), 1.0f / framerate);
 			DWORD dwProtect;
 			VirtualProtect(frameratelimit.get<void>(0x4), sizeof(float), PAGE_EXECUTE_READWRITE, &dwProtect); //This variable needs to be writable by the movie function below
+			// [Diagnostics] FpsToggleKey=1: F10 flips the live frame limiter between the
+			// configured cap and 30 fps mid-game (same cell the movie relock writes), so a
+			// frozen boss can be observed at 30 fps without replaying the approach. The
+			// per-fps fixes stay as compiled for the cap, so this is a diagnostic, not a
+			// clean 30 fps reference.
+			if (GetPrivateProfileIntW(L"Diagnostics", L"FpsToggleKey", 0, wcModulePath) != 0)
+			{
+				g_fpsCapCell = reinterpret_cast<volatile float*>(frameratelimit.get_uintptr(0x4));
+				g_fpsCapValue = 1.0f / framerate;
+				StartFpsToggleWatcher();
+			}
 
 			//Framerate here is used as an integer
 			//[ref: 0x0004F084]
@@ -2757,7 +3273,8 @@ void OnInitializeHook()
 					pointers[1] = reinterpret_cast<uintptr_t>(gPhaseRule);
 					pointers[2] = reinterpret_cast<uintptr_t>(gZero);
 					pointers[3] = reinterpret_cast<uintptr_t>(gOne);
-					ParametricASMJump("cmp dword ptr [rip + ?1], 0; je G; ucomiss xmm0, dword ptr [rip + ?2]; jne G; addss xmm0, dword ptr [rip + ?3]; jmp D; G: addss xmm0, dword ptr [rip + ?0]; D: nop", match, 0x8, 0x10);
+					// Rule value 2 = ALWAYS full rate (see EnemyTurnFullRate below).
+					ParametricASMJump("cmp dword ptr [rip + ?1], 0; je G; cmp dword ptr [rip + ?1], 2; je F; ucomiss xmm0, dword ptr [rip + ?2]; jne G; F: addss xmm0, dword ptr [rip + ?3]; jmp D; G: addss xmm0, dword ptr [rip + ?0]; D: nop", match, 0x8, 0x10);
 					// enable the phase rule only across the lone +0x1a8 clock call (E8 @0x1401b960f)
 					match = FindOne("F3 0F 10 1D 00 66 3C 00 0F 28 D0");
 					pointers[0] = reinterpret_cast<uintptr_t>(gPhaseRule);
@@ -2765,8 +3282,29 @@ void OnInitializeHook()
 					// call via register: the framework's "call ?N" only resolves as the FIRST
 					// asm instruction; mid-block, load the target and call the register (r11 is
 					// volatile and the clock clobbers it anyway).
-					ParametricASMJump("mov dword ptr [rip + ?0], 1; lea r11, [rip + ?1]; call r11; mov dword ptr [rip + ?0], 0", match, 0xB, 0x10);
-					LogF("[Movement] TurnPhaseFullRate on: turn servo at full rate, scripted turns + translation kept at 30/%.0f", framerate);
+					//
+					// [Movement] EnemyTurnFullRate=1 (General Qator Bashtar freeze): the enemy
+					// AI scheduler is entirely RENDER-frame driven (action countdown word
+					// [actor+0xc6a] -1 per frame, turn re-issues on the same cadence). Qator's
+					// AI issues a scripted "turn to face" (dispatcher state 4, waits for
+					// [actor+0x1a8]==0) and re-issues it on a frame cadence; at 120fps the turn
+					// phase steps 0.25 so the profile is rebuilt before it can ever finish
+					// (traced: rPhase jumping 1.0->5.0->4.0->1.75, ccc stuck at 4 from ~7 s into
+					// the arena), and the boss hangs. Enemy actors (class word[actor+0x360]
+					// 0x20xx) therefore get rule 2 = full rate for the whole turn profile, so
+					// their turns finish on the same frame cadence as their AI, as at 30fps.
+					// Player/party (0x00xx) keep the servo-only rule (their spawn-turn timing
+					// regressed at full rate). Bit-exact no-op at 30fps (g_step==1.0 anyway).
+					if (GetPrivateProfileIntW(L"Movement", L"EnemyTurnFullRate", 1, wcModulePath) != 0)
+					{
+						ParametricASMJump("mov dword ptr [rip + ?0], 1; movzx r11d, word ptr [rbx + 0x360]; and r11d, 0xFF00; cmp r11d, 0x2000; jne H; mov dword ptr [rip + ?0], 2; H: lea r11, [rip + ?1]; call r11; mov dword ptr [rip + ?0], 0", match, 0xB, 0x10);
+						LogF("[Movement] TurnPhaseFullRate on: turn servo at full rate, scripted turns + translation kept at 30/%.0f; EnemyTurnFullRate on (enemy class 0x20xx turns always full rate)", framerate);
+					}
+					else
+					{
+						ParametricASMJump("mov dword ptr [rip + ?0], 1; lea r11, [rip + ?1]; call r11; mov dword ptr [rip + ?0], 0", match, 0xB, 0x10);
+						LogF("[Movement] TurnPhaseFullRate on: turn servo at full rate, scripted turns + translation kept at 30/%.0f", framerate);
+					}
 				}
 				else
 				{
@@ -2852,6 +3390,72 @@ void OnInitializeHook()
 				param_floats[0] = 30.0f / framerate;
 				ParametricASMJump("addss xmm0, %0", match, 0x5, 0xD);
 				LogF("[Movement] boss scripted-move profile fix applied (mode2 phase step 30/%.0f)", framerate);
+			}
+
+			//[Movement] AnimLastFrameFix=1 (General Qator Bashtar freeze, and any AI that
+			//waits on an animation's last-frame event). The animation player steps the
+			//24.8 frame counter by (int)(rate*256) per RENDERED frame (0x1403bdb81) and,
+			//for a non-looping clip, finishes when the new frame is PAST (length-1)
+			//(0x1403bdc33: comiss newFrame, (len-1)*256; jbe notDone), clamping to the
+			//last frame. At 30fps (rate 1.0) the last frame is always reached exactly,
+			//dispatched once as a normal frame, and only the NEXT step finishes - so the
+			//keyframe events on the last frame (kind 4 bit 0 = "clip finished, act") are
+			//raised on two consecutive frames. At 120fps (rate 0.249) the step jumps from
+			//33.95 straight past 34.0, finishing in the same step: the last-frame event is
+			//raised once, the AI-block begin-frame clear wipes it before the boss's script
+			//polls, and the script idles forever (traced: Qator's clip 9BB50EA0 stops at
+			//34.00, kind4/bit0 fires once, poll at pc 3F80 sees it clear; at 30fps the same
+			//poll sees it SET and the script proceeds to its attack path).
+			//Fix: when the OLD frame was still below the last frame and the NEW one is past
+			//it, clamp to the last frame and stay playing; the next step finishes as at
+			//30fps. With integer steps this case cannot occur, so it is a bit-exact no-op
+			//at 30fps. rcx=player, eax=new frame, xmm1=(len-1)*256, xmm2=256.0; r9-r11/xmm3
+			//are free here (the function tail-calls with rcx/xmm1 only).
+			if (framerate > 30.0f && GetPrivateProfileIntW(L"Movement", L"AnimLastFrameFix", 0, wcModulePath) != 0)
+			{
+				match = FindOne("0F 2F C1 76 50 F3 0F 2C C1 41 83 E0 FE");
+				auto notDone = trampoline->Pointer<uintptr_t>();
+				*notDone = match.get_uintptr(0x55);          // 0x1403bdc88 = the 'not finished' continuation
+				pointers[0] = reinterpret_cast<uintptr_t>(notDone);
+				ParametricASMJump(
+					"comiss xmm0, xmm1; jbe N; "
+					"movss xmm3, dword ptr [rcx + 0x74]; mulss xmm3, xmm2; cvttss2si r9d, xmm3; mov r10d, eax; sub r10d, r9d; "
+					"cvttss2si r11d, xmm1; cmp r10d, r11d; jge F; mov dword ptr [rcx + 0x6c], r11d; "
+					"N: jmp qword ptr [rip + ?0]; F: nop", match, 0, 5);
+				LogF("[Movement] AnimLastFrameFix on: non-looping clips dwell one frame on their last frame before finishing (as at 30fps)");
+			}
+
+			//[Movement] AiEventKeepFix=1 - the actual General Qator Bashtar carrier.
+			//Enemy AI scripts (battle-script VM, runner 0x140370c70) tick at 30Hz, but
+			//the AI-block event words they poll (+0x1a0/+0x1a8, raised by animation
+			//keyframes through RaiseAiEvent) are zeroed by the begin-frame clear
+			//0x14027caf0 on EVERY rendered frame. Traced in-frame order at 120fps:
+			//raise -> [poll only on a tick frame] -> clear. A one-frame event raised on
+			//a frame without a script tick is wiped before any script sees it; Qator's
+			//"clip finished, act" event (kind 4 bit 0) is exactly that, so his idle loop
+			//never leaves and he hangs. At 30fps every frame is a tick frame, so nothing
+			//is ever lost. Fix: count VM runner entries; in the clear, zero the event
+			//words only if the counter moved since this block's last zeroing (i.e. a
+			//script tick happened), otherwise keep them for the next tick. At 30fps the
+			//counter moves every frame: identical to stock.
+			if (framerate > 30.0f && GetPrivateProfileIntW(L"Movement", L"AiEventKeepFix", 1, wcModulePath) != 0)
+			{
+				auto vmTicks = trampoline->Pointer<uint32_t>(); *vmTicks = 0;
+				auto lastSeen = reinterpret_cast<uint32_t*>(trampoline->RawSpace(0x42 * 4));
+				memset(lastSeen, 0, 0x42 * 4);
+				// VM thread runner entry: count ticks (re-executes the two homing stores)
+				match = FindOne("89 54 24 10 48 89 4C 24 08 53 55 56 57 41 54 41 55 48 81 EC C8 00 00 00");
+				pointers[0] = reinterpret_cast<uintptr_t>(vmTicks);
+				ParametricASMJump("inc dword ptr [rip + ?0]; mov dword ptr [rsp + 0x10], edx; mov qword ptr [rsp + 8], rcx", match, 0, 9);
+				// begin-frame clear: keep events unless a tick happened since the last zeroing
+				match = FindOne("38 91 B4 01 00 00 75 0D 48 89 91 A8 01 00 00 89 91 A0 01 00 00");
+				pointers[0] = reinterpret_cast<uintptr_t>(vmTicks);
+				pointers[1] = reinterpret_cast<uintptr_t>(lastSeen);
+				ParametricASMJump(
+					"cmp byte ptr [rcx + 0x1b4], dl; jne K; push r10; push r11; mov eax, dword ptr [rip + ?0]; movsx r10, byte ptr [rcx + 8]; test r10, r10; js Z; cmp r10, 0x41; ja Z; "
+					"lea r11, [rip + ?1]; cmp eax, dword ptr [r11 + r10*4]; je S; mov dword ptr [r11 + r10*4], eax; "
+					"Z: pop r11; pop r10; mov qword ptr [rcx + 0x1a8], rdx; mov dword ptr [rcx + 0x1a0], edx; jmp K; S: pop r11; pop r10; K: nop", match, 0, 0x15);
+				LogF("[Movement] AiEventKeepFix on: AI event bits survive until the next 30Hz script tick");
 			}
 
 			//Camera distance in the first cutscene [ref: 0x00155CB0]
@@ -3575,6 +4179,7 @@ void OnInitializeHook()
 			StartMoveTraceWatcher();
 		if (GetPrivateProfileIntW(L"Diagnostics", L"TraceBattle", 0, wcModulePath) != 0)
 			StartBattleTraceWatcher();
+		g_watchAiEvent = GetPrivateProfileIntW(L"Diagnostics", L"WatchAiEvent", 0, wcModulePath) != 0;
 		if (GetPrivateProfileIntW(L"Diagnostics", L"TraceBossPos", 0, wcModulePath) != 0)
 			StartBossPosTraceWatcher();
 		if (GetPrivateProfileIntW(L"Diagnostics", L"TraceScriptMove", 0, wcModulePath) != 0)

@@ -430,6 +430,7 @@ static volatile uint64_t* g_moveCtxCell = nullptr;
 // Ring of {caller return address, mover ptr, speed} captured by hooks on the
 // two mover-speed setter sites, to find who applies the walk/run tier speeds.
 static volatile uint8_t* g_spdRing = nullptr;
+static bool g_dashAtCap = true;
 static volatile uint32_t g_applyCount = 0; // analog watcher applySpeed calls (TraceMove)
 // The character the player is actually steering. NOT [0x658CF4] (that stays at the
 // original leader's channel across in-field character switches - traced): the game's own
@@ -1463,6 +1464,16 @@ static void StartAutoTierWatcher()
 			const bool actorOk = (expect > 0.0f) ? (fabsf(a298 - expect) <= 0.02f * expect) : true;
 			if (fabsf(curM1 - m1) < 0.02f && actor == appliedActor && actorOk)
 				continue;
+			// [Movement] DashAtCap (default 1): m1 drives the run speed (+0x298 slot) and
+			// follows the stick; m2 feeds [actor+0x2a8] = base*m2, which scales scripted
+			// moves (dash/rush distance in 0x1401aa6bc/0x1401aa89f), and m3 the script-side
+			// tier query. Keep those two at the cap row so a dash is always full speed no
+			// matter how far the stick is tilted (stock rows hold m1==m2==m3 per tier).
+			if (g_dashAtCap)
+			{
+				m2 = rowHi[1];
+				m3 = rowHi[2];
+			}
 			*reinterpret_cast<volatile float*>(g_gameBase + 0x611E8C) = m1;
 			applySpeed(actor, m1, m2, m3);
 			g_applyCount++;
@@ -2944,6 +2955,7 @@ void OnInitializeHook()
 			g_tiltWalk = GetPrivateProfileIntW(L"Movement", L"WalkTiltPercent", 80, wcModulePath);
 			g_tiltSprint = GetPrivateProfileIntW(L"Movement", L"SprintTiltPercent", 95, wcModulePath);
 			g_minSpeedPct = GetPrivateProfileIntW(L"Movement", L"MinSpeedPercent", 60, wcModulePath);
+			g_dashAtCap = GetPrivateProfileIntW(L"Movement", L"DashAtCap", 1, wcModulePath) != 0;
 			if (g_minSpeedPct < 20) g_minSpeedPct = 20;
 			if (g_minSpeedPct > 100) g_minSpeedPct = 100;
 			match = FindOne("8B 0D F3 4D 3E 00 B8 56 55 55 55");

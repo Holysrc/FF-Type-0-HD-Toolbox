@@ -431,6 +431,7 @@ static volatile uint64_t* g_moveCtxCell = nullptr;
 // two mover-speed setter sites, to find who applies the walk/run tier speeds.
 static volatile uint8_t* g_spdRing = nullptr;
 static bool g_dashAtCap = true;
+static int g_stickSat = 85;
 static volatile uint32_t g_applyCount = 0; // analog watcher applySpeed calls (TraceMove)
 // The character the player is actually steering. NOT [0x658CF4] (that stays at the
 // original leader's channel across in-field character switches - traced): the game's own
@@ -584,6 +585,58 @@ static void StartFpsToggleWatcher()
 				LogF("[FpsToggle +%llu] cap now %.0f", GetTickCount64(), at30 ? 30.0f : 1.0f / g_fpsCapValue);
 			}
 		}
+	}).detach();
+}
+
+// Combat A/B trace ([Diagnostics] TraceCombat=1): polls the CONTROLLED character's HP
+// every 50 ms and logs every decrease (damage, remaining HP, attacker channel from
+// [actor+0xc6f]) plus a per-minute summary, so "harder at 120fps" can be compared as
+// numbers (hits/min, damage/min) between a 30fps and a 120fps run of the same area.
+// Pair it with TraceSounds=1: sight windows show up as 0x9008/0x900A request bursts.
+static void StartCombatTraceWatcher()
+{
+	if (!g_logEnabled || !g_gameBase)
+		return;
+	std::thread([] {
+		const ULONGLONG armDeadline = GetTickCount64() + 15 * 60000ULL;
+		for (;;) {
+			if (GetTickCount64() > armDeadline) return;
+			const int ch = ReadControlledChannel();
+			const uintptr_t tbl = *reinterpret_cast<volatile uintptr_t*>(g_gameBase + 0x667E20);
+			if (tbl && ch >= 0 && ch <= 0x41 && *reinterpret_cast<volatile uintptr_t*>(tbl + ch * 8 + 0x18))
+				break;
+			Sleep(200);
+		}
+		LogF("[Combat] armed at framerate=%.0f", g_framerate);
+		const ULONGLONG t0 = GetTickCount64();
+		uintptr_t prevActor = 0; uint32_t prevHp = 0;
+		uint32_t minHits = 0, minDmg = 0, totHits = 0, totDmg = 0; ULONGLONG lastSum = 0;
+		while (GetTickCount64() - t0 < 900000)
+		{
+			Sleep(50);
+			const ULONGLONG now = GetTickCount64() - t0;
+			const int ch = ReadControlledChannel();
+			const uintptr_t tbl = *reinterpret_cast<volatile uintptr_t*>(g_gameBase + 0x667E20);
+			uintptr_t a = 0;
+			if (tbl && ch >= 0 && ch <= 0x41) a = *reinterpret_cast<volatile uintptr_t*>(tbl + ch * 8 + 0x18);
+			if (!a) { prevActor = 0; continue; }
+			const uint32_t hp = *reinterpret_cast<volatile uint32_t*>(a + 0x934);
+			const uint32_t mx = *reinterpret_cast<volatile uint32_t*>(a + 0x938);
+			if (a != prevActor) { LogF("[Combat +%llu] controlling ch=%d hp=%u/%u", now, ch, hp, mx); prevActor = a; prevHp = hp; continue; }
+			if (hp < prevHp && mx > 0 && hp <= mx)
+			{
+				const uint32_t d = prevHp - hp;
+				LogF("[Hit +%llu] -%u hp=%u/%u attacker=%d", now, d, hp, mx, static_cast<int>(*reinterpret_cast<volatile int8_t*>(a + 0xc6f)));
+				minHits++; minDmg += d; totHits++; totDmg += d;
+			}
+			prevHp = hp;
+			if (now - lastSum >= 60000)
+			{
+				LogF("[CombatSum +%llu] last minute: hits=%u dmg=%u | total: hits=%u dmg=%u", now, minHits, minDmg, totHits, totDmg);
+				minHits = 0; minDmg = 0; lastSum = now;
+			}
+		}
+		LogF("[Combat] trace finished");
 	}).detach();
 }
 
@@ -1409,6 +1462,11 @@ static void StartAutoTierWatcher()
 			const int sx = *reinterpret_cast<volatile int*>(g_gameBase + 0x638B20);
 			const int sy = *reinterpret_cast<volatile int*>(g_gameBase + 0x638B24);
 			float mag = sqrtf(static_cast<float>(sx * sx + sy * sy)) * 100.0f / 255.0f;
+			// [Movement] StickSaturationPercent (default 85): a pad's physical gate is not a
+			// circle - full tilt reads ~95-99% on the axes but only ~85% on the diagonals
+			// (traced: LS 241..252,0 vs 175,127), so with SprintTilt=95 diagonal running
+			// dropped to ~1.15x. Treat anything at or above the saturation point as 100%.
+			mag = mag * 100.0f / static_cast<float>(g_stickSat);
 			if (mag > 100.0f)
 				mag = 100.0f;
 			const float lo = static_cast<float>(g_tiltWalk);
@@ -2956,6 +3014,9 @@ void OnInitializeHook()
 			g_tiltSprint = GetPrivateProfileIntW(L"Movement", L"SprintTiltPercent", 95, wcModulePath);
 			g_minSpeedPct = GetPrivateProfileIntW(L"Movement", L"MinSpeedPercent", 60, wcModulePath);
 			g_dashAtCap = GetPrivateProfileIntW(L"Movement", L"DashAtCap", 1, wcModulePath) != 0;
+			g_stickSat = GetPrivateProfileIntW(L"Movement", L"StickSaturationPercent", 85, wcModulePath);
+			if (g_stickSat < 50) g_stickSat = 50;
+			if (g_stickSat > 100) g_stickSat = 100;
 			if (g_minSpeedPct < 20) g_minSpeedPct = 20;
 			if (g_minSpeedPct > 100) g_minSpeedPct = 100;
 			match = FindOne("8B 0D F3 4D 3E 00 B8 56 55 55 55");
@@ -4379,6 +4440,8 @@ void OnInitializeHook()
 		g_watchAiEvent = GetPrivateProfileIntW(L"Diagnostics", L"WatchAiEvent", 0, wcModulePath) != 0;
 		if (GetPrivateProfileIntW(L"Diagnostics", L"TraceBossPos", 0, wcModulePath) != 0)
 			StartBossPosTraceWatcher();
+		if (GetPrivateProfileIntW(L"Diagnostics", L"TraceCombat", 0, wcModulePath) != 0)
+			StartCombatTraceWatcher();
 		if (GetPrivateProfileIntW(L"Diagnostics", L"TraceScriptMove", 0, wcModulePath) != 0)
 			StartScriptMoveTraceWatcher();
 		if (GetPrivateProfileIntW(L"Diagnostics", L"TraceWatchdog", 0, wcModulePath) != 0)

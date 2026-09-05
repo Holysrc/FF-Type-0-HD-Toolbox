@@ -430,6 +430,26 @@ static volatile uint64_t* g_moveCtxCell = nullptr;
 // Ring of {caller return address, mover ptr, speed} captured by hooks on the
 // two mover-speed setter sites, to find who applies the walk/run tier speeds.
 static volatile uint8_t* g_spdRing = nullptr;
+static volatile uint32_t g_applyCount = 0; // analog watcher applySpeed calls (TraceMove)
+// The character the player is actually steering. NOT [0x658CF4] (that stays at the
+// original leader's channel across in-field character switches - traced): the game's own
+// L3 handler 0x140273d10 takes slot = [0x740598] (when [0x74126D] or [0x740940] is set,
+// else 0), entry = [0x655C10 + slot*8], channel = sbyte[entry+1].
+static volatile int* g_ctlChanCell = nullptr;   // mirrored for the asm hooks
+static int ReadControlledChannel()
+{
+	int ch = *reinterpret_cast<volatile int*>(g_gameBase + 0x658CF4);
+	const uint8_t a = *reinterpret_cast<volatile uint8_t*>(g_gameBase + 0x74126D);
+	const uint8_t b = *reinterpret_cast<volatile uint8_t*>(g_gameBase + 0x740940);
+	const int idx = (a || b) ? *reinterpret_cast<volatile int*>(g_gameBase + 0x740598) : 0;
+	if (idx >= 0 && idx <= 2)
+	{
+		const uintptr_t e = *reinterpret_cast<volatile uintptr_t*>(g_gameBase + 0x655C10 + idx * 8);
+		if (e) ch = *reinterpret_cast<volatile int8_t*>(e + 1);
+	}
+	return ch;
+}
+static volatile uint32_t* g_spLog = nullptr;  // speed-param write ring: [0]=seq, entries of 24 bytes at +8: param,value,chan,pc
 static volatile uint32_t* g_spdHead = nullptr;
 
 // Battle event-script "move actor" telemetry ([Diagnostics] TraceScriptMove=1).
@@ -1065,7 +1085,7 @@ static void StartMoveTraceWatcher()
 	std::thread([] {
 		const auto ReadMover = [](uintptr_t* actorOut) -> uintptr_t {
 			*actorOut = 0;
-			const int chan = *reinterpret_cast<volatile int*>(g_gameBase + 0x658CF4);
+			const int chan = ReadControlledChannel();
 			const uintptr_t table = *reinterpret_cast<volatile uintptr_t*>(g_gameBase + 0x667E20);
 			if (!table || chan < 0 || chan > 0x41)
 				return 0;
@@ -1091,7 +1111,7 @@ static void StartMoveTraceWatcher()
 		float prevSpd = -2.0f;
 		uintptr_t prevActor = 0, prevMover = 0;
 		ULONGLONG lastLine = 0;
-		while (GetTickCount64() - t0 < 180000)
+		while (GetTickCount64() - t0 < 900000)
 		{
 			Sleep(100);
 			const ULONGLONG now = GetTickCount64() - t0;
@@ -1127,14 +1147,76 @@ static void StartMoveTraceWatcher()
 				dl += n;
 				prevWin[i] = win[i];
 			}
+			// analog-speed drop hunt: the applier 0x19C960 writes [actor+0x2a8] = [0x637000]*m2
+			// and [actor+0x298] = slot(29c/2a0/2a4 by move mode [0x636FF0]-7) = const*m1;
+			// log the mode, the multiplier globals and the actor slots whenever the live
+			// run speed +0x298 changes
+			static float prevA298 = -1.0f; static int prevMode = -1;
+			const int mode = *reinterpret_cast<volatile int*>(g_gameBase + 0x636FF0);
+			const float m1 = *reinterpret_cast<volatile float*>(g_gameBase + 0x637004);
+			const float a298 = actor ? *reinterpret_cast<volatile float*>(actor + 0x298) : -1.0f;
 			const bool stickMoved = (abs(sx - prevSx) > 2) || (abs(sy - prevSy) > 2);
-			if (dl || stickMoved || spd != prevSpd || tier != prevTier || now - lastLine >= 2000)
+			if (dl || stickMoved || spd != prevSpd || tier != prevTier || a298 != prevA298 || mode != prevMode || now - lastLine >= 2000)
 			{
-				LogF("[Move +%llu] LS=%d,%d spd=%.3f max=%.3f tier=%d%s%s",
-					now, sx, sy, spd, spdmax, tier, dl ? " st:" : "", delta);
-				prevSx = sx; prevSy = sy; prevSpd = spd; prevTier = tier;
+				LogF("[Move +%llu] LS=%d,%d spd=%.3f max=%.3f tier=%d mode=%d m1=%.3f a298=%.3f slots=%.3f/%.3f/%.3f a2a8=%.3f blend=%.3f/%.3f g965=%u cap=%d m1s=%.3f applies=%u%s%s",
+					now, sx, sy, spd, spdmax, tier, mode, m1, a298,
+					actor ? *reinterpret_cast<volatile float*>(actor + 0x29c) : -1.0f,
+					actor ? *reinterpret_cast<volatile float*>(actor + 0x2a0) : -1.0f,
+					actor ? *reinterpret_cast<volatile float*>(actor + 0x2a4) : -1.0f,
+					actor ? *reinterpret_cast<volatile float*>(actor + 0x2a8) : -1.0f,
+					actor ? *reinterpret_cast<volatile float*>(actor + 0x110) : -1.0f,
+					actor ? *reinterpret_cast<volatile float*>(actor + 0x124) : -1.0f,
+					actor ? *reinterpret_cast<volatile uint8_t*>(actor + 0x965) : 255u,
+					*reinterpret_cast<volatile int*>(g_gameBase + 0x658BD8),
+					*reinterpret_cast<volatile float*>(g_gameBase + 0x611E8C),
+					static_cast<unsigned>(g_applyCount),
+					dl ? " st:" : "", delta);
+				prevSx = sx; prevSy = sy; prevSpd = spd; prevTier = tier; prevA298 = a298; prevMode = mode;
 				lastLine = now;
 				havePrev = true;
+			}
+			// [Party]: channels 0..3 every 500 ms - actor ptr, class, position, run speed and
+			// the mode/const globals, to see which actor actually moves under the stick and
+			// what a character switch does to channels/actors (CF4 stayed 0 across switches)
+			{
+				static ULONGLONG lastParty = 0;
+				const uintptr_t tbl = *reinterpret_cast<volatile uintptr_t*>(g_gameBase + 0x667E20);
+				if (tbl && now - lastParty >= 500)
+				{
+					lastParty = now;
+					char pl[900]; size_t pn = 0; pl[0] = 0;
+					for (int c = 0; c < 4; c++)
+					{
+						const uintptr_t a = *reinterpret_cast<volatile uintptr_t*>(tbl + c * 8 + 0x18);
+						if (!a) { const int n = snprintf(pl + pn, sizeof(pl) - pn, " ch%d=-", c); if (n > 0) pn += n; continue; }
+						const int mi2 = *reinterpret_cast<volatile signed char*>(a + 0x364);
+						uintptr_t mv2 = 0;
+						if (mi2 >= 0 && mi2 < 8) mv2 = *reinterpret_cast<volatile uintptr_t*>(a + 0x2D0 + mi2 * 0x38);
+						const int n = snprintf(pl + pn, sizeof(pl) - pn, " ch%d=%X cls=%04X pos=%.0f,%.0f a298=%.1f",
+							c, static_cast<uint32_t>(a), *reinterpret_cast<volatile uint16_t*>(a + 0x360),
+							mv2 ? *reinterpret_cast<volatile float*>(mv2 + 0x08) : 0.f, mv2 ? *reinterpret_cast<volatile float*>(mv2 + 0x10) : 0.f,
+							*reinterpret_cast<volatile float*>(a + 0x298));
+						if (n > 0) pn += n;
+					}
+					LogF("[Party +%llu] ctl=%d CE4=%u CF4=%d mode=%d c8=%.1f c9=%.1f m1=%.3f%s", now, ReadControlledChannel(),
+						*reinterpret_cast<volatile uint8_t*>(g_gameBase + 0x658CE4), *reinterpret_cast<volatile int*>(g_gameBase + 0x658CF4),
+						*reinterpret_cast<volatile int*>(g_gameBase + 0x636FF0), *reinterpret_cast<volatile float*>(g_gameBase + 0x636FF8),
+						*reinterpret_cast<volatile float*>(g_gameBase + 0x636FFC), *reinterpret_cast<volatile float*>(g_gameBase + 0x637004), pl);
+				}
+			}
+			// drain the speed-param write ring (AnalogGlobalsFix hooks): who set which
+			// walk/run/sprint speed (param 0 = base), value, channel, script PC
+			if (g_spLog)
+			{
+				static uint32_t spSeen = 0;
+				const uint32_t head = g_spLog[0];
+				if (head - spSeen > 16) spSeen = head - 16;
+				while (spSeen != head)
+				{
+					const volatile uint32_t* e = g_spLog + 2 + (spSeen & 15) * 6;
+					LogF("[Param +%llu] ch=%d param=%u val=%.3f pc=%X", now, static_cast<int>(e[2]), e[0], *reinterpret_cast<const float*>(const_cast<const uint32_t*>(e + 1)), e[3]);
+					spSeen++;
+				}
 			}
 			// drain the SetSpeed capture ring: log each distinct caller rva, and
 			// again when the (integer) speed it writes changes
@@ -1303,7 +1385,8 @@ static void StartAutoTierWatcher()
 		{
 			Sleep(16);
 			uintptr_t actor = 0, mover = 0;
-			const int chan = *reinterpret_cast<volatile int*>(g_gameBase + 0x658CF4);
+			const int chan = ReadControlledChannel();
+			if (g_ctlChanCell) *g_ctlChanCell = chan;
 			const uintptr_t table = *reinterpret_cast<volatile uintptr_t*>(g_gameBase + 0x667E20);
 			if (table && chan >= 0 && chan <= 0x41)
 			{
@@ -1365,10 +1448,24 @@ static void StartAutoTierWatcher()
 			// re-apply when the target moved, the character changed, or the
 			// game (or the L3 toggle) applied something else behind our back
 			const float curM1 = *reinterpret_cast<volatile float*>(g_gameBase + 0x637004);
-			if (fabsf(curM1 - m1) < 0.02f && actor == appliedActor)
+			// The applier writes the multiplier globals unconditionally but the actor's
+			// speed slots ONLY when the move mode [0x636FF0] is 7..9 (walk/run/sprint);
+			// a call that lands during any other mode (dash, jump, landing) updates the
+			// globals and returns, and a global-only check then believes the speed is
+			// applied while the actor keeps its old value - the "speed drops and sticks
+			// until L3/dash" bug. Compare against the actor's expected run speed
+			// (mode constant [0x636FF4 + (mode-7)*4] * m1) and never apply outside 7..9.
+			const int mode = *reinterpret_cast<volatile int*>(g_gameBase + 0x636FF0);
+			if (mode < 7 || mode > 9)
+				continue;                       // cannot take effect now; retry next tick
+			const float expect = *reinterpret_cast<volatile float*>(g_gameBase + 0x636FF4 + (mode - 7) * 4) * m1;
+			const float a298 = *reinterpret_cast<volatile float*>(actor + 0x298);
+			const bool actorOk = (expect > 0.0f) ? (fabsf(a298 - expect) <= 0.02f * expect) : true;
+			if (fabsf(curM1 - m1) < 0.02f && actor == appliedActor && actorOk)
 				continue;
 			*reinterpret_cast<volatile float*>(g_gameBase + 0x611E8C) = m1;
 			applySpeed(actor, m1, m2, m3);
+			g_applyCount++;
 			appliedActor = actor;
 		}
 	}).detach();
@@ -2854,6 +2951,65 @@ void OnInitializeHook()
 			ParametricASMJump("mov qword ptr [rsp + 0x50], rbp; mov qword ptr [rsp + 0x58], rsi; mov qword ptr [rsp + 0x60], rdi; mov qword ptr [rsp + 0x68], r14; mov ecx, dword ptr [rip + ?0]; cmp ecx, 2; je A; mov ecx, 2; jmp B; A: mov ecx, 1; B: mov dword ptr [rip + ?0], ecx; movsxd rax, ecx", match, 0, 0x38);
 			LogF("[Movement] analog speed on (min %d%%, ramp %d%%..%d%%), L3 toggles the 1.5x/2x cap",
 				g_minSpeedPct, g_tiltWalk, g_tiltSprint);
+
+			// [Movement] AnalogGlobalsFix (default 1 with AnalogTiers): SetActorParam
+			// 0x14019c620 (script ops 15/16) sets an actor's walk/run/sprint speed
+			// (params 7/8/9 -> slots +0x29c/+0x2a0/+0x2a4) and, for any party-type actor
+			// ([actor+0xcfc] type 2), ALSO publishes that speed and the mode to the
+			// SHARED globals [0x636FF4+..]/[0x636FF0] the tier applier 0x19C960 reads.
+			// A party member's script setting its own (lower) run speed therefore made
+			// the next applier call compute the PLAYER's speed from the member's base:
+			// the "speed randomly drops and sticks until a jump/L3 re-sets it" bug,
+			// only on maps with party members around. Publish the globals for the
+			// player's own channel [0x658CF4] only; the x m1 boost for party members
+			// is kept exactly as stock. Four sites: base (param 4, [0x637000] x m2) and
+			// the three mode sites; each block is re-executed with the extra channel test.
+			if (GetPrivateProfileIntW(L"Movement", L"AnalogGlobalsFix", 1, wcModulePath) != 0)
+			{
+				struct GSite { const char* sig; uint32_t constCell, mulCell, mode, len; bool hasPc; };
+				static const GSite gsites[] = {
+					// actor fn 0x14019c620: base (param 4) + modes 7/8/9 (no script PC available)
+					{ "3D 00 00 08 00 75 10 F3 0F 11 35 F0 A8 49 00 F3 0F 59 35 F0 A8 49 00", 0x637000, 0x637008, 0, 0x17, false },
+					{ "3D 00 00 08 00 75 1A F3 0F 11 35 96 A8 49 00 F3 0F 59 35 9E A8 49 00 C7 05 80 A8 49 00 07 00 00 00", 0x636FF4, 0x637004, 7, 0x21, false },
+					{ "3D 00 00 08 00 75 1A F3 0F 11 35 3C A8 49 00 F3 0F 59 35 40 A8 49 00 C7 05 22 A8 49 00 08 00 00 00", 0x636FF8, 0x637004, 8, 0x21, false },
+					{ "3D 00 00 08 00 75 1A F3 0F 11 35 D8 A7 49 00 F3 0F 59 35 D8 A7 49 00 C7 05 BA A7 49 00 09 00 00 00", 0x636FFC, 0x637004, 9, 0x21, false },
+					// script op 15/16 handler 0x14035cf2d: its own inline copies (rcx = op record, PC at +0x28)
+					{ "3D 00 00 08 00 75 1A F3 0F 11 35 8E A0 2D 00 F3 0F 59 35 96 A0 2D 00 C7 05 78 A0 2D 00 07 00 00 00", 0x636FF4, 0x637004, 7, 0x21, true },
+					{ "3D 00 00 08 00 75 1A F3 0F 11 35 33 A0 2D 00 F3 0F 59 35 33 A0 2D 00 C7 05 15 A0 2D 00 09 00 00 00", 0x636FFC, 0x637004, 9, 0x21, true },
+					{ "3D 00 00 08 00 75 1A F3 0F 11 35 D6 9F 2D 00 F3 0F 59 35 DA 9F 2D 00 C7 05 BC 9F 2D 00 08 00 00 00", 0x636FF8, 0x637004, 8, 0x21, true },
+				};
+				auto spring = reinterpret_cast<uint32_t*>(trampoline->RawSpace(8 + 16 * 24));
+				memset(spring, 0, 8 + 16 * 24);
+				g_spLog = spring;
+				auto ctl = trampoline->Pointer<int>(); *ctl = *reinterpret_cast<volatile int*>(baseaddress + 0x658CF4);
+				g_ctlChanCell = ctl;
+				for (const auto& gs : gsites)
+				{
+					match = FindOne(gs.sig);
+					pointers[0] = reinterpret_cast<uintptr_t>(ctl);   // controlled character's channel (mirrored by the watcher)
+					pointers[1] = baseaddress + gs.constCell;
+					pointers[2] = baseaddress + gs.mulCell;
+					pointers[3] = baseaddress + 0x636FF0;      // mode
+					pointers[4] = reinterpret_cast<uintptr_t>(spring);
+					constants[0] = gs.mode;
+					// ring-log every party-type write (param, value, channel, PC), then publish
+					// the globals only when the writer is the player's channel
+					const std::string logPart = std::string(
+						"push r11; push rax; lea r11, [rip + ?4]; mov eax, dword ptr [r11]; inc dword ptr [r11]; and eax, 15; imul eax, eax, 24; add r11, rax; add r11, 8; "
+						"mov dword ptr [r11], $0; movss dword ptr [r11 + 4], xmm6; movsx eax, byte ptr [rbx + 0x18]; mov dword ptr [r11 + 8], eax; ")
+						+ (gs.hasPc ? "mov eax, dword ptr [rcx + 0x28]; mov dword ptr [r11 + 12], eax; " : "mov dword ptr [r11 + 12], 0; ")
+						+ "pop rax; pop r11; ";
+					if (gs.mode)
+						ParametricASMJump(("cmp eax, 0x80000; jne E; " + logPart +
+							"movsx eax, byte ptr [rbx + 0x18]; cmp eax, dword ptr [rip + ?0]; jne M; "
+							"movss dword ptr [rip + ?1], xmm6; mov dword ptr [rip + ?3], $0; M: mulss xmm6, dword ptr [rip + ?2]; E: nop").c_str(), match, 0, gs.len);
+					else
+						ParametricASMJump(("cmp eax, 0x80000; jne E; " + logPart +
+							"movsx eax, byte ptr [rbx + 0x18]; cmp eax, dword ptr [rip + ?0]; jne M; "
+							"movss dword ptr [rip + ?1], xmm6; M: mulss xmm6, dword ptr [rip + ?2]; E: nop").c_str(), match, 0, gs.len);
+				}
+				LogF("[Movement] AnalogGlobalsFix on: move-mode/speed globals published for the player only");
+			}
 		}
 
 		const int ResX = GetPrivateProfileIntW(L"OverrideRes", L"ResX", 0, wcModulePath);
@@ -3456,6 +3612,35 @@ void OnInitializeHook()
 					"lea r11, [rip + ?1]; cmp eax, dword ptr [r11 + r10*4]; je S; mov dword ptr [r11 + r10*4], eax; "
 					"Z: pop r11; pop r10; mov qword ptr [rcx + 0x1a8], rdx; mov dword ptr [rcx + 0x1a0], edx; jmp K; S: pop r11; pop r10; K: nop", match, 0, 0x15);
 				LogF("[Movement] AiEventKeepFix on: AI event bits survive until the next 30Hz script tick");
+			}
+
+			//[Movement] AiCountdownFix=1: the enemy action scheduler's pause between
+			//decisions, word[actor+0xc6a], is decremented once per RENDERED frame
+			//(0x140194bed: add word [rbx+0xc6a], -1) and reloaded from a 30Hz-authored
+			//value, so above 30fps every non-script enemy re-decides framerate/30 times
+			//too often (traced: soldiers class 0x2016 sit in the "waiting" state 70% of
+			//samples at 30fps vs 9% at 120fps). Bosses driven by battle scripts are
+			//unaffected either way (the VM ticks at 30Hz). Fix: count AI frames at the
+			//AI begin-frame loop (0x140263b9c, once per rendered frame) and only apply
+			//the decrement on every k-th frame, k = round(framerate/30). Not installed
+			//at 30fps (k would be 1).
+			{
+				const int k = static_cast<int>(framerate / 30.0f + 0.5f);
+				if (k > 1 && GetPrivateProfileIntW(L"Movement", L"AiCountdownFix", 1, wcModulePath) != 0)
+				{
+					auto aiFrame = trampoline->Pointer<uint32_t>(); *aiFrame = 0;
+					match = FindOne("48 8B 0D 9D 4C 3F 00 41 B9 42 00 00 00");
+					pointers[0] = reinterpret_cast<uintptr_t>(aiFrame);
+					pointers[1] = match.get_uintptr(0x7) + *reinterpret_cast<int32_t*>(match.get<void>(0x3)); // the AI table cell the displaced mov reads
+					ParametricASMJump("inc dword ptr [rip + ?0]; mov rcx, qword ptr [rip + ?1]; mov r9d, 0x42", match, 0, 0xD);
+					match = FindOne("B8 FF FF 00 00 66 01 83 6A 0C 00 00");
+					pointers[0] = reinterpret_cast<uintptr_t>(aiFrame);
+					constants[0] = k;
+					ParametricASMJump(
+						"push rax; push rdx; push rcx; pushfq; mov eax, dword ptr [rip + ?0]; xor edx, edx; mov ecx, $0; div ecx; test edx, edx; jne S; "
+						"popfq; pop rcx; pop rdx; pop rax; mov eax, 0xffff; add word ptr [rbx + 0xc6a], ax; jmp E; S: popfq; pop rcx; pop rdx; pop rax; E: nop", match, 0, 0xC);
+					LogF("[Movement] AiCountdownFix on: AI decision countdown steps every %d rendered frames (30Hz cadence)", k);
+				}
 			}
 
 			//Camera distance in the first cutscene [ref: 0x00155CB0]

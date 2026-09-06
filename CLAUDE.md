@@ -39,5 +39,5 @@ All patches live in `source/Patch.cpp`. Released at https://github.com/Holysrc/F
 write watch), `WriteWatch`, `TraceSounds`, `TracePitch`, `TierScan`, `FpsToggleKey`. See GAME_INTERNALS §1.
 
 ## Open topics (as of 2026-09-05)
-- Chapter 3 softlock at 60 fps (GitHub issue #12), high-fps character steering wobble (upstream-known),
+- Chapter 3 mission 1 softlock at 60 fps (Banz99 issue #12): NOT reproduced on 0.5.4 at 120 fps (one clean pass, 2026-09-05); same class reported in chapter 5 mission 1 (Dracobaltians after Wingverns) - untested. high-fps character steering wobble (upstream-known),
   narrow-corridor camera clipping at distance -150, shadow quality, save-stone flicker.

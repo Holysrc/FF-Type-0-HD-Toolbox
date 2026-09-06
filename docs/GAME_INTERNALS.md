@@ -213,6 +213,19 @@ leader's channel across in-field switches (traced: the controlled actor moved on
 1 and 2 while `CF4` stayed 0). Same lookup is used by the action-decide function
 `0x140193DD4` and the L3 handler.
 
+### Leads from Banz99 (Discord, 2026-09-06) — script-event frame counters, UNRESOLVED
+- Main script-command handler `0x140371140`; commands whose low nibble is 6 are routed to `0x140371A20`,
+  and that is where the frame-dependent event timing lives (floating-point counters).
+- His attempts, all failed: (a) scale the `+1.0f` side (case 105) like the PSP cheat — only 0.5/0.25
+  steps avoid float drift, and events became MORE frame dependent; (b) case 110 = global counter +1 per
+  game cycle that events are compared against, multiplied by fps/30 — broke other places; (c) increment
+  case-105 counters only once per game cycle — broke one-frame events that fire without a recheck.
+- Concrete repro he shipped (save `TYPE0DAT.zip`, keep in `dump/`): after a black-screen transition two
+  enemies jump from the ship at frames 210 and 225; those totals are built by increments (e.g. 90+120)
+  through `06 01` parts = case 16 in `0x140371A20`. At 90 fps the scene misbehaves (his videos).
+- He considers our 0.5.x fixes limited to enemy behaviour; the script-counter problem is the root of the
+  ch3 / ch5 softlocks and event overlap. Also: use atom0s/Steamless to unpack the exe instead of a memory dump.
+
 ## 8. Known frame-rate dependency patterns (checklist for new bugs)
 
 1. **Per-rendered-frame counters** authored for 30 Hz: AI countdown `+0xc6a`, leg budgets

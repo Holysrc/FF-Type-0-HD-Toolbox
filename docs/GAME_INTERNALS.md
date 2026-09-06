@@ -230,6 +230,7 @@ leader's channel across in-field switches (traced: the controlled actor moved on
 - The `cd6/cd8` budget watchdog is real but did not cause either chapter-2 boss bug.
 - The `+0x30` "velocity unit" rescale on the shared evaluator breaks all movement.
 - Lock-on (R1) does not touch the target actor and did not cause the Qator freeze.
+- Save-file play-time counter is NOT frame-counted: 40 wall-clock minutes at 120 fps = +40 min in the save (2026-09-05). The Reddit claim that the moogle play-time reward comes 2-4x early is unfounded on this build.
 - The 604-point gauge on channel 13 and the "death in the air" belonged to the chapter-2
   flying unit of the first area, not to Qator (channel 6, class `0x200B`).
 - Qator's freeze was not the turn-wait alone (`EnemyTurnFullRate` fixed only the first

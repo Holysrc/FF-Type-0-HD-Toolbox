@@ -13,10 +13,19 @@ patching.
 ## 1. Tooling and workflow
 
 - **The exe is SteamStub-encrypted on disk** (`.text` entropy 8.0, entrypoint in `.bind`).
-  Signatures exist only in memory. Static analysis uses a runtime dump:
-  `scratchpad/image.bin` (~11 MB, file offset == RVA; stored data pointers were relocated
-  to base `0x7FF7ECD90000`, so `RVA = qword − 0x7FF7ECD90000`). If the dump is lost,
-  ask the user for a fresh one.
+  Two decrypted copies live in `dump/` (gitignored):
+  - `dump/fftype0hd.exe.unpacked.exe` — made with **Steamless** (`C:\Tools\Steamless\Steamless.CLI.exe
+    dumpftype0hd.exe`, variant 3.1 x64). A clean PE at base `0x140000000` with correct data pointers;
+    verified byte-identical to the memory dump at all known code sites (2026-09-06). Preferred input for
+    static analysis. Recreate from the Steam exe in one command if lost.
+  - `dump/image.bin` — the older runtime memory dump (file offset == RVA; stored data pointers were
+    relocated to base `0x7FF7ECD90000`, so `RVA = qword − 0x7FF7ECD90000`). Still what the
+    `docs/tools/*.py` scripts read; also contains live `.data` state.
+- **Ghidra** (`C:\Tools\ghidra_12.1.3_PUBLIC`, JDK 21 at `C:\Program Files\Eclipse Adoptium`):
+  project `C:\Tools\ghidra_projects\FFT0`, program `fftype0hd.exe.unpacked.exe`, fully auto-analysed.
+  Decompile without the GUI: `docs/tools/ghidra/decompile.ps1 out.c 0x140371A20 ...` (headless
+  post-script `DecompileAt.java`, accepts VAs or RVAs). Use it for big switch-style functions
+  (script-command handlers) where capstone listings are too slow to read.
 - **Disassembly**: capstone 5, `disasm.py` (pdata-bounded) / `dis_range.py <va> <bytes>`
   (raw). Many functions have no unwind entry: `pdata` chunks are *not* function starts —
   find the real start by walking back to `CC CC` padding. Starting mid-instruction

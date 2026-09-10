@@ -142,9 +142,13 @@ cutscene gate reads the dead cell `0x6D1CEC`, so it is always active.
   `+0x1a8`==0 then clears state. States 1 and 3 have a **rendered-frame budget watchdog**
   (`cd6 ≥ cd8` kills the leg and zeroes both profiles); it is real but, for every boss
   traced so far, budgets were 0xFFFF and it never fired.
-- **Battle script VM**: dispatcher `0x140370C70`, thread record (stride `0x510`): opcode
-  `+0x24`, PC `+0x28`, owner channel `+0x34`, args `+0x38..`, result `+0x30`. Threads run
-  at **30 Hz**. Useful ops: `0x09` wait N ticks; `0x60/0x6F` call label; `0x114` "actor
+- **Script VM** (one engine for field/event scripts, battle AI scripts and per-actor threads;
+  decompiled 2026-09-07, see §4a). `0x140370C70` is the command ARGUMENT PARSER (called once per
+  new command, not per tick). Thread record (stride `0x510`, call stack frames of `0xa0` at `+8`,
+  frame count at `+0x508`): opcode `+0x24` (−1 = none pending), PC `+0x28`, end PC `+0x14`,
+  owner channel `+0x34`, args `+0x38..`, result `+0x30`, waiting flag `+0x2c`, finished `+0x2d`,
+  paused `+0x2e`. The VM TICKS EVERY RENDERED FRAME (not 30 Hz); commands only *appear* to run at
+  30 Hz because the wait opcodes are stretched by upstream's per-address dedup patches. Useful ops: `0x09` wait N ticks; `0x60/0x6F` call label; `0x114` "actor
   dead?"; `0x122` actor property getter `0x1401A2080`; `0x153` AI-table target metric
   (`0x140275340` picks the nearest target; sub 2 = distance bucket); `0x15F` event-bit
   test (arg0 selects word: 0 → `aib+0x1ac`, 1 → `+0x1a0`, 2 → `+0x1a8`; arg1 = bit);
@@ -152,6 +156,57 @@ cutscene gate reads the dead cell `0x6D1CEC`, so it is always active.
   `0xD7` turn to face; `0x15/0x16` SetActorParam.
 - **Run builder** `0x14019B530` (state 2 trapezoid), walk setter `0x14019B8E0` (state 1),
   turn setter `0x14019B480` (state 3, budget 8 frames). Their callers are the ops above.
+
+### 4a. Script VM internals (decompiled with Ghidra, 2026-09-07)
+- Tick drivers: `0x140376f70` (per-frame game-system update) runs the GLOBAL VM `[sys+8]` via
+  `0x14037f2a0(vm)` and then the field manager `0x1403816b0`, which runs the FIELD VM `[fm+0x18]`
+  the same way and then updates the 3 party actors (vtable `+0x28`). Both start a `"main"` thread
+  when none is active (`0x14037f620`). Per-actor script threads run through `0x140371630` from
+  actor code (`0x1401b5f22`, `0x1401bb4b9`). Third caller of the tick: `0x14034c4e7` (battle side).
+- `0x14037f2a0` loops over threads `[vm+0]` × `0x510` and runs each until it blocks: step
+  `0x140371390` decodes one instruction by the low nibble of the first word: 1 → control flow
+  `0x140371140` (case 6 = if/else chain, 7 = jump, 0xc = loop, 0xd = end), 2 → engine command
+  (parse args `0x140370c70`, handler from table `PTR_140612368[opcode*6]`, completion check
+  `0x140370a60`; the thread yields while the command is pending), 8 → script function call
+  `0x140371000` → `0x14037f120`, else → expression `0x1403721c0`.
+- Expression evaluator `0x1403721c0`: RPN over a 32-entry stack at `0x14065aeb0` (12 bytes: type,
+  kind, value). Operand types: 4 = constant from the script's pool `[script+0x150]`, 5 = small
+  immediate / VARIABLE REFERENCE (`kind = bits 4-5`, index = `word>>6`), 6 = operator
+  (`op = word>>4`), 2 = nested engine command, 8 = function call. Operators go to
+  `0x140371a20(rec, op, &a, &b, intMode)`: 0x10 add (Banz99's "case 16"), 0x11 sub, 0x0d mul,
+  0x0e/0x0f div, 0x12/0x13/0x6b/0x6c compares, 0x6d/0x6e equality with ±1.19e-7 tolerance
+  ("case 110"), 0x17 assign, **0x69 `var++` ("case 105"), 0x6a `var--`, 0x71 `var += x`,
+  0x72 `var -= x`**. Variable reads: `0x140372150`.
+- THREE variable stores, selected by `kind`: 0 → `float[[rec+8] + idx*4]` (script-object
+  variables), 1 → `float[[rec+0x80] + idx*4]` (per-context block allocated at call time,
+  `0x14037f120`, zero-filled), 2 → `float[rec+0x5c + idx*4]` (thread locals = the up-to-8 call
+  arguments). Increment sites: store 0 `0x140371f78`, store 1 `0x140371fb2`, store 2
+  `0x140371fea`; decrement: store 0/1 shared `0x14037203c`, store 2 `0x140372070`.
+- Upstream ("Gameplay fixes #1/#2") deduplicates ONLY the store-0 sites, and only while the
+  value is in [1,10) (or when a caller stack slot `[rsp+0x60]` equals `0x140574CA0`); values ≥ 10
+  always advance. `[rsp+0x10]` at that site is the variable's value left by `0x140372150`. Its asm
+  also clobbered r13/r15, which the evaluator keeps its thread index and flag in — a `++` inside a
+  longer expression corrupted them. Fixed in the fork (volatile r8/r9/r11, same logic).
+- **A plain per-address "once per 30 Hz frame" dedup HANGS THE GAME AT BOOT**: scripts loop
+  `x++` inside a single tick (`while (x < N) x++`), so the counter never reaches N (2026-09-09,
+  reproduced: CPU spin, log stops after init). That is almost certainly why upstream limited its
+  dedup to small values. Shipped rule for stores 1/2 (`[Movement] ScriptVarDedupAll`, default 1):
+  32-entry list {addr, rendered frame, 30 Hz frame} (frame counters bumped in upstream's per-frame
+  setup hook); an address advances freely within one rendered frame, and only its FIRST touch in a
+  later rendered frame of the same 30 Hz frame is skipped. Per-tick counters → once per 30 Hz frame;
+  in-tick loops lose at most one iteration. Boots and plays (laptop + the test PC).
+- `[Movement] ScriptTick30Hz` (default 0, experimental): early-return in `0x14037f2a0` unless
+  upstream's `propagatecounters` byte says this rendered frame starts a 30 Hz frame. Gates the
+  global and field VMs only. Untested beyond boot.
+- Diagnostics: `[ScriptVars +Ts]` log line (from the stats watcher) counts performed/skipped
+  `++`/`--` per store, so a play log shows which store the problem scene's counters live in.
+- `[OverrideRes]` resolution not in the primary display's mode list closes the game silently at startup
+  (the test PC: 4K ini on a 1440p monitor). The fork now falls back to the desktop resolution with a log
+  WARNING (`AllowUnsupportedRes = 1` forces the ini value). Note a 4K laptop panel running a scaled
+  desktop still lists 4K as a mode, so the check passes there.
+- Unresolved: Banz99's "global counter increasing by 1 each game cycle" that event scripts compare
+  against (ship-jump enemies at frames 210/225 in his save) — not yet located; may be a store-1/2
+  script counter (now deduped) or an engine command result.
 
 ### Lock-on camera (verified 2026-09-05)
 - Camera update function `0x1402f1ef0`; lock-on branch runs when `[0x658f48] == 4`. The stock code has
@@ -273,6 +328,7 @@ leader's channel across in-field switches (traced: the controlled actor moved on
 | 0.5.1 | `TurnPhaseFullRate` | Commander Schmitz stair entrance: servo at full rate |
 | 0.5.2 | `AiEventKeepFix`, `EnemyTurnFullRate` | General Qator Bashtar freeze |
 | 0.5.3 | `AnalogGlobalsFix`, controlled-character lookup, `DashAtCap`, `AiCountdownFix` | analog movement after character switches, dash speed, enemy decision pacing |
+| next | `ScriptVarDedupAll` (default 1), `ScriptTick30Hz` (default 0) | script `++/--` on all variable stores at 30 Hz; upstream r13/r15 clobber fixed; VM tick gate experiment |
 | 0.5.4 | `[Camera] LockFollowPercent`, `LockDeadZoneDegrees`; `[Movement] StickSaturationPercent` | lock-on camera soft follow + dead zone; diagonal stick saturation; tuner window regrouped, tooltips fixed |
 | — | `AnimLastFrameFix` (default 0) | superseded; its asm form is rejected at runtime |
 | — | `BossFixPace/Nav/Turn/Profile`, `ProfileVelocityFix`, `BossVerticalFix` (default 0) | dead or superseded experiments |

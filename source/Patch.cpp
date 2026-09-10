@@ -119,6 +119,8 @@ static pattern FindAll(const char* sig, size_t expected)
 // whenever anything changed, so list pressure can be correlated with in-game
 // events (issue #12 softlock / #20 crashes) without a debugger attached.
 static uint32_t* g_stats = nullptr;
+// [ScriptVars] counters: per script-variable store {performed, skipped} for ++ on store 0/1/2 and -- on store 2
+static uint32_t* g_scriptStats = nullptr;
 
 // Sound-trace mode ([Diagnostics] TraceSounds=1): a hook on the game's central
 // "request sound by id" function writes every id into this ring buffer; a
@@ -2415,6 +2417,19 @@ static void StartStatsWatcher()
 					cur[0], cur[1], cur[2], cur[3], cur[4], cur[7], cur[8], cur[5] + 1, cur[6] + 1);
 				memcpy(last, cur, sizeof(cur));
 			}
+			if (g_scriptStats)
+			{
+				static uint32_t lastS[8] = {};
+				uint32_t curS[8];
+				for (int i = 0; i < 8; i++)
+					curS[i] = *(volatile uint32_t*)&g_scriptStats[i];
+				if (memcmp(curS, lastS, sizeof(curS)) != 0)
+				{
+					LogF("[ScriptVars +%llus] ++store0=%u/%u ++store1=%u/%u ++store2=%u/%u --store2=%u/%u (done/skipped as 30Hz duplicates)",
+						(GetTickCount64() - start) / 1000ULL, curS[0], curS[1], curS[2], curS[3], curS[4], curS[5], curS[6], curS[7]);
+					memcpy(lastS, curS, sizeof(curS));
+				}
+			}
 		}
 	}).detach();
 }
@@ -3184,8 +3199,38 @@ void OnInitializeHook()
 			}
 		}
 
-		const int ResX = GetPrivateProfileIntW(L"OverrideRes", L"ResX", 0, wcModulePath);
-		const int ResY = GetPrivateProfileIntW(L"OverrideRes", L"ResY", 0, wcModulePath);
+		int ResX = GetPrivateProfileIntW(L"OverrideRes", L"ResX", 0, wcModulePath);
+		int ResY = GetPrivateProfileIntW(L"OverrideRes", L"ResY", 0, wcModulePath);
+
+		//[fork] A resolution the primary display cannot show closes the game silently at startup
+		//(the ini asks for 4K on a 1440p monitor, nothing happens, no log). Check the requested
+		//mode against the display's mode list; if it is not there, fall back to the desktop
+		//resolution and say so in the log. AllowUnsupportedRes = 1 skips the check.
+		if (ResX > 0 && ResY > 0 && GetPrivateProfileIntW(L"OverrideRes", L"AllowUnsupportedRes", 0, wcModulePath) == 0)
+		{
+			bool supported = false;
+			DEVMODEW dm = {};
+			dm.dmSize = sizeof(dm);
+			for (DWORD i = 0; EnumDisplaySettingsW(nullptr, i, &dm); i++)
+			{
+				if (static_cast<int>(dm.dmPelsWidth) == ResX && static_cast<int>(dm.dmPelsHeight) == ResY)
+				{
+					supported = true;
+					break;
+				}
+			}
+			if (!supported)
+			{
+				DEVMODEW cur = {};
+				cur.dmSize = sizeof(cur);
+				if (EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &cur) && cur.dmPelsWidth > 0 && cur.dmPelsHeight > 0)
+				{
+					LogF("[Resolution] WARNING: %dx%d is not a mode of the primary display - using the desktop resolution %ux%u instead (set [OverrideRes] AllowUnsupportedRes = 1 to force)", ResX, ResY, cur.dmPelsWidth, cur.dmPelsHeight);
+					ResX = static_cast<int>(cur.dmPelsWidth);
+					ResY = static_cast<int>(cur.dmPelsHeight);
+				}
+			}
+		}
 
 		if (ResX > 0 && ResY > 0)
 		{
@@ -3307,6 +3352,8 @@ void OnInitializeHook()
 			// original >30fps glitches (double triggers / fast counters).
 			const bool disableCounterDedup = GetPrivateProfileIntW(L"Diagnostics", L"DisableCounterDedup", 0, wcModulePath) != 0;
 			const bool disableTriggerDedup = GetPrivateProfileIntW(L"Diagnostics", L"DisableTriggerDedup", 0, wcModulePath) != 0;
+			const bool scriptVarDedupAll = GetPrivateProfileIntW(L"Movement", L"ScriptVarDedupAll", 1, wcModulePath) != 0;
+			const bool scriptTick30Hz = GetPrivateProfileIntW(L"Movement", L"ScriptTick30Hz", 0, wcModulePath) != 0;
 			if (disableCounterDedup)
 				LogF("[Framerate] counter dedup patches DISABLED via ini (bisect mode)");
 			if (disableTriggerDedup)
@@ -4189,7 +4236,12 @@ void OnInitializeHook()
 			pointers[2] = reinterpret_cast<uintptr_t>(reset_list);
 			pointers[3] = reinterpret_cast<uintptr_t>(damage_and_audio_triggers);
 			pointers[4] = reinterpret_cast<uintptr_t>(floatcountersptrs);
-			ParametricASMJump("movss xmm2, dword ptr [rip + ?0]; addss xmm2, %0; comiss xmm2, %1; mov byte ptr [rip + ?1], 0; jb A; subss xmm2, %1; mov byte ptr [rip + ?1], 1; lea rax, [rip + ?4]; xor rbx, rbx; C: mov qword ptr [rax + rbx * 8], 0; inc rbx; cmp bl, $1; jl C; neg byte ptr [rip + ?2]; js A; lea rax, [rip + ?3]; xor rbx, rbx; B: mov qword ptr [rax + rbx * 8], 0; inc rbx; cmp bl, $0; jl B; A: movss dword ptr [rip + ?0], xmm2; mov rbx, qword ptr [rsp + 0x40]", match, 0x7, 0xC);
+			//[fork] frame counters for the script-variable dedup below: [0] rendered frames, [4] 30Hz frames, [8] list slot cursor
+			auto scriptFrames = reinterpret_cast<uint32_t*>(trampoline->RawSpace(4 * sizeof(uint32_t)));
+			memset(scriptFrames, 0, 4 * sizeof(uint32_t));
+			pointers[5] = reinterpret_cast<uintptr_t>(&scriptFrames[0]);
+			pointers[6] = reinterpret_cast<uintptr_t>(&scriptFrames[1]);
+			ParametricASMJump("movss xmm2, dword ptr [rip + ?0]; addss xmm2, %0; comiss xmm2, %1; mov byte ptr [rip + ?1], 0; jb A; subss xmm2, %1; mov byte ptr [rip + ?1], 1; inc dword ptr [rip + ?6]; lea rax, [rip + ?4]; xor rbx, rbx; C: mov qword ptr [rax + rbx * 8], 0; inc rbx; cmp bl, $1; jl C; neg byte ptr [rip + ?2]; js A; lea rax, [rip + ?3]; xor rbx, rbx; B: mov qword ptr [rax + rbx * 8], 0; inc rbx; cmp bl, $0; jl B; A: movss dword ptr [rip + ?0], xmm2; inc dword ptr [rip + ?5]; mov rbx, qword ptr [rsp + 0x40]", match, 0x7, 0xC);
 
 			auto stats = reinterpret_cast<uint32_t*>(trampoline->RawSpace(9 * sizeof(uint32_t)));
 			memset(stats, 0, 9 * sizeof(uint32_t));
@@ -4229,7 +4281,15 @@ void OnInitializeHook()
 			pointers[2] = reinterpret_cast<uintptr_t>(&stats[2]);
 			param_floats[0] = 1.0f;
 			param_floats[1] = 10.0f;
-			ParametricASMJump("mov r13, $1; cmp qword ptr [rsp + 0x60], r13; je F; movss xmm1, dword ptr [rsp + 0x10]; comiss xmm1, %1; jae E; comiss xmm1, %0; jb E; F: lea rbx, [rax + rcx * 4]; lea r13, [rip + ?0]; xor r15, r15; A: cmp qword ptr [r13 + r15 * 8], rbx; je D; inc r15; cmp r15b, $0; jl A; addss xmm0, %0; xor r15, r15; B: cmp r15b, $0; jge G; cmp qword ptr [r13 + r15 * 8], 0; jne C; mov qword ptr [r13 + r15 * 8], rbx; cmp dword ptr [rip + ?1], r15d; jge D; mov dword ptr [rip + ?1], r15d; jmp D; C: inc r15; jmp B; G: inc dword ptr [rip + ?2]; jmp D; E: addss xmm0, %0; D: nop", match, 0x8, 0x10);
+			auto scriptStats = reinterpret_cast<uint32_t*>(trampoline->RawSpace(8 * sizeof(uint32_t)));
+			memset(scriptStats, 0, 8 * sizeof(uint32_t));
+			g_scriptStats = scriptStats;
+			pointers[3] = reinterpret_cast<uintptr_t>(&scriptStats[0]);
+			pointers[4] = reinterpret_cast<uintptr_t>(&scriptStats[1]);
+			// [fork] same logic as upstream, but the scratch registers are the volatile r8/r9/r11: the
+			// original used r13/r15, which the caller (expression evaluator 0x1403721c0) keeps its thread
+			// index / flag in across this call, so a "++" inside a longer expression corrupted them.
+			ParametricASMJump("mov r9, $1; cmp qword ptr [rsp + 0x60], r9; je F; movss xmm1, dword ptr [rsp + 0x10]; comiss xmm1, %1; jae E; comiss xmm1, %0; jb E; F: lea r8, [rax + rcx * 4]; lea r9, [rip + ?0]; xor r11, r11; A: cmp qword ptr [r9 + r11 * 8], r8; je H; inc r11; cmp r11b, $0; jl A; addss xmm0, %0; inc dword ptr [rip + ?3]; xor r11, r11; B: cmp r11b, $0; jge G; cmp qword ptr [r9 + r11 * 8], 0; jne C; mov qword ptr [r9 + r11 * 8], r8; cmp dword ptr [rip + ?1], r11d; jge D; mov dword ptr [rip + ?1], r11d; jmp D; C: inc r11; jmp B; G: inc dword ptr [rip + ?2]; jmp D; H: inc dword ptr [rip + ?4]; jmp D; E: addss xmm0, %0; inc dword ptr [rip + ?3]; D: nop", match, 0x8, 0x10);
 
 			//Unknown (likely Gameplay fixes #2 due to proximity) [ref: 0x0013D86C]
 			match = FindOne("00 00 00 F3 0F 10 04 88 F3 0F 5C 05 78 DD 20 00");
@@ -4281,6 +4341,57 @@ void OnInitializeHook()
 			pointers[1] = reinterpret_cast<uintptr_t>(&stats[6]);
 			pointers[2] = reinterpret_cast<uintptr_t>(&stats[8]);
 			ParametricASMJump("push rax; push rdx; push r14; lea rax, [rcx + 0x24]; lea rdx, [rip + ?0]; xor r14, r14; A: cmp qword ptr [rdx + r14 * 8], rax; je D; inc r14; cmp r14b, $0; jl A; inc word ptr [rcx + 0x24]; xor r14, r14; B: cmp r14b, $0; jge G; cmp qword ptr [rdx + r14 * 8], 0; jne C; mov qword ptr [rdx + r14 * 8], rax; cmp dword ptr [rip + ?1], r14d; jge D; mov dword ptr [rip + ?1], r14d; jmp D; C: inc r14; jmp B; G: inc dword ptr [rip + ?2]; D: pop r14; pop rdx; pop rax; movsx eax, word ptr [rcx + 0x24]", match, 0, 0x8);
+
+			//[fork] Script variable ++/-- on the other two variable stores. The script expression
+			//evaluator (0x140371a20) implements "var++" (op 0x69) and "var--" (op 0x6a) for three
+			//stores: 0 = script-object variables, 1 = per-context variable block, 2 = thread locals
+			//(call arguments). Upstream deduplicates only store 0 (the two patches above), so a
+			//counter kept in a local or context variable still advances once per RENDERED frame,
+			//i.e. framerate/30 times too fast (scripted spawn timings, "wait until counter == N").
+			//Rule (different from upstream's, which only touches values in [1,10)): an address may
+			//advance freely within one rendered frame (scripts loop "x++" inside a single tick, a
+			//plain per-address dedup hangs the game at boot), but its FIRST touch in a later rendered
+			//frame of the same 30Hz frame is skipped. So a per-tick counter advances once per 30Hz
+			//frame and an in-tick loop only ever loses one iteration. 32-entry list {addr, rendered
+			//frame, 30Hz frame}, round-robin replacement, no per-frame reset needed.
+			if (scriptVarDedupAll)
+			{
+			auto scriptVarList = reinterpret_cast<uint8_t*>(trampoline->RawSpace(32 * 16));
+			memset(scriptVarList, 0, 32 * 16);
+			param_floats[0] = 1.0f;
+			constants[0] = 32 * 16;
+			pointers[0] = reinterpret_cast<uintptr_t>(scriptVarList);
+			pointers[1] = reinterpret_cast<uintptr_t>(scriptFrames);
+			// store 1: mov rax,[rbx+0x80]; movss xmm0,[rax+rcx*4]; addss xmm0,1.0; movss [rax+rcx*4],xmm0
+			match = FindOne("48 8B 83 80 00 00 00 F3 0F 10 04 88 F3 0F 58 05 ? ? ? ? F3 0F 11 04 88");
+			pointers[2] = reinterpret_cast<uintptr_t>(&scriptStats[2]);
+			pointers[3] = reinterpret_cast<uintptr_t>(&scriptStats[3]);
+			ParametricASMJump("lea r8, [rax + rcx * 4]; lea r9, [rip + ?0]; lea rdx, [rip + ?1]; mov r11d, dword ptr [rdx]; xor r10, r10; A: cmp qword ptr [r9 + r10], r8; je F; add r10, 16; cmp r10, $0; jl A; mov r10d, dword ptr [rdx + 8]; inc dword ptr [rdx + 8]; and r10d, 31; shl r10, 4; mov qword ptr [r9 + r10], r8; mov dword ptr [r9 + r10 + 8], r11d; mov r8d, dword ptr [rdx + 4]; mov dword ptr [r9 + r10 + 12], r8d; jmp E; F: cmp dword ptr [r9 + r10 + 8], r11d; je E; mov r8d, dword ptr [rdx + 4]; cmp dword ptr [r9 + r10 + 12], r8d; jne N; mov dword ptr [r9 + r10 + 8], r11d; inc dword ptr [rip + ?3]; jmp D; N: mov dword ptr [r9 + r10 + 8], r11d; mov dword ptr [r9 + r10 + 12], r8d; E: addss xmm0, %0; inc dword ptr [rip + ?2]; D: nop", match, 0xC, 0x14);
+			// store 2: movss xmm0,[rbx+rcx*4+0x5c]; addss xmm0,1.0; movss [rbx+rcx*4+0x5c],xmm0
+			match = FindOne("F3 0F 10 44 8B 5C F3 0F 58 05 ? ? ? ? F3 0F 11 44 8B 5C");
+			pointers[2] = reinterpret_cast<uintptr_t>(&scriptStats[4]);
+			pointers[3] = reinterpret_cast<uintptr_t>(&scriptStats[5]);
+			ParametricASMJump("lea r8, [rbx + rcx * 4 + 0x5c]; lea r9, [rip + ?0]; lea rdx, [rip + ?1]; mov r11d, dword ptr [rdx]; xor r10, r10; A: cmp qword ptr [r9 + r10], r8; je F; add r10, 16; cmp r10, $0; jl A; mov r10d, dword ptr [rdx + 8]; inc dword ptr [rdx + 8]; and r10d, 31; shl r10, 4; mov qword ptr [r9 + r10], r8; mov dword ptr [r9 + r10 + 8], r11d; mov r8d, dword ptr [rdx + 4]; mov dword ptr [r9 + r10 + 12], r8d; jmp E; F: cmp dword ptr [r9 + r10 + 8], r11d; je E; mov r8d, dword ptr [rdx + 4]; cmp dword ptr [r9 + r10 + 12], r8d; jne N; mov dword ptr [r9 + r10 + 8], r11d; inc dword ptr [rip + ?3]; jmp D; N: mov dword ptr [r9 + r10 + 8], r11d; mov dword ptr [r9 + r10 + 12], r8d; E: addss xmm0, %0; inc dword ptr [rip + ?2]; D: nop", match, 0x6, 0xE);
+			// store 2 "--": movss xmm1,[rbx+rcx*4+0x5c]; subss xmm1,1.0; movss [rbx+rcx*4+0x5c],xmm1
+			match = FindOne("F3 0F 10 4C 8B 5C F3 0F 5C 0D ? ? ? ? F3 0F 11 4C 8B 5C");
+			pointers[2] = reinterpret_cast<uintptr_t>(&scriptStats[6]);
+			pointers[3] = reinterpret_cast<uintptr_t>(&scriptStats[7]);
+			ParametricASMJump("lea r8, [rbx + rcx * 4 + 0x5c]; lea r9, [rip + ?0]; lea rdx, [rip + ?1]; mov r11d, dword ptr [rdx]; xor r10, r10; A: cmp qword ptr [r9 + r10], r8; je F; add r10, 16; cmp r10, $0; jl A; mov r10d, dword ptr [rdx + 8]; inc dword ptr [rdx + 8]; and r10d, 31; shl r10, 4; mov qword ptr [r9 + r10], r8; mov dword ptr [r9 + r10 + 8], r11d; mov r8d, dword ptr [rdx + 4]; mov dword ptr [r9 + r10 + 12], r8d; jmp E; F: cmp dword ptr [r9 + r10 + 8], r11d; je E; mov r8d, dword ptr [rdx + 4]; cmp dword ptr [r9 + r10 + 12], r8d; jne N; mov dword ptr [r9 + r10 + 8], r11d; inc dword ptr [rip + ?3]; jmp D; N: mov dword ptr [r9 + r10 + 8], r11d; mov dword ptr [r9 + r10 + 12], r8d; E: subss xmm1, %0; inc dword ptr [rip + ?2]; D: nop", match, 0x6, 0xE);
+			LogF("[Movement] ScriptVarDedupAll on: script ++/-- on variable stores 1/2 advance once per 30Hz frame (in-tick loops allowed)");
+			}
+
+			//[fork, EXPERIMENTAL, default off] Tick the global and field script VMs (0x14037f2a0,
+			//called once per rendered frame for each) only on the first rendered frame of every
+			//30Hz frame, i.e. at the cadence the scripts were written for. Makes every per-tick
+			//counter dedup above a no-op for these VMs (each address is then seen once per 30Hz
+			//frame anyway). Per-actor script threads (0x140371630) are not gated.
+			if (scriptTick30Hz)
+			{
+			match = FindOne("40 56 57 41 56 48 83 EC 20 45 33 F6 48 8B F9 41 8B F6 44 39 31");
+			pointers[0] = reinterpret_cast<uintptr_t>(propagatecounters);
+			ParametricASMJump("cmp byte ptr [rip + ?0], 1; je A; ret; A: push rsi; push rdi; push r14; sub rsp, 0x20", match, 0, 0x9);
+			LogF("[Movement] ScriptTick30Hz on (EXPERIMENTAL): global/field script VMs tick once per 30Hz frame");
+			}
 			}
 
 			//In game timer

@@ -204,6 +204,33 @@ cutscene gate reads the dead cell `0x6D1CEC`, so it is always active.
   (the test PC: 4K ini on a 1440p monitor). The fork now falls back to the desktop resolution with a log
   WARNING (`AllowUnsupportedRes = 1` forces the ini value). Note a 4K laptop panel running a scaled
   desktop still lists 4K as a mode, so the check passes there.
+- **Chapter 3 mission 2 hang (2026-09-09, ROOT CAUSE)**: actor script (ch14) function id 16 runs
+  `i = 7; while (actorVar[i] unset) i--;` inside ONE tick (fn id 3/5 = `GetActorVar(i)/100000`, "unset"
+  = value in (-2,0)). `i` is a store-1 variable; upstream's "Gameplay fixes #2" (`--` dedup at
+  `0x14037203c`, stores 0/1, no small-value rule) drops the second `i--` of the tick, `i` sticks at 6,
+  the loop never ends, the main thread spins in the evaluator (RIPs 0x372192/0x372299/0x372494/
+  0x370EF7). Happens at ANY FpsCap above 30 (at 30 the whole framerate block is skipped). Fix: both
+  upstream store-0/1 sites replaced by the frame-aware rule (`ScriptVarDedupAll`, default 1).
+- **Script file format** ("ATELY", decoded 2026-09-09, tool `docs/tools/scriptdis.py`): object header
+  fields `+0x118` code, `+0x120` fn table, `+0x138/+0x140` label tables, `+0x148` labels (`0xFF0000nn`,
+  offset pairs), `+0x150` float constant pool. Code: 0x30-byte file header, then functions =
+  8-byte header `{fn id, body length}` (4-byte aligned) + body; the last ring PC of a command is
+  recorded 6 bytes after the command start. Statement word low nibble: 1 control (op=(w>>4)&0xF:
+  1/2/A `if (expr) skip next 4 bytes` — the next statement is usually `GOTO label`; 4 goto label w1;
+  5 label w1; 6 switch(expr) block w1; 7 case(expr) (falls through as a statement); 8 endswitch;
+  3 else-mark; C return expr; D end), 2 command (`id<<4|2`, w1 flags/result target, w2 arg bytes),
+  8 call (`fnid<<4|8`, 10-byte header + args), 3 expression statement (len = w>>4). Expression
+  operands: 4 const[w>>6], 5 variable (kind=(w>>4)&3: 0 script-object vars, 1 context block, 2 call
+  args; idx=w>>6), 6 operator (0x10 + 0x11 - 0x0d * 0x0e / 0x12 < 0x13 > 0x6b <= 0x6c >= 0x6d == 0x6e !=
+  0x6f AND 0x70 OR 0x17 = 0x69 ++ 0x6a -- 0x71 += 0x72 -=), 2 nested command, 8 nested call.
+  Script commands seen: id 0x29E SetActorVar(idx,val), 0x29F GetActorVar(idx) (`actor+0x90+idx*4`,
+  16 floats, -1 = unset), 0x8E DistanceToPoint(x,z), 0x0A wait, 0x128/0xF/0x52/0xC state
+  enter/leave wrappers, 0x4C SetFlag(n,v).
+- **Diagnostics added 2026-09-09**: `[Diagnostics] HangWatch` (default 1; stall report after 8 s
+  without rendered frames, or F7: thread RIPs + stacks, evaluator state, script rings, per-channel
+  script dumps `<ini>_script_*.bin`), `TraceScriptOps` (default 1; ring of the last 512 commands and
+  a spin-filtered ring of the last 512 distinct-PC commands), `WatchActorVar = ch,idx` (DR0 write
+  watch on an actor variable). Tools: `docs/tools/scriptdis.py`, `calls_to.py`.
 - Unresolved: Banz99's "global counter increasing by 1 each game cycle" that event scripts compare
   against (ship-jump enemies at frames 210/225 in his save) — not yet located; may be a store-1/2
   script counter (now deduped) or an engine command result.

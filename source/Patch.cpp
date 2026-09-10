@@ -13,6 +13,9 @@
 #include <thread>
 #include <commctrl.h>
 #include <tlhelp32.h>
+#include <psapi.h>
+#pragma comment(lib, "Psapi.lib")
+extern "C" IMAGE_DOS_HEADER __ImageBase;
 #pragma comment(lib, "Comctl32.lib")
 #include "Utils/Trampoline.h"
 #include "include/keystone/keystone.h"
@@ -121,6 +124,16 @@ static pattern FindAll(const char* sig, size_t expected)
 static uint32_t* g_stats = nullptr;
 // [ScriptVars] counters: per script-variable store {performed, skipped} for ++ on store 0/1/2 and -- on store 2
 static uint32_t* g_scriptStats = nullptr;
+static volatile uint32_t* g_scriptFrames = nullptr; // [0] rendered frames (bumped by the per-frame setup hook)
+static uintptr_t g_trampolineLo = 0, g_trampolineHi = 0;
+// [TraceScriptOps] ring of the last 512 script commands parsed by 0x140370c70 (all channels):
+// 24-byte entries {opcode, channel, PC, thread index, record ptr lo, record ptr hi}; dumped by HangWatch
+static volatile uint8_t* g_scriptOpRing = nullptr;
+static volatile uint32_t* g_scriptOpHead = nullptr;
+// second ring with a spin filter: an entry is dropped when its PC equals the PC of any of the
+// previous four entries, so a tight script loop cannot flush the history before it
+static volatile uint8_t* g_scriptOpRing2 = nullptr;
+static volatile uint32_t* g_scriptOpHead2 = nullptr;
 
 // Sound-trace mode ([Diagnostics] TraceSounds=1): a hook on the game's central
 // "request sound by id" function writes every id into this ring buffer; a
@@ -2380,7 +2393,7 @@ static void StartSoundTraceWatcher()
 		{
 			Sleep(200);
 			const ULONGLONG now = GetTickCount64() - start;
-			if (GetAsyncKeyState(VK_F9) & 1)
+			if (GetAsyncKeyState(VK_F7) & 1)
 				LogF("[Mark] F9 at +%llums", now);
 			const uint32_t head = *g_sndHead;
 			if (head != last)
@@ -2392,6 +2405,325 @@ static void StartSoundTraceWatcher()
 					pos += sprintf_s(line + pos, sizeof(line) - pos, "%X ", g_sndRing[i & 0xFF]);
 				LogF("[Snd +%llums] %s", now, line);
 				last = head;
+			}
+		}
+	}).detach();
+}
+
+// [HangWatch] report: freeze every other thread once, log each thread's RIP (module-relative
+// for the exe / the mod / the trampoline) and, for threads inside the exe, the return addresses
+// found in the top of the stack; then dump both script-command rings. Called by the stall
+// watcher (rendered-frame counter stuck for 8 s) and by the F9 hotkey.
+static void HangReport(const char* why)
+{
+	LogF("[HangWatch] %s - thread report:", why);
+	const HMODULE self = reinterpret_cast<HMODULE>(&__ImageBase);
+	MODULEINFO mi = {};
+	GetModuleInformation(GetCurrentProcess(), reinterpret_cast<HMODULE>(g_gameBase), &mi, sizeof(mi));
+	const uintptr_t exeLo = g_gameBase, exeHi = g_gameBase + mi.SizeOfImage;
+	MODULEINFO ms = {};
+	GetModuleInformation(GetCurrentProcess(), self, &ms, sizeof(ms));
+	const uintptr_t selfLo = reinterpret_cast<uintptr_t>(self), selfHi = selfLo + ms.SizeOfImage;
+	auto where = [&](uintptr_t a, char* buf, size_t n) {
+		if (a >= exeLo && a < exeHi) snprintf(buf, n, "exe+%llX", static_cast<unsigned long long>(a - exeLo));
+		else if (a >= selfLo && a < selfHi) snprintf(buf, n, "mod+%llX", static_cast<unsigned long long>(a - selfLo));
+		else if (a >= g_trampolineLo && a < g_trampolineHi) snprintf(buf, n, "tramp+%llX", static_cast<unsigned long long>(a - g_trampolineLo));
+		else snprintf(buf, n, "%llX", static_cast<unsigned long long>(a));
+	};
+	const DWORD me = GetCurrentThreadId(), pid = GetCurrentProcessId();
+	HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+	if (snap == INVALID_HANDLE_VALUE)
+		return;
+	THREADENTRY32 te = { sizeof(te) };
+	for (BOOL ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te))
+	{
+		if (te.th32OwnerProcessID != pid || te.th32ThreadID == me)
+			continue;
+		HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID);
+		if (!h)
+			continue;
+		if (SuspendThread(h) != static_cast<DWORD>(-1))
+		{
+			CONTEXT ctx = {};
+			ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+			if (GetThreadContext(h, &ctx))
+			{
+				char w[48];
+				where(ctx.Rip, w, sizeof(w));
+				const bool inExe = ctx.Rip >= exeLo && ctx.Rip < exeHi;
+				const bool inTramp = ctx.Rip >= g_trampolineLo && ctx.Rip < g_trampolineHi;
+				if (inExe || inTramp)
+				{
+					char line[900];
+					int n = snprintf(line, sizeof(line), "[HangWatch]  tid %u rip=%s rax=%llX rcx=%llX rdx=%llX r8=%llX r9=%llX r10=%llX r11=%llX | stack:",
+						te.th32ThreadID, w, ctx.Rax, ctx.Rcx, ctx.Rdx, ctx.R8, ctx.R9, ctx.R10, ctx.R11);
+					int shown = 0;
+					for (int i = 0; i < 96 && shown < 12 && n < static_cast<int>(sizeof(line)) - 40; i++)
+					{
+						const uintptr_t addr = ctx.Rsp + i * 8;
+						uintptr_t v = 0;
+						if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(addr), &v, sizeof(v), nullptr))
+							break;
+						if ((v >= exeLo && v < exeHi) || (v >= g_trampolineLo && v < g_trampolineHi))
+						{
+							where(v, w, sizeof(w));
+							n += snprintf(line + n, sizeof(line) - n, " [%d]%s", i, w);
+							shown++;
+						}
+					}
+					LogF("%s", line);
+					// Inside the script expression evaluator (0x1403721c0..0x1403725c0): rsi = thread
+					// record, r12d = end PC of the expression. Dump PC/opcode and the bytecode around PC.
+					const uintptr_t rva = ctx.Rip - exeLo;
+					// (0x370c70..0x370f50 = command argument parser, record in rbx)
+					const uintptr_t recReg = (rva >= 0x3721c0 && rva < 0x3725c0) ? ctx.Rsi : ((rva >= 0x370c70 && rva < 0x370f50) ? ctx.Rbx : 0);
+					if (recReg > 0x10000)
+					{
+						const uintptr_t rec = recReg;
+						uint32_t pc = 0, op = 0, endpc = 0; uintptr_t scr = 0, code = 0;
+						ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(rec + 0x28), &pc, 4, nullptr);
+						ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(rec + 0x24), &op, 4, nullptr);
+						ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(rec + 0x14), &endpc, 4, nullptr);
+						ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(rec + 8), &scr, 8, nullptr);
+						if (scr) ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(scr + 0x118), &code, 8, nullptr);
+						char hex[200] = {}; int hn = 0;
+						if (code)
+						{
+							uint8_t b[32] = {};
+							const uintptr_t from = code + (pc > 16 ? pc - 16 : 0);
+							ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(from), b, sizeof(b), nullptr);
+							for (int i = 0; i < 32; i++) hn += snprintf(hex + hn, sizeof(hex) - hn, "%s%02X", (i == 16 ? " |" : (i ? " " : "")), b[i]);
+						}
+						LogF("[HangWatch]  evaluator: rec=%llX pc=%u exprEnd(r12d)=%u endPc=%u pendingOp=%d script=%llX code=%llX rbx=%llX rbp=%llX rdi=%llX bytes[pc-16..pc+16)= %s",
+							static_cast<unsigned long long>(rec), pc, static_cast<uint32_t>(ctx.R12), endpc, static_cast<int>(op),
+							static_cast<unsigned long long>(scr), static_cast<unsigned long long>(code), ctx.Rbx, ctx.Rbp, ctx.Rdi, hex);
+					}
+				}
+				else
+					LogF("[HangWatch]  tid %u rip=%s (outside the game code)", te.th32ThreadID, w);
+			}
+			ResumeThread(h);
+		}
+		CloseHandle(h);
+	}
+	CloseHandle(snap);
+
+	if (g_scriptOpRing && g_scriptOpHead)
+	{
+		const uint32_t head = *g_scriptOpHead;
+		const uint32_t n = head < 48 ? head : 48;
+		LogF("[HangWatch] last %u script commands (oldest first): op ch pc thr rec", n);
+		char line[1000]; int ln = 0; int inLine = 0;
+		uintptr_t lastRec = 0; uint32_t lastPc = 0;
+		for (uint32_t k = head - n; k < head; k++)
+		{
+			volatile uint8_t* e = g_scriptOpRing + (k & 0x1ff) * 24;
+			const uint32_t op = *reinterpret_cast<volatile uint32_t*>(e), ch = *reinterpret_cast<volatile uint32_t*>(e + 4);
+			const uint32_t pc = *reinterpret_cast<volatile uint32_t*>(e + 8), thr = *reinterpret_cast<volatile uint32_t*>(e + 12);
+			const uintptr_t rec = *reinterpret_cast<volatile uint32_t*>(e + 16) | (static_cast<uintptr_t>(*reinterpret_cast<volatile uint32_t*>(e + 20)) << 32);
+			ln += snprintf(line + ln, sizeof(line) - ln, " %X/%d/%u/%u/%llX", op, static_cast<int>(ch), pc, thr, static_cast<unsigned long long>(rec));
+			lastRec = rec; lastPc = pc;
+			if (++inLine == 8 || k + 1 == head) { LogF("[HangWatch]  %s", line); ln = 0; inLine = 0; }
+		}
+		if (lastRec > 0x10000)
+		{
+			uintptr_t scr = 0, code = 0;
+			ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(lastRec + 8), &scr, 8, nullptr);
+			if (scr) ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(scr + 0x118), &code, 8, nullptr);
+			if (code)
+			{
+				// dump the whole script (up to 64 KB, page by page) plus the script object header
+				// next to the log, for offline decoding: "<mod>_script_<n>.bin"
+				static int dumpNo = 0;
+				wchar_t path[MAX_PATH];
+				swprintf_s(path, L"%s_script_%d.bin", wcModulePath, dumpNo++);
+				HANDLE f = CreateFileW(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+				if (f != INVALID_HANDLE_VALUE)
+				{
+					uint8_t hdr[0x200] = {};
+					ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(scr), hdr, sizeof(hdr), nullptr);
+					DWORD wr = 0;
+					WriteFile(f, hdr, sizeof(hdr), &wr, nullptr);
+					uint8_t page[4096];
+					size_t total = 0;
+					for (int pg = 0; pg < 16; pg++)
+					{
+						SIZE_T got = 0;
+						if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(code + pg * 4096), page, sizeof(page), &got) || got == 0)
+							break;
+						WriteFile(f, page, static_cast<DWORD>(got), &wr, nullptr);
+						total += got;
+					}
+					CloseHandle(f);
+					LogF("[HangWatch]  script dumped: %ls (0x200-byte object header + %zu code bytes; code ptr %llX)", path, total, static_cast<unsigned long long>(code));
+				}
+				const uint32_t from = lastPc > 96 ? lastPc - 96 : 0;
+				for (int row = 0; row < 6; row++)
+				{
+					uint8_t b[64] = {};
+					ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(code + from + row * 64), b, sizeof(b), nullptr);
+					char hex[260]; int hn = 0;
+					for (int i = 0; i < 64; i++) hn += snprintf(hex + hn, sizeof(hex) - hn, "%s%02X", (i && i % 16 == 0) ? "  " : (i ? " " : ""), b[i]);
+					LogF("[HangWatch]  code+%u: %s", from + row * 64, hex);
+				}
+				LogF("[HangWatch]  (pc of the last command = %u; a command's PC is recorded after its 6-byte header)", lastPc);
+			}
+			// thread locals (store 2) and the owner actor's dwords at +0x90.. (what op 0x29F reads)
+			float loc[8] = {};
+			ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(lastRec + 0x5c), loc, sizeof(loc), nullptr);
+			float chf = static_cast<float>(static_cast<int>(*reinterpret_cast<volatile uint32_t*>(g_scriptOpRing + ((head - 1) & 0x1ff) * 24 + 4)));
+			LogF("[HangWatch]  thread locals: %g %g %g %g %g %g %g %g  channel=%g", loc[0], loc[1], loc[2], loc[3], loc[4], loc[5], loc[6], loc[7], chf);
+			const int ch = static_cast<int>(chf);
+			const uintptr_t tbl = *reinterpret_cast<volatile uintptr_t*>(g_gameBase + 0x667E20);
+			if (tbl && ch >= 0 && ch < 0x42)
+			{
+				uintptr_t actor = 0;
+				ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(tbl + 0x18 + ch * 8), &actor, 8, nullptr);
+				if (actor)
+				{
+					uint32_t d[40] = {};
+					ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(actor + 0x90), d, sizeof(d), nullptr);
+					char line[700]; int n = snprintf(line, sizeof(line), "[HangWatch]  actor ch%d=%llX dwords +0x90..+0x130:", ch, static_cast<unsigned long long>(actor));
+					for (int i = 0; i < 40; i++) n += snprintf(line + n, sizeof(line) - n, " %X", d[i]);
+					LogF("%s", line);
+				}
+			}
+		}
+	}
+	if (g_scriptOpRing2 && g_scriptOpHead2)
+	{
+		// dump the script object + bytecode of every distinct script seen in ring2 (max 8), by channel
+		{
+			uintptr_t seen[8] = {}; int nSeen = 0;
+			const uint32_t head = *g_scriptOpHead2;
+			const uint32_t n = head < 512 ? head : 512;
+			for (uint32_t k = head - n; k < head && nSeen < 8; k++)
+			{
+				volatile uint8_t* e = g_scriptOpRing2 + (k & 0x1ff) * 24;
+				const int ch = static_cast<int>(*reinterpret_cast<volatile uint32_t*>(e + 4));
+				const uintptr_t rec = *reinterpret_cast<volatile uint32_t*>(e + 16) | (static_cast<uintptr_t>(*reinterpret_cast<volatile uint32_t*>(e + 20)) << 32);
+				uintptr_t scr = 0, code = 0;
+				if (rec < 0x10000 || !ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(rec + 8), &scr, 8, nullptr) || !scr)
+					continue;
+				bool dup = false;
+				for (int i = 0; i < nSeen; i++) if (seen[i] == scr) dup = true;
+				if (dup) continue;
+				seen[nSeen++] = scr;
+				ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(scr + 0x118), &code, 8, nullptr);
+				if (!code) continue;
+				wchar_t path[MAX_PATH];
+				swprintf_s(path, L"%s_script_ch%d_%llX.bin", wcModulePath, ch, static_cast<unsigned long long>(scr & 0xFFFFFF));
+				HANDLE f = CreateFileW(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+				if (f == INVALID_HANDLE_VALUE) continue;
+				uint8_t hdr[0x200] = {};
+				ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(scr), hdr, sizeof(hdr), nullptr);
+				DWORD wr = 0;
+				WriteFile(f, hdr, sizeof(hdr), &wr, nullptr);
+				uint8_t page[4096]; size_t total = 0;
+				for (int pg = 0; pg < 16; pg++)
+				{
+					SIZE_T got = 0;
+					if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(code + pg * 4096), page, sizeof(page), &got) || got == 0)
+						break;
+					WriteFile(f, page, static_cast<DWORD>(got), &wr, nullptr);
+					total += got;
+				}
+				CloseHandle(f);
+				LogF("[HangWatch]  script of ch%d dumped: %ls (%zu code bytes)", ch, path, total);
+			}
+		}
+		const uint32_t head = *g_scriptOpHead2;
+		const uint32_t n = head < 64 ? head : 64;
+		LogF("[HangWatch] last %u DISTINCT-PC script commands (oldest first): op ch pc thr rec", n);
+		char line[1000]; int ln = 0; int inLine = 0;
+		for (uint32_t k = head - n; k < head; k++)
+		{
+			volatile uint8_t* e = g_scriptOpRing2 + (k & 0x1ff) * 24;
+			const uint32_t op = *reinterpret_cast<volatile uint32_t*>(e), ch = *reinterpret_cast<volatile uint32_t*>(e + 4);
+			const uint32_t pc = *reinterpret_cast<volatile uint32_t*>(e + 8), thr = *reinterpret_cast<volatile uint32_t*>(e + 12);
+			const uint32_t recLo = *reinterpret_cast<volatile uint32_t*>(e + 16);
+			ln += snprintf(line + ln, sizeof(line) - ln, " %X/%d/%u/%u/%X", op, static_cast<int>(ch), pc, thr, recLo);
+			if (++inLine == 8 || k + 1 == head) { LogF("[HangWatch]  %s", line); ln = 0; inLine = 0; }
+		}
+	}
+	LogF("[HangWatch] report done");
+}
+
+// Stall watcher: needs the rendered-frame counter (only available with the framerate patches).
+static void StartHangWatcher()
+{
+	if (!g_logEnabled || !g_gameBase)
+		return;
+	// F7 = report on demand (any framerate)
+	std::thread([] {
+		for (;;)
+		{
+			Sleep(100);
+			if ((GetAsyncKeyState(VK_F7) & 0x8000) == 0)
+				continue;
+			HangReport("F7 pressed");
+			Sleep(2000);
+		}
+	}).detach();
+	if (!g_scriptFrames)
+		return;
+	std::thread([] {
+		uint32_t last = *g_scriptFrames;
+		int still = 0;
+		bool reported = false;
+		for (;;)
+		{
+			Sleep(1000);
+			const uint32_t cur = *g_scriptFrames;
+			if (cur != last) { last = cur; still = 0; reported = false; continue; }
+			if (++still < 8 || reported)
+				continue;
+			reported = true;
+			char why[96];
+			snprintf(why, sizeof(why), "frame counter stuck at %u for %d s", cur, still);
+			HangReport(why);
+		}
+	}).detach();
+}
+
+// [Diagnostics] WatchActorVar = <channel>,<index>: when the actor of that channel exists, arm the
+// DR0 write watch on its script variable slot actor+0x90+index*4 (the slots read/written by script
+// commands 0x29F/0x29E) and log every change of the value with the rendered-frame counter. Used to
+// find who sets the variable the chapter-3 mission-2 script spin-waits on.
+static void StartActorVarWatcher()
+{
+	wchar_t spec[64] = {};
+	GetPrivateProfileStringW(L"Diagnostics", L"WatchActorVar", L"", spec, 64, wcModulePath);
+	int ch = -1, idx = -1;
+	if (swscanf_s(spec, L"%d,%d", &ch, &idx) != 2 || ch < 0 || ch >= 0x42 || idx < 0 || idx > 15 || !g_gameBase)
+		return;
+	LogF("[ActorVar] watching channel %d var %d", ch, idx);
+	std::thread([ch, idx] {
+		uintptr_t armedActor = 0;
+		uint32_t lastVal = 0xFFFFFFFF;
+		for (;;)
+		{
+			Sleep(50);
+			const uintptr_t tbl = *reinterpret_cast<volatile uintptr_t*>(g_gameBase + 0x667E20);
+			if (!tbl) continue;
+			uintptr_t actor = 0;
+			if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(tbl + 0x18 + ch * 8), &actor, 8, nullptr) || !actor)
+				continue;
+			const uintptr_t cell = actor + 0x90 + idx * 4;
+			uint32_t v = 0;
+			if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(cell), &v, 4, nullptr))
+				continue;
+			if (actor != armedActor)
+			{
+				armedActor = actor;
+				lastVal = v;
+				LogF("[ActorVar] ch%d actor=%llX var%d=%X (%g) at frame %u - arming write watch", ch, static_cast<unsigned long long>(actor), idx, v, *reinterpret_cast<float*>(&v), g_scriptFrames ? *g_scriptFrames : 0u);
+				ArmHwWatch(cell);
+			}
+			else if (v != lastVal)
+			{
+				LogF("[ActorVar] ch%d var%d changed %X -> %X (%g) at frame %u", ch, idx, lastVal, v, *reinterpret_cast<float*>(&v), g_scriptFrames ? *g_scriptFrames : 0u);
+				lastVal = v;
 			}
 		}
 	}).detach();
@@ -2419,14 +2751,14 @@ static void StartStatsWatcher()
 			}
 			if (g_scriptStats)
 			{
-				static uint32_t lastS[8] = {};
-				uint32_t curS[8];
-				for (int i = 0; i < 8; i++)
+				static uint32_t lastS[12] = {};
+				uint32_t curS[12];
+				for (int i = 0; i < 12; i++)
 					curS[i] = *(volatile uint32_t*)&g_scriptStats[i];
 				if (memcmp(curS, lastS, sizeof(curS)) != 0)
 				{
-					LogF("[ScriptVars +%llus] ++store0=%u/%u ++store1=%u/%u ++store2=%u/%u --store2=%u/%u (done/skipped as 30Hz duplicates)",
-						(GetTickCount64() - start) / 1000ULL, curS[0], curS[1], curS[2], curS[3], curS[4], curS[5], curS[6], curS[7]);
+					LogF("[ScriptVars +%llus] ++store0=%u/%u ++store1=%u/%u ++store2=%u/%u --store0/1=%u/%u --store2=%u/%u (done/skipped as 30Hz duplicates)",
+						(GetTickCount64() - start) / 1000ULL, curS[0], curS[1], curS[2], curS[3], curS[4], curS[5], curS[8], curS[9], curS[6], curS[7]);
 					memcpy(lastS, curS, sizeof(curS));
 				}
 			}
@@ -2657,6 +2989,8 @@ void OnInitializeHook()
 		ks_open_fnc(KS_ARCH_X86, KS_MODE_64, &ks);
 
 		trampoline = Trampoline::MakeTrampoline(GetModuleHandle(nullptr));
+		g_trampolineLo = reinterpret_cast<uintptr_t>(trampoline->RawSpace(0));
+		g_trampolineHi = g_trampolineLo + 0x100000;
 		uintptr_t baseaddress = reinterpret_cast<uintptr_t>(GetModuleHandle(nullptr));
 
 		floatpointers = reinterpret_cast<float*>(trampoline->RawSpace(ALLOCATED_FLOATS * sizeof(float)));
@@ -4239,6 +4573,7 @@ void OnInitializeHook()
 			//[fork] frame counters for the script-variable dedup below: [0] rendered frames, [4] 30Hz frames, [8] list slot cursor
 			auto scriptFrames = reinterpret_cast<uint32_t*>(trampoline->RawSpace(4 * sizeof(uint32_t)));
 			memset(scriptFrames, 0, 4 * sizeof(uint32_t));
+			g_scriptFrames = scriptFrames;
 			pointers[5] = reinterpret_cast<uintptr_t>(&scriptFrames[0]);
 			pointers[6] = reinterpret_cast<uintptr_t>(&scriptFrames[1]);
 			ParametricASMJump("movss xmm2, dword ptr [rip + ?0]; addss xmm2, %0; comiss xmm2, %1; mov byte ptr [rip + ?1], 0; jb A; subss xmm2, %1; mov byte ptr [rip + ?1], 1; inc dword ptr [rip + ?6]; lea rax, [rip + ?4]; xor rbx, rbx; C: mov qword ptr [rax + rbx * 8], 0; inc rbx; cmp bl, $1; jl C; neg byte ptr [rip + ?2]; js A; lea rax, [rip + ?3]; xor rbx, rbx; B: mov qword ptr [rax + rbx * 8], 0; inc rbx; cmp bl, $0; jl B; A: movss dword ptr [rip + ?0], xmm2; inc dword ptr [rip + ?5]; mov rbx, qword ptr [rsp + 0x40]", match, 0x7, 0xC);
@@ -4272,7 +4607,15 @@ void OnInitializeHook()
 
 			if (!disableCounterDedup)
 			{
+			auto scriptStats = reinterpret_cast<uint32_t*>(trampoline->RawSpace(12 * sizeof(uint32_t)));
+			memset(scriptStats, 0, 12 * sizeof(uint32_t));
+			g_scriptStats = scriptStats;
+			if (!scriptVarDedupAll)
+			{
 			//Gameplay fixes #1 (i.e guards falling into the ground below when dropping from the ship at the beginning of the game)[ref:0x0013D75C, different approach used]
+			//[fork] UPSTREAM LOGIC, kept only for ScriptVarDedupAll=0. Known to hang the game: see the
+			//frame-aware replacement below. Scratch registers changed to volatile ones (upstream used
+			//r13/r15, which the calling expression evaluator keeps live).
 			match = FindOne("8B 43 08 F3 0F 10 04 88 F3 0F 58 05 3C DE 20 00");
 			constants[0] = floatcountersptrs_count;
 			constants[1] = baseaddress + 0x574CA0; //Whenever it's supposed to be a proper frame counter instead of a random increase, this value is @rsp + 0x60
@@ -4281,24 +4624,23 @@ void OnInitializeHook()
 			pointers[2] = reinterpret_cast<uintptr_t>(&stats[2]);
 			param_floats[0] = 1.0f;
 			param_floats[1] = 10.0f;
-			auto scriptStats = reinterpret_cast<uint32_t*>(trampoline->RawSpace(8 * sizeof(uint32_t)));
-			memset(scriptStats, 0, 8 * sizeof(uint32_t));
-			g_scriptStats = scriptStats;
 			pointers[3] = reinterpret_cast<uintptr_t>(&scriptStats[0]);
 			pointers[4] = reinterpret_cast<uintptr_t>(&scriptStats[1]);
-			// [fork] same logic as upstream, but the scratch registers are the volatile r8/r9/r11: the
-			// original used r13/r15, which the caller (expression evaluator 0x1403721c0) keeps its thread
-			// index / flag in across this call, so a "++" inside a longer expression corrupted them.
-			ParametricASMJump("mov r9, $1; cmp qword ptr [rsp + 0x60], r9; je F; movss xmm1, dword ptr [rsp + 0x10]; comiss xmm1, %1; jae E; comiss xmm1, %0; jb E; F: lea r8, [rax + rcx * 4]; lea r9, [rip + ?0]; xor r11, r11; A: cmp qword ptr [r9 + r11 * 8], r8; je H; inc r11; cmp r11b, $0; jl A; addss xmm0, %0; inc dword ptr [rip + ?3]; xor r11, r11; B: cmp r11b, $0; jge G; cmp qword ptr [r9 + r11 * 8], 0; jne C; mov qword ptr [r9 + r11 * 8], r8; cmp dword ptr [rip + ?1], r11d; jge D; mov dword ptr [rip + ?1], r11d; jmp D; C: inc r11; jmp B; G: inc dword ptr [rip + ?2]; jmp D; H: inc dword ptr [rip + ?4]; jmp D; E: addss xmm0, %0; inc dword ptr [rip + ?3]; D: nop", match, 0x8, 0x10);
+			ParametricASMJump("mov r10, $1; cmp qword ptr [rsp + 0x60], r10; je F; movss xmm1, dword ptr [rsp + 0x10]; comiss xmm1, %1; jae E; comiss xmm1, %0; jb E; F: lea r8, [rax + rcx * 4]; lea r10, [rip + ?0]; xor r11, r11; A: cmp qword ptr [r10 + r11 * 8], r8; je H; inc r11; cmp r11b, $0; jl A; addss xmm0, %0; inc dword ptr [rip + ?3]; xor r11, r11; B: cmp r11b, $0; jge G; cmp qword ptr [r10 + r11 * 8], 0; jne C; mov qword ptr [r10 + r11 * 8], r8; cmp dword ptr [rip + ?1], r11d; jge D; mov dword ptr [rip + ?1], r11d; jmp D; C: inc r11; jmp B; G: inc dword ptr [rip + ?2]; jmp D; H: inc dword ptr [rip + ?4]; jmp D; E: addss xmm0, %0; inc dword ptr [rip + ?3]; D: nop", match, 0x8, 0x10);
 
 			//Unknown (likely Gameplay fixes #2 due to proximity) [ref: 0x0013D86C]
+			//[fork] UPSTREAM LOGIC (register-fixed), ScriptVarDedupAll=0 only. This one HANGS chapter 3
+			//mission 2 at any FpsCap above 30: the actor script runs "i = 7; while (var[i] unset) i--;"
+			//inside one tick, the second "i--" on the same address is dropped as a duplicate, i never
+			//moves and the loop spins forever.
 			match = FindOne("00 00 00 F3 0F 10 04 88 F3 0F 5C 05 78 DD 20 00");
 			constants[0] = floatcountersptrs_count;
 			pointers[0] = reinterpret_cast<uintptr_t>(floatcountersptrs);
 			pointers[1] = reinterpret_cast<uintptr_t>(&stats[6]);
 			pointers[2] = reinterpret_cast<uintptr_t>(&stats[3]);
 			param_floats[0] = 1.0f;
-			ParametricASMJump("lea rbx, [rax + rcx * 4]; lea r13, [rip + ?0]; xor r15, r15; A: cmp qword ptr [r13 + r15 * 8], rbx; je D; inc r15; cmp r15b, $0; jl A; subss xmm0, %0; xor r15, r15; B: cmp r15b, $0; jge G; cmp qword ptr [r13 + r15 * 8], 0; jne C; mov qword ptr [r13 + r15 * 8], rbx; cmp dword ptr [rip + ?1], r15d; jge D; mov dword ptr [rip + ?1], r15d; jmp D; C: inc r15; jmp B; G: inc dword ptr [rip + ?2]; D: nop", match, 0x8, 0x10);
+			ParametricASMJump("lea r8, [rax + rcx * 4]; lea r10, [rip + ?0]; xor r11, r11; A: cmp qword ptr [r10 + r11 * 8], r8; je D; inc r11; cmp r11b, $0; jl A; subss xmm0, %0; xor r11, r11; B: cmp r11b, $0; jge G; cmp qword ptr [r10 + r11 * 8], 0; jne C; mov qword ptr [r10 + r11 * 8], r8; cmp dword ptr [rip + ?1], r11d; jge D; mov dword ptr [rip + ?1], r11d; jmp D; C: inc r11; jmp B; G: inc dword ptr [rip + ?2]; D: nop", match, 0x8, 0x10);
+			}
 
 			//Various timings, used mainly in cutscenes but not exclusively [ref: 0x00127D90]
 			match = FindOne("2F C8 76 04 C6 41 2C 01 F3 0F 5C 0D 93 34 22 00");
@@ -4366,18 +4708,28 @@ void OnInitializeHook()
 			match = FindOne("48 8B 83 80 00 00 00 F3 0F 10 04 88 F3 0F 58 05 ? ? ? ? F3 0F 11 04 88");
 			pointers[2] = reinterpret_cast<uintptr_t>(&scriptStats[2]);
 			pointers[3] = reinterpret_cast<uintptr_t>(&scriptStats[3]);
-			ParametricASMJump("lea r8, [rax + rcx * 4]; lea r9, [rip + ?0]; lea rdx, [rip + ?1]; mov r11d, dword ptr [rdx]; xor r10, r10; A: cmp qword ptr [r9 + r10], r8; je F; add r10, 16; cmp r10, $0; jl A; mov r10d, dword ptr [rdx + 8]; inc dword ptr [rdx + 8]; and r10d, 31; shl r10, 4; mov qword ptr [r9 + r10], r8; mov dword ptr [r9 + r10 + 8], r11d; mov r8d, dword ptr [rdx + 4]; mov dword ptr [r9 + r10 + 12], r8d; jmp E; F: cmp dword ptr [r9 + r10 + 8], r11d; je E; mov r8d, dword ptr [rdx + 4]; cmp dword ptr [r9 + r10 + 12], r8d; jne N; mov dword ptr [r9 + r10 + 8], r11d; inc dword ptr [rip + ?3]; jmp D; N: mov dword ptr [r9 + r10 + 8], r11d; mov dword ptr [r9 + r10 + 12], r8d; E: addss xmm0, %0; inc dword ptr [rip + ?2]; D: nop", match, 0xC, 0x14);
+			ParametricASMJump("push r9; lea r8, [rax + rcx * 4]; lea r9, [rip + ?0]; lea rdx, [rip + ?1]; mov r11d, dword ptr [rdx]; xor r10, r10; A: cmp qword ptr [r9 + r10], r8; je F; add r10, 16; cmp r10, $0; jl A; mov r10d, dword ptr [rdx + 8]; inc dword ptr [rdx + 8]; and r10d, 31; shl r10, 4; mov qword ptr [r9 + r10], r8; mov dword ptr [r9 + r10 + 8], r11d; mov r8d, dword ptr [rdx + 4]; mov dword ptr [r9 + r10 + 12], r8d; jmp E; F: cmp dword ptr [r9 + r10 + 8], r11d; je E; mov r8d, dword ptr [rdx + 4]; cmp dword ptr [r9 + r10 + 12], r8d; jne N; mov dword ptr [r9 + r10 + 8], r11d; inc dword ptr [rip + ?3]; jmp D; N: mov dword ptr [r9 + r10 + 8], r11d; mov dword ptr [r9 + r10 + 12], r8d; E: addss xmm0, %0; inc dword ptr [rip + ?2]; D: pop r9", match, 0xC, 0x14);
 			// store 2: movss xmm0,[rbx+rcx*4+0x5c]; addss xmm0,1.0; movss [rbx+rcx*4+0x5c],xmm0
 			match = FindOne("F3 0F 10 44 8B 5C F3 0F 58 05 ? ? ? ? F3 0F 11 44 8B 5C");
 			pointers[2] = reinterpret_cast<uintptr_t>(&scriptStats[4]);
 			pointers[3] = reinterpret_cast<uintptr_t>(&scriptStats[5]);
-			ParametricASMJump("lea r8, [rbx + rcx * 4 + 0x5c]; lea r9, [rip + ?0]; lea rdx, [rip + ?1]; mov r11d, dword ptr [rdx]; xor r10, r10; A: cmp qword ptr [r9 + r10], r8; je F; add r10, 16; cmp r10, $0; jl A; mov r10d, dword ptr [rdx + 8]; inc dword ptr [rdx + 8]; and r10d, 31; shl r10, 4; mov qword ptr [r9 + r10], r8; mov dword ptr [r9 + r10 + 8], r11d; mov r8d, dword ptr [rdx + 4]; mov dword ptr [r9 + r10 + 12], r8d; jmp E; F: cmp dword ptr [r9 + r10 + 8], r11d; je E; mov r8d, dword ptr [rdx + 4]; cmp dword ptr [r9 + r10 + 12], r8d; jne N; mov dword ptr [r9 + r10 + 8], r11d; inc dword ptr [rip + ?3]; jmp D; N: mov dword ptr [r9 + r10 + 8], r11d; mov dword ptr [r9 + r10 + 12], r8d; E: addss xmm0, %0; inc dword ptr [rip + ?2]; D: nop", match, 0x6, 0xE);
+			ParametricASMJump("push r9; lea r8, [rbx + rcx * 4 + 0x5c]; lea r9, [rip + ?0]; lea rdx, [rip + ?1]; mov r11d, dword ptr [rdx]; xor r10, r10; A: cmp qword ptr [r9 + r10], r8; je F; add r10, 16; cmp r10, $0; jl A; mov r10d, dword ptr [rdx + 8]; inc dword ptr [rdx + 8]; and r10d, 31; shl r10, 4; mov qword ptr [r9 + r10], r8; mov dword ptr [r9 + r10 + 8], r11d; mov r8d, dword ptr [rdx + 4]; mov dword ptr [r9 + r10 + 12], r8d; jmp E; F: cmp dword ptr [r9 + r10 + 8], r11d; je E; mov r8d, dword ptr [rdx + 4]; cmp dword ptr [r9 + r10 + 12], r8d; jne N; mov dword ptr [r9 + r10 + 8], r11d; inc dword ptr [rip + ?3]; jmp D; N: mov dword ptr [r9 + r10 + 8], r11d; mov dword ptr [r9 + r10 + 12], r8d; E: addss xmm0, %0; inc dword ptr [rip + ?2]; D: pop r9", match, 0x6, 0xE);
 			// store 2 "--": movss xmm1,[rbx+rcx*4+0x5c]; subss xmm1,1.0; movss [rbx+rcx*4+0x5c],xmm1
 			match = FindOne("F3 0F 10 4C 8B 5C F3 0F 5C 0D ? ? ? ? F3 0F 11 4C 8B 5C");
 			pointers[2] = reinterpret_cast<uintptr_t>(&scriptStats[6]);
 			pointers[3] = reinterpret_cast<uintptr_t>(&scriptStats[7]);
-			ParametricASMJump("lea r8, [rbx + rcx * 4 + 0x5c]; lea r9, [rip + ?0]; lea rdx, [rip + ?1]; mov r11d, dword ptr [rdx]; xor r10, r10; A: cmp qword ptr [r9 + r10], r8; je F; add r10, 16; cmp r10, $0; jl A; mov r10d, dword ptr [rdx + 8]; inc dword ptr [rdx + 8]; and r10d, 31; shl r10, 4; mov qword ptr [r9 + r10], r8; mov dword ptr [r9 + r10 + 8], r11d; mov r8d, dword ptr [rdx + 4]; mov dword ptr [r9 + r10 + 12], r8d; jmp E; F: cmp dword ptr [r9 + r10 + 8], r11d; je E; mov r8d, dword ptr [rdx + 4]; cmp dword ptr [r9 + r10 + 12], r8d; jne N; mov dword ptr [r9 + r10 + 8], r11d; inc dword ptr [rip + ?3]; jmp D; N: mov dword ptr [r9 + r10 + 8], r11d; mov dword ptr [r9 + r10 + 12], r8d; E: subss xmm1, %0; inc dword ptr [rip + ?2]; D: nop", match, 0x6, 0xE);
-			LogF("[Movement] ScriptVarDedupAll on: script ++/-- on variable stores 1/2 advance once per 30Hz frame (in-tick loops allowed)");
+			ParametricASMJump("push r9; lea r8, [rbx + rcx * 4 + 0x5c]; lea r9, [rip + ?0]; lea rdx, [rip + ?1]; mov r11d, dword ptr [rdx]; xor r10, r10; A: cmp qword ptr [r9 + r10], r8; je F; add r10, 16; cmp r10, $0; jl A; mov r10d, dword ptr [rdx + 8]; inc dword ptr [rdx + 8]; and r10d, 31; shl r10, 4; mov qword ptr [r9 + r10], r8; mov dword ptr [r9 + r10 + 8], r11d; mov r8d, dword ptr [rdx + 4]; mov dword ptr [r9 + r10 + 12], r8d; jmp E; F: cmp dword ptr [r9 + r10 + 8], r11d; je E; mov r8d, dword ptr [rdx + 4]; cmp dword ptr [r9 + r10 + 12], r8d; jne N; mov dword ptr [r9 + r10 + 8], r11d; inc dword ptr [rip + ?3]; jmp D; N: mov dword ptr [r9 + r10 + 8], r11d; mov dword ptr [r9 + r10 + 12], r8d; E: subss xmm1, %0; inc dword ptr [rip + ?2]; D: pop r9", match, 0x6, 0xE);
+			// store 0 "++" (replaces upstream "Gameplay fixes #1"): mov rax,[rbx+8]; movss xmm0,[rax+rcx*4]; addss; movss
+			match = FindOne("8B 43 08 F3 0F 10 04 88 F3 0F 58 05 ? ? ? ? F3 0F 11 04 88");
+			pointers[2] = reinterpret_cast<uintptr_t>(&scriptStats[0]);
+			pointers[3] = reinterpret_cast<uintptr_t>(&scriptStats[1]);
+			ParametricASMJump("push r9; lea r8, [rax + rcx * 4]; lea r9, [rip + ?0]; lea rdx, [rip + ?1]; mov r11d, dword ptr [rdx]; xor r10, r10; A: cmp qword ptr [r9 + r10], r8; je F; add r10, 16; cmp r10, $0; jl A; mov r10d, dword ptr [rdx + 8]; inc dword ptr [rdx + 8]; and r10d, 31; shl r10, 4; mov qword ptr [r9 + r10], r8; mov dword ptr [r9 + r10 + 8], r11d; mov r8d, dword ptr [rdx + 4]; mov dword ptr [r9 + r10 + 12], r8d; jmp E; F: cmp dword ptr [r9 + r10 + 8], r11d; je E; mov r8d, dword ptr [rdx + 4]; cmp dword ptr [r9 + r10 + 12], r8d; jne N; mov dword ptr [r9 + r10 + 8], r11d; inc dword ptr [rip + ?3]; jmp D; N: mov dword ptr [r9 + r10 + 8], r11d; mov dword ptr [r9 + r10 + 12], r8d; E: addss xmm0, %0; inc dword ptr [rip + ?2]; D: pop r9", match, 0x8, 0x10);
+			// store 0/1 "--" (replaces upstream "Gameplay fixes #2"): shared tail movss xmm0,[rax+rcx*4]; subss; movss
+			match = FindOne("00 00 00 F3 0F 10 04 88 F3 0F 5C 05 ? ? ? ? F3 0F 11 04 88");
+			pointers[2] = reinterpret_cast<uintptr_t>(&scriptStats[8]);
+			pointers[3] = reinterpret_cast<uintptr_t>(&scriptStats[9]);
+			ParametricASMJump("push r9; lea r8, [rax + rcx * 4]; lea r9, [rip + ?0]; lea rdx, [rip + ?1]; mov r11d, dword ptr [rdx]; xor r10, r10; A: cmp qword ptr [r9 + r10], r8; je F; add r10, 16; cmp r10, $0; jl A; mov r10d, dword ptr [rdx + 8]; inc dword ptr [rdx + 8]; and r10d, 31; shl r10, 4; mov qword ptr [r9 + r10], r8; mov dword ptr [r9 + r10 + 8], r11d; mov r8d, dword ptr [rdx + 4]; mov dword ptr [r9 + r10 + 12], r8d; jmp E; F: cmp dword ptr [r9 + r10 + 8], r11d; je E; mov r8d, dword ptr [rdx + 4]; cmp dword ptr [r9 + r10 + 12], r8d; jne N; mov dword ptr [r9 + r10 + 8], r11d; inc dword ptr [rip + ?3]; jmp D; N: mov dword ptr [r9 + r10 + 8], r11d; mov dword ptr [r9 + r10 + 12], r8d; E: subss xmm0, %0; inc dword ptr [rip + ?2]; D: pop r9", match, 0x8, 0x10);
+			LogF("[Movement] ScriptVarDedupAll on: script ++/-- on all variable stores advance once per 30Hz frame, repeats within one rendered frame allowed (upstream store-0 patches replaced)");
 			}
 
 			//[fork, EXPERIMENTAL, default off] Tick the global and field script VMs (0x14037f2a0,
@@ -4390,7 +4742,15 @@ void OnInitializeHook()
 			match = FindOne("40 56 57 41 56 48 83 EC 20 45 33 F6 48 8B F9 41 8B F6 44 39 31");
 			pointers[0] = reinterpret_cast<uintptr_t>(propagatecounters);
 			ParametricASMJump("cmp byte ptr [rip + ?0], 1; je A; ret; A: push rsi; push rdi; push r14; sub rsp, 0x20", match, 0, 0x9);
-			LogF("[Movement] ScriptTick30Hz on (EXPERIMENTAL): global/field script VMs tick once per 30Hz frame");
+			//Per-actor script threads: the two per-frame call sites of the thread runner 0x140371630
+			//(actor update 0x1401b5f22 and 0x1401bb4b9). The thread-start call at 0x14037f6cf and the
+			//nested-call site inside the evaluator are left alone (they must run immediately).
+			constants[0] = baseaddress + 0x371630;
+			match = FindOne("C9 74 0A 41 B0 01 33 D2 E8 ? ? ? ? 40 32 F6");
+			ParametricASMJump("cmp byte ptr [rip + ?0], 1; jne A; mov r8b, 1; xor edx, edx; mov rax, $0; call rax; A: nop", match, 0x3, 0xD);
+			match = FindOne("C4 28 C3 41 B0 01 33 D2 E8 ? ? ? ? B0 01");
+			ParametricASMJump("cmp byte ptr [rip + ?0], 1; jne A; mov r8b, 1; xor edx, edx; mov rax, $0; call rax; A: nop", match, 0x3, 0xD);
+			LogF("[Movement] ScriptTick30Hz on (EXPERIMENTAL): global/field script VMs and per-actor script threads tick once per 30Hz frame");
 			}
 			}
 
@@ -4646,7 +5006,56 @@ void OnInitializeHook()
 		if (g_skipIntroVideos)
 			g_introBase = baseaddress;
 		g_gameBase = baseaddress;
+		// [TraceScriptOps] (default 1 while the chapter-3 hang is being chased): record every script
+		// command parsed by 0x140370c70 into a ring; HangWatch prints the last 48 at a stall. Same hook
+		// site as TraceWatchdog's script-op hook, so it is skipped when TraceWatchdog is on.
+		if (GetPrivateProfileIntW(L"Diagnostics", L"TraceScriptOps", 1, wcModulePath) != 0 &&
+			GetPrivateProfileIntW(L"Diagnostics", L"TraceWatchdog", 0, wcModulePath) == 0)
+		{
+			auto ring = trampoline->RawSpace(512 * 24);
+			auto head = reinterpret_cast<uint32_t*>(trampoline->RawSpace(sizeof(uint32_t)));
+			memset(ring, 0, 512 * 24);
+			*head = 0;
+			g_scriptOpRing = reinterpret_cast<volatile uint8_t*>(ring);
+			g_scriptOpHead = head;
+			auto ring2 = trampoline->RawSpace(512 * 24);
+			auto head2 = reinterpret_cast<uint32_t*>(trampoline->RawSpace(sizeof(uint32_t)));
+			memset(ring2, 0, 512 * 24);
+			*head2 = 0;
+			g_scriptOpRing2 = reinterpret_cast<volatile uint8_t*>(ring2);
+			g_scriptOpHead2 = head2;
+			pointers[0] = reinterpret_cast<uintptr_t>(ring);
+			pointers[1] = reinterpret_cast<uintptr_t>(head);
+			pointers[2] = reinterpret_cast<uintptr_t>(ring2);
+			pointers[3] = reinterpret_cast<uintptr_t>(head2);
+			auto match = FindOne("F3 0F 11 43 34 0F B7 47 02 A8 03 74 0E");
+			ParametricASMJump(
+				"push rax; push r10; push r11; pushfq; "
+				"mov r10d, dword ptr [rip + ?1]; inc dword ptr [rip + ?1]; and r10d, 0x1ff; imul r10d, r10d, 24; "
+				"lea r11, [rip + ?0]; add r11, r10; "
+				"mov eax, dword ptr [rbx + 0x24]; mov dword ptr [r11], eax; "
+				"cvttss2si eax, xmm0; mov dword ptr [r11 + 4], eax; "
+				"mov eax, dword ptr [rbx + 0x28]; mov dword ptr [r11 + 8], eax; "
+				"mov eax, dword ptr [rsp + 0x128]; mov dword ptr [r11 + 12], eax; "
+				"mov dword ptr [r11 + 16], ebx; mov rax, rbx; shr rax, 32; mov dword ptr [r11 + 20], eax; "
+				// ring2: skip when PC equals the PC of one of the last 4 ring2 entries
+				"mov eax, dword ptr [rbx + 0x28]; lea r11, [rip + ?2]; "
+				"mov r10d, dword ptr [rip + ?3]; dec r10d; and r10d, 0x1ff; imul r10d, r10d, 24; cmp dword ptr [r11 + r10 + 8], eax; je Y; "
+				"mov r10d, dword ptr [rip + ?3]; sub r10d, 2; and r10d, 0x1ff; imul r10d, r10d, 24; cmp dword ptr [r11 + r10 + 8], eax; je Y; "
+				"mov r10d, dword ptr [rip + ?3]; sub r10d, 3; and r10d, 0x1ff; imul r10d, r10d, 24; cmp dword ptr [r11 + r10 + 8], eax; je Y; "
+				"mov r10d, dword ptr [rip + ?3]; sub r10d, 4; and r10d, 0x1ff; imul r10d, r10d, 24; cmp dword ptr [r11 + r10 + 8], eax; jne W; Y: jmp Z; W: "
+				"mov r10d, dword ptr [rip + ?3]; inc dword ptr [rip + ?3]; and r10d, 0x1ff; imul r10d, r10d, 24; add r11, r10; "
+				"mov dword ptr [r11 + 8], eax; mov eax, dword ptr [rbx + 0x24]; mov dword ptr [r11], eax; "
+				"cvttss2si eax, xmm0; mov dword ptr [r11 + 4], eax; "
+				"mov eax, dword ptr [rsp + 0x128]; mov dword ptr [r11 + 12], eax; mov dword ptr [r11 + 16], ebx; mov rax, rbx; shr rax, 32; mov dword ptr [r11 + 20], eax; "
+				"Z: popfq; pop r11; pop r10; pop rax; "
+				"movss dword ptr [rbx + 0x34], xmm0; movzx eax, word ptr [rdi + 2]", match, 0, 0x9);
+			LogF("[TraceScriptOps] ring armed (last 512 script commands, dumped by HangWatch)");
+		}
 		StartStatsWatcher();
+		StartActorVarWatcher();
+		if (GetPrivateProfileIntW(L"Diagnostics", L"HangWatch", 1, wcModulePath) != 0)
+			StartHangWatcher();
 		StartSoundTraceWatcher();
 		StartMovieTraceWatcher();
 		StartIntroSkipWatcher();

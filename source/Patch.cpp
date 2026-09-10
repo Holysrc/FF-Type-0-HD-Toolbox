@@ -5006,10 +5006,10 @@ void OnInitializeHook()
 		if (g_skipIntroVideos)
 			g_introBase = baseaddress;
 		g_gameBase = baseaddress;
-		// [TraceScriptOps] (default 1 while the chapter-3 hang is being chased): record every script
+		// [TraceScriptOps] (default 0): record every script
 		// command parsed by 0x140370c70 into a ring; HangWatch prints the last 48 at a stall. Same hook
 		// site as TraceWatchdog's script-op hook, so it is skipped when TraceWatchdog is on.
-		if (GetPrivateProfileIntW(L"Diagnostics", L"TraceScriptOps", 1, wcModulePath) != 0 &&
+		if (GetPrivateProfileIntW(L"Diagnostics", L"TraceScriptOps", 0, wcModulePath) != 0 &&
 			GetPrivateProfileIntW(L"Diagnostics", L"TraceWatchdog", 0, wcModulePath) == 0)
 		{
 			auto ring = trampoline->RawSpace(512 * 24);

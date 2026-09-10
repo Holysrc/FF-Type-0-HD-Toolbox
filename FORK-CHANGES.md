@@ -121,3 +121,11 @@ FF Type-0 HD Toolbox — вырос из форка мода Banz99. Всё из
 All original work by [Banz99](https://github.com/Banz99) and the upstream contributors
 (CookiePLMonster, LunaMoo, Keystone Engine, Ultimate ASI Loader). The toolbox adds
 the changes described above on top of that foundation.
+
+## High-framerate script fixes and a freeze report
+
+The original mod's frame-counter patches could freeze the game above 30 fps when a script counts
+inside a single tick (chapter 3, mission 2 froze at the start). The toolbox uses a frame-aware rule
+instead, so script counters keep their 30 fps pace without ever getting stuck. If the game still
+freezes somewhere, wait 15 seconds before closing it: the mod writes a report of where it got stuck
+into `FFT0HD Unlocker.log` for the bug report.

@@ -355,7 +355,7 @@ leader's channel across in-field switches (traced: the controlled actor moved on
 | 0.5.1 | `TurnPhaseFullRate` | Commander Schmitz stair entrance: servo at full rate |
 | 0.5.2 | `AiEventKeepFix`, `EnemyTurnFullRate` | General Qator Bashtar freeze |
 | 0.5.3 | `AnalogGlobalsFix`, controlled-character lookup, `DashAtCap`, `AiCountdownFix` | analog movement after character switches, dash speed, enemy decision pacing |
-| next | `ScriptVarDedupAll` (default 1), `ScriptTick30Hz` (default 0) | script `++/--` on all variable stores at 30 Hz; upstream r13/r15 clobber fixed; VM tick gate experiment |
+| 0.5.5 | `ScriptVarDedupAll` (default 1), `ScriptTick30Hz` (default 0), `[OverrideRes] AllowUnsupportedRes` | frame-aware script `++/--` dedup on all stores (chapter 3 mission 2 hang); resolution fallback; HangWatch/TraceScriptOps diagnostics |
 | 0.5.4 | `[Camera] LockFollowPercent`, `LockDeadZoneDegrees`; `[Movement] StickSaturationPercent` | lock-on camera soft follow + dead zone; diagonal stick saturation; tuner window regrouped, tooltips fixed |
 | — | `AnimLastFrameFix` (default 0) | superseded; its asm form is rejected at runtime |
 | — | `BossFixPace/Nav/Turn/Profile`, `ProfileVelocityFix`, `BossVerticalFix` (default 0) | dead or superseded experiments |

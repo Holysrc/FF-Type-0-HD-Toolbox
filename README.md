@@ -1,10 +1,16 @@
 <p align="center"><img src="docs/banner.png" width="560" alt="FF Type-0 HD Toolbox"></p>
 
-# FF Type-0 HD Toolbox
+# FF Type-0 HD Toolbox — a Final Fantasy Type-0 HD PC mod
 
-Quality-of-life toolbox for Final Fantasy Type-0 HD on PC: custom resolution and framerate,
-FOV control, full intro skip, a modern tunable camera, analog movement speed and
-high-framerate timing fixes. One .asi plugin, no game files touched.
+**FF Type-0 HD Toolbox** is a mod for **Final Fantasy Type-0 HD** on PC (Steam) that unlocks
+**60 / 90 / 120 fps**, **custom and ultrawide resolutions** and **field of view**, skips the whole
+intro, replaces the stiff camera with a modern tunable one, adds analog movement speed and fixes
+the bosses, scripts and timers that break at high framerates. One `.asi` plugin, no game files
+touched, Steam updates never break it.
+
+**Download:** [latest release](https://github.com/Holysrc/FF-Type-0-HD-Toolbox/releases/latest)
+· [Nexus Mods page](https://www.nexusmods.com/finalfantasytype0hd/mods/4) ·
+[what the toolbox adds](FORK-CHANGES.md)
 
 > **Built on the work of [Banz99](https://github.com/Banz99/Final-Fantasy-Type-0-Hd-Unlocker).**
 > This project began as a fork of his FFT0HD Unlocker, which did the hard reverse-engineering
@@ -13,7 +19,7 @@ high-framerate timing fixes. One .asi plugin, no game files touched.
 > (intro skip, modern camera, analog movement, timing fixes, crash protection).
 > Everything below is the original README.
 
-## Camera tuning window
+## Camera tuning window (in-game settings for the FF Type-0 HD camera)
 
 Set `TuneWindow = 1` in `FFT0HD Unlocker.ini` and a small always-on-top settings window
 opens next to the game: camera distance, lock-on follow, turn speeds, stick response and

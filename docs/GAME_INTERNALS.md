@@ -189,28 +189,26 @@ cutscene gate reads the dead cell `0x6D1CEC`, so it is always active.
   longer expression corrupted them. Fixed in the fork (volatile r8/r9/r11, same logic).
 - **A plain per-address "once per 30 Hz frame" dedup HANGS THE GAME AT BOOT**: scripts loop
   `x++` inside a single tick (`while (x < N) x++`), so the counter never reaches N (2026-09-09,
-  reproduced: CPU spin, log stops after init). That is almost certainly why upstream limited its
-  dedup to small values. Shipped rule for stores 1/2 (`[Movement] ScriptVarDedupAll`, default 1):
-  32-entry list {addr, rendered frame, 30 Hz frame} (frame counters bumped in upstream's per-frame
-  setup hook); an address advances freely within one rendered frame, and only its FIRST touch in a
-  later rendered frame of the same 30 Hz frame is skipped. Per-tick counters → once per 30 Hz frame;
-  in-tick loops lose at most one iteration. Boots and plays (laptop + the test PC).
-- `[Movement] ScriptTick30Hz` (default 0, experimental): early-return in `0x14037f2a0` unless
-  upstream's `propagatecounters` byte says this rendered frame starts a 30 Hz frame. Gates the
-  global and field VMs only. Untested beyond boot.
-- Diagnostics: `[ScriptVars +Ts]` log line (from the stats watcher) counts performed/skipped
-  `++`/`--` per store, so a play log shows which store the problem scene's counters live in.
-- `[OverrideRes]` resolution not in the primary display's mode list closes the game silently at startup
-  (the test PC: 4K ini on a 1440p monitor). The fork now falls back to the desktop resolution with a log
-  WARNING (`AllowUnsupportedRes = 1` forces the ini value). Note a 4K laptop panel running a scaled
-  desktop still lists 4K as a mode, so the check passes there.
-- **Chapter 3 mission 2 hang (2026-09-09, ROOT CAUSE)**: actor script (ch14) function id 16 runs
-  `i = 7; while (actorVar[i] unset) i--;` inside ONE tick (fn id 3/5 = `GetActorVar(i)/100000`, "unset"
-  = value in (-2,0)). `i` is a store-1 variable; upstream's "Gameplay fixes #2" (`--` dedup at
-  `0x14037203c`, stores 0/1, no small-value rule) drops the second `i--` of the tick, `i` sticks at 6,
-  the loop never ends, the main thread spins in the evaluator (RIPs 0x372192/0x372299/0x372494/
-  0x370EF7). Happens at ANY FpsCap above 30 (at 30 the whole framerate block is skipped). Fix: both
-  upstream store-0/1 sites replaced by the frame-aware rule (`ScriptVarDedupAll`, default 1).
+  reproduced: CPU spin, log stops after init). That is why upstream limited its dedup to small values.
+- **Plateau dedup (advance once per 30 Hz frame, allow in-frame repeats) MAKES EQUALITY EVENTS FIRE
+  4x**: the field script triggers dialogue lines with `if (v0[14] == 30)`; a value held for 4 rendered
+  frames fires the line 4 times (2026-09-10, ch3 m2 dialogue repeated).
+- **Fractional stepping (+30/fps per rendered frame, loop repair on the 2nd in-frame touch) BREAKS
+  DESCENDING LOOPS**: `i--` gives 6.75, truncation makes index 7 vanish; enemy AI target loops that
+  count down never see the player → some enemies never attack (2026-09-10).
+- **Gating the whole script VM to 30 Hz (`ScriptTick30Hz`) breaks engine interactions** that expect
+  the script every frame (phantoma harvest prompt after a kill: prompt missing, character jitters as
+  if a button were held). Kept as an off-by-default experiment only.
+- **Shipped scheme (`ScriptVarDedupAll`, default 1, all 5 `++/--` sites, 2026-09-10)**: list of 32
+  entries {addr, rendered frame, 30 Hz frame, accumulated nudge}; first touch of an address in a NEW
+  30 Hz frame: subtract the accumulated nudge and step by a whole ±1 (value is an exact integer at
+  every tick boundary, like the original); repeat touch in the SAME rendered frame: whole ±1 (in-tick
+  loops exact, up and down); touch in a LATER rendered frame of the same 30 Hz frame: ±1/64 nudge in
+  the direction of the value's sign (equality against integers is true for exactly one frame per
+  tick, truncation toward zero is unchanged). Frame counters come from upstream's per-frame setup
+  hook. Verified: ch3 mission 2 start, dialogue once, enemies attack, phantoma prompt, the pilot
+  spawn at the mission end, 65-minute session, no hang. Stats ratio whole:nudge ≈ 1:3 at 120 fps.
+  A first version had the 30 Hz-frame branch inverted (nudge instead of landing) → scripts 16x slow.
 - **Script file format** ("ATELY", decoded 2026-09-09, tool `docs/tools/scriptdis.py`): object header
   fields `+0x118` code, `+0x120` fn table, `+0x138/+0x140` label tables, `+0x148` labels (`0xFF0000nn`,
   offset pairs), `+0x150` float constant pool. Code: 0x30-byte file header, then functions =

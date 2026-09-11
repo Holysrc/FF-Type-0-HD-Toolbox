@@ -2393,7 +2393,7 @@ static void StartSoundTraceWatcher()
 		{
 			Sleep(200);
 			const ULONGLONG now = GetTickCount64() - start;
-			if (GetAsyncKeyState(VK_F7) & 1)
+			if (GetAsyncKeyState(VK_MULTIPLY) & 1)
 				LogF("[Mark] F9 at +%llums", now);
 			const uint32_t head = *g_sndHead;
 			if (head != last)
@@ -2632,6 +2632,43 @@ static void HangReport(const char* why)
 				LogF("[HangWatch]  script of ch%d dumped: %ls (%zu code bytes)", ch, path, total);
 			}
 		}
+		// per-thread variable snapshot: store 1 block [rec+0x80] (first 12) and locals [rec+0x5c] (8)
+		{
+			uintptr_t seenRec[12] = {}; int nRec = 0;
+			const uint32_t head = *g_scriptOpHead2;
+			const uint32_t n = head < 128 ? head : 128;
+			for (uint32_t k = head - n; k < head && nRec < 12; k++)
+			{
+				volatile uint8_t* e = g_scriptOpRing2 + (k & 0x1ff) * 24;
+				const int ch = static_cast<int>(*reinterpret_cast<volatile uint32_t*>(e + 4));
+				const uintptr_t rec = *reinterpret_cast<volatile uint32_t*>(e + 16) | (static_cast<uintptr_t>(*reinterpret_cast<volatile uint32_t*>(e + 20)) << 32);
+				bool dup = false;
+				for (int i = 0; i < nRec; i++) if (seenRec[i] == rec) dup = true;
+				if (dup || rec < 0x10000) continue;
+				seenRec[nRec++] = rec;
+				// the ring records the frame that parsed the command; show the thread's DEEPEST frame
+				// instead (frames are 0xa0 apart from thread+8, count at thread+0x508)
+				uintptr_t deep = rec;
+				for (int k = 0; k < 8; k++)
+				{
+					const uintptr_t th = rec - 8 - k * 0xa0;
+					uint32_t cnt = 0;
+					if (ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(th + 0x508), &cnt, 4, nullptr) && cnt == static_cast<uint32_t>(k + 1))
+					{ deep = th + 8 + (cnt - 1) * 0xa0; break; }
+					if (ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(th + 0x508), &cnt, 4, nullptr) && cnt > static_cast<uint32_t>(k + 1) && cnt <= 8)
+					{ deep = th + 8 + (cnt - 1) * 0xa0; break; }
+				}
+				uintptr_t blk = 0; float v1[12] = {}; float v2[8] = {};
+				uint32_t pcDeep = 0;
+				ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(deep + 0x28), &pcDeep, 4, nullptr);
+				ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(deep + 0x80), &blk, 8, nullptr);
+				if (blk) ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(blk), v1, sizeof(v1), nullptr);
+				ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(deep + 0x5c), v2, sizeof(v2), nullptr);
+				LogF("[HangWatch]  vars ch%d frame=%llX pc=%u v1[0..11]= %g %g %g %g %g %g %g %g %g %g %g %g | v2[0..7]= %g %g %g %g %g %g %g %g",
+					ch, static_cast<unsigned long long>(deep), pcDeep, v1[0], v1[1], v1[2], v1[3], v1[4], v1[5], v1[6], v1[7], v1[8], v1[9], v1[10], v1[11],
+					v2[0], v2[1], v2[2], v2[3], v2[4], v2[5], v2[6], v2[7]);
+			}
+		}
 		const uint32_t head = *g_scriptOpHead2;
 		const uint32_t n = head < 64 ? head : 64;
 		LogF("[HangWatch] last %u DISTINCT-PC script commands (oldest first): op ch pc thr rec", n);
@@ -2654,14 +2691,14 @@ static void StartHangWatcher()
 {
 	if (!g_logEnabled || !g_gameBase)
 		return;
-	// F7 = report on demand (any framerate)
+	// numpad * = report on demand (any framerate)
 	std::thread([] {
 		for (;;)
 		{
 			Sleep(100);
-			if ((GetAsyncKeyState(VK_F7) & 0x8000) == 0)
+			if ((GetAsyncKeyState(VK_MULTIPLY) & 0x8000) == 0)
 				continue;
-			HangReport("F7 pressed");
+			HangReport("numpad * pressed");
 			Sleep(2000);
 		}
 	}).detach();
@@ -2757,7 +2794,7 @@ static void StartStatsWatcher()
 					curS[i] = *(volatile uint32_t*)&g_scriptStats[i];
 				if (memcmp(curS, lastS, sizeof(curS)) != 0)
 				{
-					LogF("[ScriptVars +%llus] ++store0=%u/%u ++store1=%u/%u ++store2=%u/%u --store0/1=%u/%u --store2=%u/%u (done/skipped as 30Hz duplicates)",
+					LogF("[ScriptVars +%llus] ++store0=%u/%u ++store1=%u/%u ++store2=%u/%u --store0/1=%u/%u --store2=%u/%u (whole/nudge steps)",
 						(GetTickCount64() - start) / 1000ULL, curS[0], curS[1], curS[2], curS[3], curS[4], curS[5], curS[8], curS[9], curS[6], curS[7]);
 					memcpy(lastS, curS, sizeof(curS));
 				}
@@ -4698,38 +4735,43 @@ void OnInitializeHook()
 			//frame, 30Hz frame}, round-robin replacement, no per-frame reset needed.
 			if (scriptVarDedupAll)
 			{
-			auto scriptVarList = reinterpret_cast<uint8_t*>(trampoline->RawSpace(32 * 16));
-			memset(scriptVarList, 0, 32 * 16);
+			// 32 entries x 32 bytes: {addr, rendered frame, 30Hz frame, accumulated epsilon}
+			auto scriptVarList = reinterpret_cast<uint8_t*>(trampoline->RawSpace(32 * 32));
+			memset(scriptVarList, 0, 32 * 32);
 			param_floats[0] = 1.0f;
-			constants[0] = 32 * 16;
+			param_floats[1] = 1.0f / 64.0f;   // epsilon for later rendered frames of the same 30Hz frame (value >= 0)
+			param_floats[2] = -1.0f / 64.0f;  // ... and for negative values (keeps truncation toward zero intact)
+			param_floats[3] = 0.005f;
+			param_floats[4] = -0.005f;
+			constants[0] = 32 * 32;
 			pointers[0] = reinterpret_cast<uintptr_t>(scriptVarList);
 			pointers[1] = reinterpret_cast<uintptr_t>(scriptFrames);
-			// store 1: mov rax,[rbx+0x80]; movss xmm0,[rax+rcx*4]; addss xmm0,1.0; movss [rax+rcx*4],xmm0
+			// store 1 "++": mov rax,[rbx+0x80]; movss xmm0,[rax+rcx*4]; addss; movss
 			match = FindOne("48 8B 83 80 00 00 00 F3 0F 10 04 88 F3 0F 58 05 ? ? ? ? F3 0F 11 04 88");
 			pointers[2] = reinterpret_cast<uintptr_t>(&scriptStats[2]);
 			pointers[3] = reinterpret_cast<uintptr_t>(&scriptStats[3]);
-			ParametricASMJump("push r9; lea r8, [rax + rcx * 4]; lea r9, [rip + ?0]; lea rdx, [rip + ?1]; mov r11d, dword ptr [rdx]; xor r10, r10; A: cmp qword ptr [r9 + r10], r8; je F; add r10, 16; cmp r10, $0; jl A; mov r10d, dword ptr [rdx + 8]; inc dword ptr [rdx + 8]; and r10d, 31; shl r10, 4; mov qword ptr [r9 + r10], r8; mov dword ptr [r9 + r10 + 8], r11d; mov r8d, dword ptr [rdx + 4]; mov dword ptr [r9 + r10 + 12], r8d; jmp E; F: cmp dword ptr [r9 + r10 + 8], r11d; je E; mov r8d, dword ptr [rdx + 4]; cmp dword ptr [r9 + r10 + 12], r8d; jne N; mov dword ptr [r9 + r10 + 8], r11d; inc dword ptr [rip + ?3]; jmp D; N: mov dword ptr [r9 + r10 + 8], r11d; mov dword ptr [r9 + r10 + 12], r8d; E: addss xmm0, %0; inc dword ptr [rip + ?2]; D: pop r9", match, 0xC, 0x14);
-			// store 2: movss xmm0,[rbx+rcx*4+0x5c]; addss xmm0,1.0; movss [rbx+rcx*4+0x5c],xmm0
+			ParametricASMJump("push r9; lea r8, [rax + rcx * 4]; lea r9, [rip + ?0]; lea rdx, [rip + ?1]; mov r11d, dword ptr [rdx]; xor r10, r10; A: cmp qword ptr [r9 + r10], r8; je F; add r10, 32; cmp r10, $0; jl A; jmp Q; F: cmp dword ptr [r9 + r10 + 8], r11d; jne G; addss xmm0, %0; inc dword ptr [rip + ?2]; jmp H; G: mov r8d, dword ptr [rdx + 4]; cmp dword ptr [r9 + r10 + 12], r8d; je E; mov dword ptr [r9 + r10 + 8], r11d; mov dword ptr [r9 + r10 + 12], r8d; subss xmm0, dword ptr [r9 + r10 + 16]; mov dword ptr [r9 + r10 + 16], 0; addss xmm0, %0; inc dword ptr [rip + ?2]; H: jmp D; Q: jmp N; E: mov dword ptr [r9 + r10 + 8], r11d; movss xmm3, %1; xorps xmm4, xmm4; comiss xmm0, xmm4; jae K; movss xmm3, %2; K: addss xmm0, xmm3; addss xmm3, dword ptr [r9 + r10 + 16]; movss dword ptr [r9 + r10 + 16], xmm3; inc dword ptr [rip + ?3]; jmp D; N: mov r10d, dword ptr [rdx + 8]; inc dword ptr [rdx + 8]; and r10d, 31; shl r10, 5; mov qword ptr [r9 + r10], r8; mov dword ptr [r9 + r10 + 8], r11d; mov r8d, dword ptr [rdx + 4]; mov dword ptr [r9 + r10 + 12], r8d; mov dword ptr [r9 + r10 + 16], 0; addss xmm0, %0; inc dword ptr [rip + ?2]; D: pop r9", match, 0xC, 0x14);
+			// store 2 "++": movss xmm0,[rbx+rcx*4+0x5c]; addss; movss
 			match = FindOne("F3 0F 10 44 8B 5C F3 0F 58 05 ? ? ? ? F3 0F 11 44 8B 5C");
 			pointers[2] = reinterpret_cast<uintptr_t>(&scriptStats[4]);
 			pointers[3] = reinterpret_cast<uintptr_t>(&scriptStats[5]);
-			ParametricASMJump("push r9; lea r8, [rbx + rcx * 4 + 0x5c]; lea r9, [rip + ?0]; lea rdx, [rip + ?1]; mov r11d, dword ptr [rdx]; xor r10, r10; A: cmp qword ptr [r9 + r10], r8; je F; add r10, 16; cmp r10, $0; jl A; mov r10d, dword ptr [rdx + 8]; inc dword ptr [rdx + 8]; and r10d, 31; shl r10, 4; mov qword ptr [r9 + r10], r8; mov dword ptr [r9 + r10 + 8], r11d; mov r8d, dword ptr [rdx + 4]; mov dword ptr [r9 + r10 + 12], r8d; jmp E; F: cmp dword ptr [r9 + r10 + 8], r11d; je E; mov r8d, dword ptr [rdx + 4]; cmp dword ptr [r9 + r10 + 12], r8d; jne N; mov dword ptr [r9 + r10 + 8], r11d; inc dword ptr [rip + ?3]; jmp D; N: mov dword ptr [r9 + r10 + 8], r11d; mov dword ptr [r9 + r10 + 12], r8d; E: addss xmm0, %0; inc dword ptr [rip + ?2]; D: pop r9", match, 0x6, 0xE);
-			// store 2 "--": movss xmm1,[rbx+rcx*4+0x5c]; subss xmm1,1.0; movss [rbx+rcx*4+0x5c],xmm1
+			ParametricASMJump("push r9; lea r8, [rbx + rcx * 4 + 0x5c]; lea r9, [rip + ?0]; lea rdx, [rip + ?1]; mov r11d, dword ptr [rdx]; xor r10, r10; A: cmp qword ptr [r9 + r10], r8; je F; add r10, 32; cmp r10, $0; jl A; jmp Q; F: cmp dword ptr [r9 + r10 + 8], r11d; jne G; addss xmm0, %0; inc dword ptr [rip + ?2]; jmp H; G: mov r8d, dword ptr [rdx + 4]; cmp dword ptr [r9 + r10 + 12], r8d; je E; mov dword ptr [r9 + r10 + 8], r11d; mov dword ptr [r9 + r10 + 12], r8d; subss xmm0, dword ptr [r9 + r10 + 16]; mov dword ptr [r9 + r10 + 16], 0; addss xmm0, %0; inc dword ptr [rip + ?2]; H: jmp D; Q: jmp N; E: mov dword ptr [r9 + r10 + 8], r11d; movss xmm3, %1; xorps xmm4, xmm4; comiss xmm0, xmm4; jae K; movss xmm3, %2; K: addss xmm0, xmm3; addss xmm3, dword ptr [r9 + r10 + 16]; movss dword ptr [r9 + r10 + 16], xmm3; inc dword ptr [rip + ?3]; jmp D; N: mov r10d, dword ptr [rdx + 8]; inc dword ptr [rdx + 8]; and r10d, 31; shl r10, 5; mov qword ptr [r9 + r10], r8; mov dword ptr [r9 + r10 + 8], r11d; mov r8d, dword ptr [rdx + 4]; mov dword ptr [r9 + r10 + 12], r8d; mov dword ptr [r9 + r10 + 16], 0; addss xmm0, %0; inc dword ptr [rip + ?2]; D: pop r9", match, 0x6, 0xE);
+			// store 2 "--": movss xmm1,[rbx+rcx*4+0x5c]; subss xmm1; movss
 			match = FindOne("F3 0F 10 4C 8B 5C F3 0F 5C 0D ? ? ? ? F3 0F 11 4C 8B 5C");
 			pointers[2] = reinterpret_cast<uintptr_t>(&scriptStats[6]);
 			pointers[3] = reinterpret_cast<uintptr_t>(&scriptStats[7]);
-			ParametricASMJump("push r9; lea r8, [rbx + rcx * 4 + 0x5c]; lea r9, [rip + ?0]; lea rdx, [rip + ?1]; mov r11d, dword ptr [rdx]; xor r10, r10; A: cmp qword ptr [r9 + r10], r8; je F; add r10, 16; cmp r10, $0; jl A; mov r10d, dword ptr [rdx + 8]; inc dword ptr [rdx + 8]; and r10d, 31; shl r10, 4; mov qword ptr [r9 + r10], r8; mov dword ptr [r9 + r10 + 8], r11d; mov r8d, dword ptr [rdx + 4]; mov dword ptr [r9 + r10 + 12], r8d; jmp E; F: cmp dword ptr [r9 + r10 + 8], r11d; je E; mov r8d, dword ptr [rdx + 4]; cmp dword ptr [r9 + r10 + 12], r8d; jne N; mov dword ptr [r9 + r10 + 8], r11d; inc dword ptr [rip + ?3]; jmp D; N: mov dword ptr [r9 + r10 + 8], r11d; mov dword ptr [r9 + r10 + 12], r8d; E: subss xmm1, %0; inc dword ptr [rip + ?2]; D: pop r9", match, 0x6, 0xE);
+			ParametricASMJump("push r9; lea r8, [rbx + rcx * 4 + 0x5c]; lea r9, [rip + ?0]; lea rdx, [rip + ?1]; mov r11d, dword ptr [rdx]; xor r10, r10; A: cmp qword ptr [r9 + r10], r8; je F; add r10, 32; cmp r10, $0; jl A; jmp Q; F: cmp dword ptr [r9 + r10 + 8], r11d; jne G; subss xmm1, %0; inc dword ptr [rip + ?2]; jmp H; G: mov r8d, dword ptr [rdx + 4]; cmp dword ptr [r9 + r10 + 12], r8d; je E; mov dword ptr [r9 + r10 + 8], r11d; mov dword ptr [r9 + r10 + 12], r8d; subss xmm1, dword ptr [r9 + r10 + 16]; mov dword ptr [r9 + r10 + 16], 0; subss xmm1, %0; inc dword ptr [rip + ?2]; H: jmp D; Q: jmp N; E: mov dword ptr [r9 + r10 + 8], r11d; movss xmm3, %1; xorps xmm4, xmm4; comiss xmm1, xmm4; jae K; movss xmm3, %2; K: addss xmm1, xmm3; addss xmm3, dword ptr [r9 + r10 + 16]; movss dword ptr [r9 + r10 + 16], xmm3; inc dword ptr [rip + ?3]; jmp D; N: mov r10d, dword ptr [rdx + 8]; inc dword ptr [rdx + 8]; and r10d, 31; shl r10, 5; mov qword ptr [r9 + r10], r8; mov dword ptr [r9 + r10 + 8], r11d; mov r8d, dword ptr [rdx + 4]; mov dword ptr [r9 + r10 + 12], r8d; mov dword ptr [r9 + r10 + 16], 0; subss xmm1, %0; inc dword ptr [rip + ?2]; D: pop r9", match, 0x6, 0xE);
 			// store 0 "++" (replaces upstream "Gameplay fixes #1"): mov rax,[rbx+8]; movss xmm0,[rax+rcx*4]; addss; movss
 			match = FindOne("8B 43 08 F3 0F 10 04 88 F3 0F 58 05 ? ? ? ? F3 0F 11 04 88");
 			pointers[2] = reinterpret_cast<uintptr_t>(&scriptStats[0]);
 			pointers[3] = reinterpret_cast<uintptr_t>(&scriptStats[1]);
-			ParametricASMJump("push r9; lea r8, [rax + rcx * 4]; lea r9, [rip + ?0]; lea rdx, [rip + ?1]; mov r11d, dword ptr [rdx]; xor r10, r10; A: cmp qword ptr [r9 + r10], r8; je F; add r10, 16; cmp r10, $0; jl A; mov r10d, dword ptr [rdx + 8]; inc dword ptr [rdx + 8]; and r10d, 31; shl r10, 4; mov qword ptr [r9 + r10], r8; mov dword ptr [r9 + r10 + 8], r11d; mov r8d, dword ptr [rdx + 4]; mov dword ptr [r9 + r10 + 12], r8d; jmp E; F: cmp dword ptr [r9 + r10 + 8], r11d; je E; mov r8d, dword ptr [rdx + 4]; cmp dword ptr [r9 + r10 + 12], r8d; jne N; mov dword ptr [r9 + r10 + 8], r11d; inc dword ptr [rip + ?3]; jmp D; N: mov dword ptr [r9 + r10 + 8], r11d; mov dword ptr [r9 + r10 + 12], r8d; E: addss xmm0, %0; inc dword ptr [rip + ?2]; D: pop r9", match, 0x8, 0x10);
+			ParametricASMJump("push r9; lea r8, [rax + rcx * 4]; lea r9, [rip + ?0]; lea rdx, [rip + ?1]; mov r11d, dword ptr [rdx]; xor r10, r10; A: cmp qword ptr [r9 + r10], r8; je F; add r10, 32; cmp r10, $0; jl A; jmp Q; F: cmp dword ptr [r9 + r10 + 8], r11d; jne G; addss xmm0, %0; inc dword ptr [rip + ?2]; jmp H; G: mov r8d, dword ptr [rdx + 4]; cmp dword ptr [r9 + r10 + 12], r8d; je E; mov dword ptr [r9 + r10 + 8], r11d; mov dword ptr [r9 + r10 + 12], r8d; subss xmm0, dword ptr [r9 + r10 + 16]; mov dword ptr [r9 + r10 + 16], 0; addss xmm0, %0; inc dword ptr [rip + ?2]; H: jmp D; Q: jmp N; E: mov dword ptr [r9 + r10 + 8], r11d; movss xmm3, %1; xorps xmm4, xmm4; comiss xmm0, xmm4; jae K; movss xmm3, %2; K: addss xmm0, xmm3; addss xmm3, dword ptr [r9 + r10 + 16]; movss dword ptr [r9 + r10 + 16], xmm3; inc dword ptr [rip + ?3]; jmp D; N: mov r10d, dword ptr [rdx + 8]; inc dword ptr [rdx + 8]; and r10d, 31; shl r10, 5; mov qword ptr [r9 + r10], r8; mov dword ptr [r9 + r10 + 8], r11d; mov r8d, dword ptr [rdx + 4]; mov dword ptr [r9 + r10 + 12], r8d; mov dword ptr [r9 + r10 + 16], 0; addss xmm0, %0; inc dword ptr [rip + ?2]; D: pop r9", match, 0x8, 0x10);
 			// store 0/1 "--" (replaces upstream "Gameplay fixes #2"): shared tail movss xmm0,[rax+rcx*4]; subss; movss
 			match = FindOne("00 00 00 F3 0F 10 04 88 F3 0F 5C 05 ? ? ? ? F3 0F 11 04 88");
 			pointers[2] = reinterpret_cast<uintptr_t>(&scriptStats[8]);
 			pointers[3] = reinterpret_cast<uintptr_t>(&scriptStats[9]);
-			ParametricASMJump("push r9; lea r8, [rax + rcx * 4]; lea r9, [rip + ?0]; lea rdx, [rip + ?1]; mov r11d, dword ptr [rdx]; xor r10, r10; A: cmp qword ptr [r9 + r10], r8; je F; add r10, 16; cmp r10, $0; jl A; mov r10d, dword ptr [rdx + 8]; inc dword ptr [rdx + 8]; and r10d, 31; shl r10, 4; mov qword ptr [r9 + r10], r8; mov dword ptr [r9 + r10 + 8], r11d; mov r8d, dword ptr [rdx + 4]; mov dword ptr [r9 + r10 + 12], r8d; jmp E; F: cmp dword ptr [r9 + r10 + 8], r11d; je E; mov r8d, dword ptr [rdx + 4]; cmp dword ptr [r9 + r10 + 12], r8d; jne N; mov dword ptr [r9 + r10 + 8], r11d; inc dword ptr [rip + ?3]; jmp D; N: mov dword ptr [r9 + r10 + 8], r11d; mov dword ptr [r9 + r10 + 12], r8d; E: subss xmm0, %0; inc dword ptr [rip + ?2]; D: pop r9", match, 0x8, 0x10);
-			LogF("[Movement] ScriptVarDedupAll on: script ++/-- on all variable stores advance once per 30Hz frame, repeats within one rendered frame allowed (upstream store-0 patches replaced)");
+			ParametricASMJump("push r9; lea r8, [rax + rcx * 4]; lea r9, [rip + ?0]; lea rdx, [rip + ?1]; mov r11d, dword ptr [rdx]; xor r10, r10; A: cmp qword ptr [r9 + r10], r8; je F; add r10, 32; cmp r10, $0; jl A; jmp Q; F: cmp dword ptr [r9 + r10 + 8], r11d; jne G; subss xmm0, %0; inc dword ptr [rip + ?2]; jmp H; G: mov r8d, dword ptr [rdx + 4]; cmp dword ptr [r9 + r10 + 12], r8d; je E; mov dword ptr [r9 + r10 + 8], r11d; mov dword ptr [r9 + r10 + 12], r8d; subss xmm0, dword ptr [r9 + r10 + 16]; mov dword ptr [r9 + r10 + 16], 0; subss xmm0, %0; inc dword ptr [rip + ?2]; H: jmp D; Q: jmp N; E: mov dword ptr [r9 + r10 + 8], r11d; movss xmm3, %1; xorps xmm4, xmm4; comiss xmm0, xmm4; jae K; movss xmm3, %2; K: addss xmm0, xmm3; addss xmm3, dword ptr [r9 + r10 + 16]; movss dword ptr [r9 + r10 + 16], xmm3; inc dword ptr [rip + ?3]; jmp D; N: mov r10d, dword ptr [rdx + 8]; inc dword ptr [rdx + 8]; and r10d, 31; shl r10, 5; mov qword ptr [r9 + r10], r8; mov dword ptr [r9 + r10 + 8], r11d; mov r8d, dword ptr [rdx + 4]; mov dword ptr [r9 + r10 + 12], r8d; mov dword ptr [r9 + r10 + 16], 0; subss xmm0, %0; inc dword ptr [rip + ?2]; D: pop r9", match, 0x8, 0x10);
+			LogF("[Movement] ScriptVarDedupAll on: script ++/-- whole step on the first touch per 30Hz frame and on in-tick repeats, 1/64 nudges in between (single-fire equality, exact truncation); upstream store-0 patches replaced");
 			}
 
 			//[fork, EXPERIMENTAL, default off] Tick the global and field script VMs (0x14037f2a0,

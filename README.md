@@ -5,12 +5,24 @@
 **FF Type-0 HD Toolbox** is a mod for **Final Fantasy Type-0 HD** on PC (Steam) that unlocks
 **60 / 90 / 120 fps**, **custom and ultrawide resolutions** and **field of view**, skips the whole
 intro, replaces the stiff camera with a modern tunable one, adds analog movement speed and fixes
-the bosses, scripts and timers that break at high framerates. One `.asi` plugin, no game files
-touched, Steam updates never break it.
+the bosses, scripts and timers that break at high framerates. The main `.asi` plugin
+patches the game in memory; an optional launcher replacement is installed separately.
 
-**Download:** [latest release](https://github.com/Holysrc/FF-Type-0-HD-Toolbox/releases/latest)
-· [Nexus Mods page](https://www.nexusmods.com/finalfantasytype0hd/mods/4) ·
+**Download:** [Nexus Mods page](https://www.nexusmods.com/finalfantasytype0hd/mods/4) ·
 [what the toolbox adds](FORK-CHANGES.md)
+
+**0.5.8 (prepared for Nexus):** [changes](docs/releases/0.5.8/CHANGELOG.md),
+[installation and updating](docs/releases/0.5.8/README-EN.txt).
+Copy the archive's `WIN` folder into the **game root**, merging folders.
+The package contains the main mod only; no launcher replacement is included.
+The legacy installation instructions below refer to older flat archives.
+
+**Experimental cutscene fix:** `[Cutscenes] PartySceneFix=1` expands
+partial-party cutscene handling to 17 reviewed scenes across the game, with
+temporary participants where needed. It is enabled in the 0.5.8 INI; merge the
+setting when retaining an old INI. The Judecca boss intro is runtime-tested;
+other scene profiles remain experimental. See
+[coverage, configuration and testing status](docs/CUTSCENE_PARTY_EXPANSION.md).
 
 > **Built on the work of [Banz99](https://github.com/Banz99/Final-Fantasy-Type-0-Hd-Unlocker).**
 > This project began as a fork of his FFT0HD Unlocker, which did the hard reverse-engineering

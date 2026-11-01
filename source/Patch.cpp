@@ -6,8 +6,11 @@
 #include <string_view>
 #include <sstream>
 #include <regex>
+#include <unordered_map>
+#include <vector>
 #include <math.h>
 #include <cstdio>
+#include <share.h>
 #include <cstdarg>
 #include <stdexcept>
 #include <thread>
@@ -19,6 +22,8 @@ extern "C" IMAGE_DOS_HEADER __ImageBase;
 #pragma comment(lib, "Comctl32.lib")
 #include "Utils/Trampoline.h"
 #include "include/keystone/keystone.h"
+#include "include/JudeccaCutsceneGate.h"
+#include "include/CutscenePartyProfiles.h"
 
 #pragma comment(lib, "Shlwapi.lib")
 
@@ -125,6 +130,17 @@ static uint32_t* g_stats = nullptr;
 // [ScriptVars] counters: per script-variable store {performed, skipped} for ++ on store 0/1/2 and -- on store 2
 static uint32_t* g_scriptStats = nullptr;
 static volatile uint32_t* g_scriptFrames = nullptr; // [0] rendered frames (bumped by the per-frame setup hook)
+// [Diagnostics] DataRing takes over the * key (numpad * or Shift+8) from the HangWatch report while on.
+static volatile bool g_dataRingOn = false;
+static bool StarKeyDown()
+{
+	return (GetAsyncKeyState(VK_MULTIPLY) & 0x8000) != 0
+		|| ((GetAsyncKeyState('8') & 0x8000) != 0 && (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0);
+}
+// [Diagnostics] TraceMinutes (default 15): lifetime of the bounded trace threads
+// (script stream, BossPos/Roster/BossAI, Move, Combat). A boss fight reached 12
+// minutes into a session was cut off by the old fixed 15-minute windows.
+static ULONGLONG g_traceMs = 15 * 60000ULL;
 static uintptr_t g_trampolineLo = 0, g_trampolineHi = 0;
 // [TraceScriptOps] ring of the last 512 script commands parsed by 0x140370c70 (all channels):
 // 24-byte entries {opcode, channel, PC, thread index, record ptr lo, record ptr hi}; dumped by HangWatch
@@ -133,7 +149,676 @@ static volatile uint32_t* g_scriptOpHead = nullptr;
 // second ring with a spin filter: an entry is dropped when its PC equals the PC of any of the
 // previous four entries, so a tight script loop cannot flush the history before it
 static volatile uint8_t* g_scriptOpRing2 = nullptr;
+// [TraceCmdQ] ring of actor command-queue pushes (0x1401b5b20) for one channel: {cmd, arg1, arg2, caller RVA, queue count, frame}
+static volatile uint8_t* g_cmdqRing = nullptr;
+static volatile uint32_t* g_cmdqHead = nullptr;
 static volatile uint32_t* g_scriptOpHead2 = nullptr;
+
+// Optional read-only consumer of the existing parser ring. Keep a continuous
+// channel trace: a manual HangWatch snapshot loses earlier action transitions.
+static void StartScriptStreamWatcher(int channel)
+{
+	if (!g_logEnabled || !g_scriptOpRing || !g_scriptOpHead) return;
+	const bool allChannels = GetPrivateProfileIntW(L"Diagnostics", L"TraceScriptStreamAll", 0, wcModulePath) != 0;
+	// [Diagnostics] TraceScriptStreamCutsceneOnly=1 (2026-09-26): keep only commands parsed while a
+	// cutscene script runs (game mode [0x658F70] == 1), so a long session stays small.
+	const bool cutsceneOnly = GetPrivateProfileIntW(L"Diagnostics", L"TraceScriptStreamCutsceneOnly", 0, wcModulePath) != 0;
+	std::thread([channel, allChannels, cutsceneOnly] {
+		wchar_t path[MAX_PATH];
+		swprintf_s(path, L"%s_scriptstream.tsv", wcModulePath);
+		FILE* out = nullptr;
+		out = _wfsopen(path, L"w", _SH_DENYNO);
+		if (!out) return;
+		setvbuf(out, nullptr, _IOFBF, 65536);
+		// a0..a2 = the thread's argument slots [rec+0x38..0x40] when the row is written (up to ~10 ms
+		// after parsing: exact for commands still pending, e.g. waits, best-effort otherwise)
+		fprintf(out, "ms\top\tch\tpc\trecord\tscript\ta0\ta1\ta2\n");
+		const ULONGLONG start = GetTickCount64();
+		LogF("[ScriptStream] channel %d and global commands -> %ls; start tick=%llu", channel, path, start);
+		if (allChannels) LogF("[ScriptStream] all actor channels included");
+		const auto modeCell = reinterpret_cast<volatile int*>(reinterpret_cast<uintptr_t>(GetModuleHandle(nullptr)) + 0x658F70);
+		if (cutsceneOnly) LogF("[ScriptStream] only while a cutscene script runs (game mode 1)");
+		uint32_t consumed = 0;
+		ULONGLONG flushed = start;
+		uintptr_t seen[128] = {}; size_t nSeen = 0;
+		struct Entry { uint32_t op; int32_t ch; uint32_t pc, thread; uintptr_t rec; };
+		static_assert(sizeof(Entry) == 24, "script parser ring layout");
+		Entry batch[512];
+		while (GetTickCount64() - start < g_traceMs)
+		{
+			Sleep(10);
+			const uint32_t head = *g_scriptOpHead;
+			if (head == 0) continue;
+			// Producer publishes the head BEFORE writing. Leave its newest entry
+			// for the next poll, and reject a copy overwritten during this read.
+			const uint32_t end = head - 1;
+			if (end == consumed) continue;
+			if (end - consumed > 511)
+			{
+				fprintf(out, "# lost %u entries at %llu ms\n", end - consumed - 511, GetTickCount64() - start);
+				consumed = end - 511;
+			}
+			for (uint32_t k = consumed; k != end; ++k)
+				memcpy(&batch[k & 511], const_cast<const uint8_t*>(g_scriptOpRing) + (k & 511) * 24, 24);
+			if (*g_scriptOpHead - consumed > 512) continue;
+			const ULONGLONG now = GetTickCount64();
+			for (; consumed != end; ++consumed)
+			{
+				const Entry& e = batch[consumed & 511];
+				if (!allChannels && e.ch != channel && e.ch != -1) continue;
+				if (cutsceneOnly && *modeCell != 1) continue;
+				uintptr_t scr = 0, code = 0;
+				ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(e.rec + 8), &scr, 8, nullptr);
+				float args[3] = {};
+				ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(e.rec + 0x38), args, sizeof(args), nullptr);
+				fprintf(out, "%llu\t%X\t%d\t%u\t%llX\t%llX\t%g\t%g\t%g\n", now - start, e.op, e.ch, e.pc,
+					static_cast<unsigned long long>(e.rec), static_cast<unsigned long long>(scr), args[0], args[1], args[2]);
+				if (!scr || nSeen == 128) continue;
+				bool found = false;
+				for (size_t i = 0; i < nSeen; ++i) if (seen[i] == scr) { found = true; break; }
+				if (found) continue;
+				if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(scr + 0x118), &code, 8, nullptr) || !code) continue;
+				swprintf_s(path, L"%s_stream_%llX.bin", wcModulePath, static_cast<unsigned long long>(scr));
+				FILE* dump = nullptr;
+				if (_wfopen_s(&dump, path, L"wb") != 0 || !dump) continue;
+				uint8_t hdr[512] = {};
+				ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(scr), hdr, sizeof(hdr), nullptr);
+				fwrite(hdr, 1, sizeof(hdr), dump);
+				uint8_t page[4096]; size_t total = 0;
+				// Judecca's constant pool starts beyond 64 KiB (observed +0x107a0).
+				// Keep a bounded 256 KiB image, stopping at unreadable memory.
+				for (int pg = 0; pg < 64; ++pg)
+				{
+					SIZE_T got = 0;
+					ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(code + pg * 4096), page, sizeof(page), &got);
+					if (!got) break;
+					fwrite(page, 1, got, dump); total += got;
+					if (got != sizeof(page)) break;
+				}
+				fclose(dump);
+				seen[nSeen++] = scr;
+				LogF("[ScriptStream] ch%d script=%llX code=%llX saved %zu bytes -> %ls", e.ch,
+					static_cast<unsigned long long>(scr), static_cast<unsigned long long>(code), total, path);
+			}
+			if (now - flushed >= 1000) { fflush(out); flushed = now; }
+		}
+		fclose(out);
+		LogF("[ScriptStream] trace finished");
+	}).detach();
+}
+
+// [TraceBrain] = <channel>: ring of enemy AI brain (0x140258fd0 via 0x140266010) results for one
+// channel: frame, result, chosen action byte, brain countdowns, queue state, player action bytes.
+struct BrainTraceEntry { uint32_t frame; uint8_t ch, result, action, state; int16_t cd5f8, cd5fa; int32_t cd620; int16_t cd644, mode9c0; uint32_t qcount, qhead; uint32_t pa[6]; };
+static uintptr_t g_gameBase;
+
+// Opt-in native-behavior change, independent of FPS. Override ONLY the result
+// of reviewed cinematic eligibility checks, never the global count, HP, death
+// flags or party entries. Legacy Judecca-only mode remains available.
+static void (*g_nativePartyCount)(uintptr_t) = nullptr;
+static uintptr_t (*g_nativeActorName)(uintptr_t, const char*, uintptr_t) = nullptr;
+static int g_judeccaArmedScene = 0;
+static unsigned g_judeccaEmptySlots = 0;
+static unsigned g_judeccaMissingLogged = 0;
+static bool g_judeccaStandIns = false;
+static int g_judeccaModels[3] = {-1, -1, -1};
+struct JudeccaStandIn { uintptr_t actor = 0; int channel = -1, model = -1; };
+static JudeccaStandIn g_judeccaCast[3];
+static uintptr_t g_judeccaCastManager = 0;
+static unsigned g_judeccaCastLogged = 0;
+static unsigned g_judeccaMotionLogged[3] = {};
+static uint8_t g_judeccaPartyBefore[3 * 0x60];
+static bool g_partySceneFix = false;
+static const CutscenePartyProfiles::Profile* g_partySceneProfile = nullptr;
+static int g_sceneReplacementModels[3] = {-1, -1, -1};
+static void DumpSceneState();
+
+static bool ReadSceneMemory(uintptr_t address, void* out, size_t size)
+{
+	SIZE_T got = 0;
+	return address && ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(address), out, size, &got) && got == size;
+}
+
+static bool MatchSceneModule(uintptr_t script, uint32_t size, uint32_t poolOffset, uint64_t hash)
+{
+	uintptr_t code = 0, pool = 0;
+	if (!script || size < 48 || size > 256 * 1024 || poolOffset >= size ||
+		!ReadSceneMemory(script + 0x118, &code, sizeof(code)) || !code ||
+		!ReadSceneMemory(script + 0x150, &pool, sizeof(pool)) || pool != code + poolOffset) return false;
+	// No address-only cache: the native allocator reuses script/code addresses.
+	std::vector<uint8_t> bytes(size);
+	return ReadSceneMemory(code, bytes.data(), bytes.size()) &&
+		CutscenePartyProfiles::Fingerprint(bytes.data(), bytes.size()) == hash;
+}
+
+static bool SceneStandInScope(int scene, int stage)
+{
+	if (!g_partySceneFix) return JudeccaCutsceneGate::StandInScope(g_judeccaArmedScene, scene, stage);
+	return g_partySceneProfile && g_partySceneProfile->scene == g_judeccaArmedScene &&
+		CutscenePartyProfiles::Scope(g_judeccaArmedScene, scene, stage);
+}
+
+static void RememberSceneParty(int scene, const int* models)
+{
+	g_judeccaArmedScene = scene;
+	g_judeccaEmptySlots = 0;
+	g_judeccaMissingLogged = 0;
+	memcpy(g_judeccaModels, models, sizeof(g_judeccaModels));
+	memcpy(g_sceneReplacementModels, models, sizeof(g_sceneReplacementModels));
+	for (int slot = 0; slot < 3; ++slot) if (models[slot] == -1) {
+		g_judeccaEmptySlots |= 1u << slot;
+		g_sceneReplacementModels[slot] = JudeccaCutsceneGate::ChooseStandIn(g_sceneReplacementModels);
+	}
+}
+
+static uintptr_t JudeccaActorAt(int channel)
+{
+	if (channel < 0 || channel >= 0x42) return 0;
+	const uintptr_t table = *reinterpret_cast<uintptr_t*>(g_gameBase + 0x667E20);
+	return table ? *reinterpret_cast<uintptr_t*>(table + 0x18 + channel * 8) : 0;
+}
+
+static bool JudeccaCastActive()
+{
+	const uintptr_t manager = *reinterpret_cast<uintptr_t*>(g_gameBase + 0x659E88);
+	return manager && manager == g_judeccaCastManager &&
+		SceneStandInScope(*reinterpret_cast<int*>(manager + 0x10), *reinterpret_cast<int*>(manager + 0x48));
+}
+
+static void PrepareJudeccaStandIns(uintptr_t manager)
+{
+	// After actor backup, before stage5's native resource wait and init script.
+	reinterpret_cast<void(*)(uintptr_t)>(g_gameBase + 0x34B880)(manager);
+	if (g_partySceneFix) {
+		// Native34B880 just constructed the scene's script at engine+0x10.
+		// Reset even for unsupported/full-party scenes to prevent stale arming.
+		g_partySceneProfile = nullptr;
+		g_judeccaArmedScene = 0;
+		g_judeccaEmptySlots = 0;
+		const int scene = *reinterpret_cast<int*>(manager + 0x10);
+		const auto* profile = CutscenePartyProfiles::Find(scene);
+		const float alive = static_cast<float>(*reinterpret_cast<int*>(g_gameBase + 0x657944));
+		const auto getModel = reinterpret_cast<int(*)(int)>(g_gameBase + 0x1C0320);
+		const int models[] = {getModel(0), getModel(1), getModel(2)};
+		uintptr_t engine = 0, script = 0;
+		if (!profile || !JudeccaCutsceneGate::CanOverride(alive, models) ||
+			!ReadSceneMemory(manager + 8, &engine, sizeof(engine)) || !engine ||
+			!ReadSceneMemory(engine + 0x10, &script, sizeof(script)) ||
+			!MatchSceneModule(script, profile->size, profile->pool, profile->hash)) {
+			if (profile && (alive == 1 || alive == 2))
+				LogF("[PartySceneFix] scene%d preparation rejected: party or module does not match reviewed profile", scene);
+			return;
+		}
+		g_partySceneProfile = profile;
+		RememberSceneParty(scene, models);
+		LogF("[PartySceneFix] scene%d verified; models=%d/%d/%d empty-mask=%u clips=%u", scene,
+			models[0], models[1], models[2], g_judeccaEmptySlots, profile->clipCount);
+	}
+	if (!g_judeccaStandIns || !g_judeccaEmptySlots ||
+		!SceneStandInScope(*reinterpret_cast<int*>(manager + 0x10), *reinterpret_cast<int*>(manager + 0x48))) return;
+	for (auto& cast : g_judeccaCast) cast = {};
+	g_judeccaCastManager = manager;
+	g_judeccaCastLogged = 0;
+	memset(g_judeccaMotionLogged, 0, sizeof(g_judeccaMotionLogged));
+	memcpy(g_judeccaPartyBefore, reinterpret_cast<void*>(g_gameBase + 0x6559D0), sizeof(g_judeccaPartyBefore));
+	int models[3]; memcpy(models, g_judeccaModels, sizeof(models));
+	const uintptr_t system = *reinterpret_cast<uintptr_t*>(g_gameBase + 0x659EA8);
+	const uintptr_t registry = system ? *reinterpret_cast<uintptr_t*>(system + 0x10EB8) : 0;
+	if (!registry || *reinterpret_cast<int*>(system + 0x30) == 0) return;
+	// These scenes create their own EVE_PC actors (or don't animate the PCs).
+	// Keep their casting and preload logic; only supply missing model queries.
+	if (g_partySceneProfile && !g_partySceneProfile->clipCount) return;
+	for (int slot = 0; slot < 3; ++slot) {
+		if (!(g_judeccaEmptySlots & (1u << slot))) continue;
+		const int model = JudeccaCutsceneGate::ChooseStandIn(models);
+		// CMDEF allocates channels6..47 and a scene-owned name entry (80 max).
+		bool freeChannel = false;
+		for (int ch = 6; ch < 48; ++ch) if (!JudeccaActorAt(ch)) { freeChannel = true; break; }
+		if (model < 0 || !freeChannel || *reinterpret_cast<int*>(registry + 0xD68) >= 80) {
+			LogF("[JudeccaStandIn] slot%d creation skipped: no model/channel/name capacity", slot);
+			continue;
+		}
+		// CMDEF only reads context+8/+38/+3C/+40 and this one-entry name table.
+		// The registry stores the name hash, not a pointer to this temporary text.
+		alignas(16) uint8_t code[0x60] = {}, script[0x120] = {}, context[0x50] = {};
+		*reinterpret_cast<uint32_t*>(code + 0xC) = 0x20;
+		*reinterpret_cast<uint16_t*>(code + 0x20) = 1;
+		sprintf_s(reinterpret_cast<char*>(code + 0x28), sizeof(code) - 0x28, "ToolboxScenePC%d", slot);
+		*reinterpret_cast<uintptr_t*>(script + 0x118) = reinterpret_cast<uintptr_t>(code);
+		*reinterpret_cast<uintptr_t*>(context + 8) = reinterpret_cast<uintptr_t>(script);
+		*reinterpret_cast<float*>(context + 0x38) = static_cast<float>(JudeccaCutsceneGate::standInBanks[model]);
+		*reinterpret_cast<float*>(context + 0x3C) = 1.0f;
+		reinterpret_cast<void(*)(uintptr_t)>(g_gameBase + 0x366CB0)(reinterpret_cast<uintptr_t>(context)); // CMD27C
+		*reinterpret_cast<float*>(context + 0x38) = static_cast<float>(JudeccaCutsceneGate::standInResources[model]);
+		*reinterpret_cast<float*>(context + 0x3C) = 0.0f; // name-table ID0
+		*reinterpret_cast<float*>(context + 0x40) = 1.0f; // native getPCModel4 load group
+		reinterpret_cast<void(*)(uintptr_t)>(g_gameBase + 0x363EB0)(reinterpret_cast<uintptr_t>(context)); // CMDEF
+		const int channel = static_cast<int>(*reinterpret_cast<float*>(context + 0x30));
+		const uintptr_t actor = channel >= 6 && channel < 48 ? JudeccaActorAt(channel) : 0;
+		if (!actor) { LogF("[JudeccaStandIn] slot%d native creation failed: channel%d", slot, channel); continue; }
+		g_judeccaCast[slot] = {actor, channel, model};
+		models[slot] = model;
+		// These scenes assume PCs carry ordinary animation clips already.
+		// Request all clips used by this scene's PC tracks for the new actor,
+		// using native CMD21, before stage5 waits for model/animation loading.
+		*reinterpret_cast<float*>(context + 0x34) = static_cast<float>(channel);
+		*reinterpret_cast<float*>(context + 0x3C) = 1.0f;
+		*reinterpret_cast<float*>(context + 0x40) = static_cast<float>(JudeccaCutsceneGate::standInResources[model]);
+		const int* clips = g_partySceneProfile ? g_partySceneProfile->clips : JudeccaCutsceneGate::standInClips;
+		const unsigned clipCount = g_partySceneProfile ? g_partySceneProfile->clipCount : 6;
+		for (unsigned i = 0; i < clipCount; ++i) {
+			const int clip = clips[i];
+			*reinterpret_cast<float*>(context + 0x38) = static_cast<float>(clip);
+			reinterpret_cast<void(*)(uintptr_t)>(g_gameBase + 0x35D500)(reinterpret_cast<uintptr_t>(context));
+		}
+		LogF("[JudeccaStandIn] scene%d slot%d -> model%d resource%d channel%d actor=%llX; native scene-owned allocation",
+			g_judeccaArmedScene, slot, model, JudeccaCutsceneGate::standInResources[model], channel, static_cast<unsigned long long>(actor));
+		LogF("[JudeccaStandIn] channel%d requested %u scene-specific clips before resource wait", channel, clipCount);
+	}
+}
+
+static void PlayJudeccaSceneMotion(uintptr_t context)
+{
+	reinterpret_cast<void(*)(uintptr_t)>(g_gameBase + 0x35C600)(context);
+	if (!JudeccaCastActive()) return;
+	const float channel = *reinterpret_cast<float*>(context + 0x34);
+	const float clip = *reinterpret_cast<float*>(context + 0x38);
+	for (int slot = 0; slot < 3; ++slot) {
+		const auto& cast = g_judeccaCast[slot];
+		if (!cast.actor || channel != static_cast<float>(cast.channel) || JudeccaActorAt(cast.channel) != cast.actor) continue;
+		const int* clips = g_partySceneProfile ? g_partySceneProfile->clips : JudeccaCutsceneGate::standInClips;
+		const unsigned count = g_partySceneProfile ? g_partySceneProfile->clipCount : 6;
+		for (unsigned i = 0; i < count; ++i) {
+			if (clip != static_cast<float>(clips[i]) || (g_judeccaMotionLogged[slot] & (1u << i))) continue;
+			g_judeccaMotionLogged[slot] |= 1u << i;
+			LogF("[JudeccaStandIn] channel%d requested-motion=%.0f actor-motion=%d request=%.0f", cast.channel, clip,
+				*reinterpret_cast<int*>(cast.actor + 0x5C8), *reinterpret_cast<float*>(context + 0x30));
+			DumpSceneState();
+		}
+	}
+}
+
+static void QueryJudeccaSceneModel(uintptr_t context)
+{
+	reinterpret_cast<void(*)(uintptr_t)>(g_gameBase + 0x366340)(context);
+	if (!JudeccaCastActive() || *reinterpret_cast<float*>(context + 0x30) != -1.0f) return;
+	const float slotArg = *reinterpret_cast<float*>(context + 0x38);
+	if (slotArg != 0.0f && slotArg != 1.0f && slotArg != 2.0f) return;
+	if (g_partySceneProfile && !g_partySceneProfile->clipCount) {
+		const int model = g_sceneReplacementModels[static_cast<int>(slotArg)];
+		if (model >= 0 && model < 12) *reinterpret_cast<float*>(context + 0x30) = static_cast<float>(model);
+		return;
+	}
+	const auto& cast = g_judeccaCast[static_cast<int>(slotArg)];
+	if (cast.actor && JudeccaActorAt(cast.channel) == cast.actor)
+		*reinterpret_cast<float*>(context + 0x30) = static_cast<float>(cast.model);
+}
+
+static void CleanupJudeccaStandIns(uintptr_t registry)
+{
+	// This native path handles both normal completion and skip. Clear resolver
+	// access before destructors run; term must not target a freed/reused channel.
+	JudeccaStandIn old[3]; memcpy(old, g_judeccaCast, sizeof(old));
+	const bool hadCast = g_judeccaCastManager != 0;
+	g_judeccaCastManager = 0;
+	for (auto& cast : g_judeccaCast) cast = {};
+	reinterpret_cast<void(*)(uintptr_t)>(g_gameBase + 0x384960)(registry);
+	if (!hadCast) return;
+	for (int slot = 0; slot < 3; ++slot) if (old[slot].actor)
+		LogF("[JudeccaStandIn] cleanup slot%d channel%d removed=%d", slot, old[slot].channel,
+			JudeccaActorAt(old[slot].channel) != old[slot].actor);
+	LogF("[JudeccaStandIn] cleanup party-table unchanged=%d native-count=%d",
+		memcmp(g_judeccaPartyBefore, reinterpret_cast<void*>(g_gameBase + 0x6559D0), sizeof(g_judeccaPartyBefore)) == 0,
+		*reinterpret_cast<int*>(g_gameBase + 0x657944));
+	DumpSceneState();
+}
+
+static uintptr_t ResolveJudeccaActorName(uintptr_t actors, const char* name, uintptr_t owner)
+{
+	const uintptr_t native = g_nativeActorName(actors, name, owner);
+	if (!g_judeccaArmedScene) return native;
+	const uintptr_t manager = *reinterpret_cast<uintptr_t*>(g_gameBase + 0x659E88);
+	if (!manager) return native;
+	const int current = *reinterpret_cast<int*>(manager + 0x10), stage = *reinterpret_cast<int*>(manager + 0x48);
+	bool missing = JudeccaCutsceneGate::SkipMissingActor(static_cast<int>(native), name,
+		g_judeccaArmedScene, current, stage, g_judeccaEmptySlots);
+	if (g_partySceneFix) {
+		missing = g_partySceneProfile && g_partySceneProfile->scene == g_judeccaArmedScene &&
+			CutscenePartyProfiles::MissingActor(static_cast<int>(native), name, g_judeccaArmedScene, current, stage, g_judeccaEmptySlots);
+	}
+	if (!missing) return native;
+	const unsigned mask = 1u << (name[3] - '0');
+	const auto& cast = g_judeccaCast[name[3] - '0'];
+	if (JudeccaCastActive() && cast.actor && JudeccaActorAt(cast.channel) == cast.actor) {
+		if (!(g_judeccaCastLogged & mask)) {
+			g_judeccaCastLogged |= mask;
+			LogF("[JudeccaStandIn] resolve %s -> channel%d model%d; model-resource=%u model-data=%llX", name,
+				cast.channel, cast.model, *reinterpret_cast<uint16_t*>(cast.actor + 0x2C4),
+				static_cast<unsigned long long>(*reinterpret_cast<uintptr_t*>(cast.actor + 0x2D0)));
+			DumpSceneState();
+		}
+		return static_cast<uintptr_t>(cast.channel);
+	}
+	if (!(g_judeccaMissingLogged & mask)) {
+		g_judeccaMissingLogged |= mask;
+		LogF("[JudeccaCutscene] scene=%d empty %s (native channel%d) -> channel66; no replacement actor", g_judeccaArmedScene, name, static_cast<int>(native));
+	}
+	return 0x42; // native actor channels are 0..0x41
+}
+
+static void QueryJudeccaCutscenePartyCount(uintptr_t context)
+{
+	g_nativePartyCount(context);
+	const float alive = *reinterpret_cast<float*>(context + 0x30);
+	const uint32_t pc = *reinterpret_cast<uint32_t*>(context + 0x28);
+	if (g_partySceneFix) {
+		if (alive != 1 && alive != 2) return;
+		const uintptr_t manager = *reinterpret_cast<uintptr_t*>(g_gameBase + 0x659E88);
+		const int current = manager ? *reinterpret_cast<int*>(manager + 0x10) : 0;
+		const int stage = manager ? *reinterpret_cast<int*>(manager + 0x48) : 0;
+		for (const auto& guard : CutscenePartyProfiles::guards) {
+			if (!CutscenePartyProfiles::Eligible(guard, pc, alive,
+				g_partySceneProfile && g_partySceneProfile->scene == g_judeccaArmedScene ? g_judeccaArmedScene : 0, current, stage)) continue;
+			uintptr_t script = 0;
+			if (!ReadSceneMemory(context + 8, &script, sizeof(script)) ||
+				!MatchSceneModule(script, guard.size, guard.pool, guard.hash)) continue;
+			const auto getModel = reinterpret_cast<int(*)(int)>(g_gameBase + 0x1C0320);
+			const int models[] = {getModel(0), getModel(1), getModel(2)};
+			if (!JudeccaCutsceneGate::CanOverride(alive, models)) return;
+			if (!guard.internal) RememberSceneParty(guard.scene, models);
+			*reinterpret_cast<float*>(context + 0x30) = 3.0f;
+			LogF("[PartySceneFix] scene%d %s guard pc=%X count=%.0f -> result3; global count unchanged",
+				guard.scene, guard.internal ? "internal" : "launch", pc, alive);
+			return;
+		}
+		return; // Unknown modules/checks retain native behavior, including count3/2/1 staging.
+	}
+	const size_t size = pc == 0x64E ? sizeof(JudeccaCutsceneGate::boss) :
+		pc == 0x203A ? sizeof(JudeccaCutsceneGate::approach) : 0;
+	if (!size) return;
+	auto read = [](uintptr_t address, void* dest, size_t bytes) {
+		SIZE_T got = 0;
+		return address && ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(address),
+			dest, bytes, &got) && got == bytes;
+	};
+	uintptr_t script = 0, code = 0, pool = 0;
+	if (!read(context + 8, &script, sizeof(script)) || !script ||
+		!read(script + 0x118, &code, sizeof(code)) || !code ||
+		!read(script + 0x150, &pool, sizeof(pool)) || !pool) return;
+	uint8_t bytes[sizeof(JudeccaCutsceneGate::approach)] = {};
+	float threshold = 0, scene = 0, secondaryZero = 0;
+	// Encoded constant operands: index2 for threshold,65/425 for scene ID.
+	const size_t sceneIndex = pc == 0x64E ? 65 : 425;
+	if (!read(code + pc - 12, bytes, size) ||
+		!read(pool + 2 * sizeof(float), &threshold, sizeof(float)) ||
+		!read(pool + sceneIndex * sizeof(float), &scene, sizeof(float)) ||
+		!read(pool + sizeof(float), &secondaryZero, sizeof(float))) return;
+	const int sceneId = JudeccaCutsceneGate::Match(pc, bytes, size, threshold, scene, secondaryZero);
+	if (!sceneId) return;
+	// A later replay with a full/changed party must not inherit an old empty mask.
+	g_judeccaArmedScene = 0;
+	g_judeccaEmptySlots = 0;
+	if (alive != 1.0f && alive != 2.0f) return;
+	const auto getModel = reinterpret_cast<int(*)(int)>(g_gameBase + 0x1C0320);
+	const int models[] = { getModel(0), getModel(1), getModel(2) };
+	if (!JudeccaCutsceneGate::CanOverride(alive, models)) {
+		LogF("[JudeccaCutscene] scene=%d not overridden: count=%.0f models=%d/%d/%d", sceneId, alive, models[0], models[1], models[2]);
+		return;
+	}
+	g_judeccaArmedScene = sceneId;
+	memcpy(g_judeccaModels, models, sizeof(models));
+	g_judeccaEmptySlots = 0;
+	for (int i = 0; i < 3; ++i) if (models[i] == -1) g_judeccaEmptySlots |= 1u << i;
+	g_judeccaMissingLogged = 0;
+	*reinterpret_cast<float*>(context + 0x30) = 3.0f;
+	LogF("[JudeccaCutscene] scene=%d allowed: count=%.0f -> result3, models=%d/%d/%d; empty slots allowed, HP/death flags untouched", sceneId, alive, models[0], models[1], models[2]);
+	DumpSceneState(); // opt-in diagnostics: preserve pre-scene HP/death flags
+}
+
+// Vajra's motion loop sleeps with CMDA(1), then polls CMD160(1,1).
+// Keep only the completion pulse that would otherwise be cleared during that
+// sleep, for at most one native 30-Hz frame. Other actors/bits are untouched.
+struct VajraCompletionPulse {
+	uintptr_t actor = 0;
+	int motion = -1;
+	uint32_t raised = 0, observed = 0;
+	bool pending = false, hasObserved = false;
+};
+static VajraCompletionPulse g_vajraPulse[0x42];
+static uint32_t g_vajraPulseWindow = 0;
+static void (*g_nativeEventQuery)(uintptr_t) = nullptr;
+
+static uintptr_t VajraActor(int ch)
+{
+	if (!g_gameBase || ch < 0 || ch >= 0x42) return 0;
+	const uintptr_t table = *reinterpret_cast<uintptr_t*>(g_gameBase + 0x667E20);
+	const uintptr_t a = table ? *reinterpret_cast<uintptr_t*>(table + 0x18 + ch * 8) : 0;
+	return a && *reinterpret_cast<uint16_t*>(a + 0x360) == 0x206A ? a : 0;
+}
+
+static VajraCompletionPulse& VajraPulseFor(int ch, uintptr_t actor)
+{
+	auto& pulse = g_vajraPulse[ch];
+	const int motion = *reinterpret_cast<int*>(actor + 0x5c8);
+	if (pulse.actor != actor || pulse.motion != motion) {
+		pulse = {};
+		pulse.actor = actor;
+		pulse.motion = motion;
+	}
+	return pulse;
+}
+
+static void CaptureVajraCompletion(uintptr_t ai)
+{
+	if (!g_scriptFrames || !(*reinterpret_cast<uint32_t*>(ai + 0x1a0) & 2)) return;
+	const int ch = *reinterpret_cast<int8_t*>(ai + 8);
+	const uintptr_t actor = VajraActor(ch);
+	if (!actor) return;
+	auto& pulse = VajraPulseFor(ch, actor);
+	const uint32_t frame = *g_scriptFrames;
+	// A native successful query in this frame already delivered this pulse.
+	if (pulse.hasObserved && pulse.observed == frame) return;
+	pulse.raised = frame;
+	pulse.pending = true;
+}
+
+static void QueryVajraCompletion(uintptr_t context)
+{
+	g_nativeEventQuery(context);
+	if (!g_scriptFrames || *reinterpret_cast<float*>(context + 0x38) != 1.0f ||
+		*reinterpret_cast<float*>(context + 0x3c) != 1.0f) return;
+	const int ch = static_cast<int>(*reinterpret_cast<float*>(context + 0x34));
+	const uintptr_t actor = VajraActor(ch);
+	if (!actor) return;
+	auto& pulse = VajraPulseFor(ch, actor);
+	const uint32_t frame = *g_scriptFrames;
+	float& result = *reinterpret_cast<float*>(context + 0x30);
+	if (result != 0.0f) {
+		pulse.observed = frame;
+		pulse.hasObserved = true;
+		pulse.pending = false;
+		return;
+	}
+	if (!pulse.pending) return;
+	pulse.pending = false;
+	if (frame - pulse.raised > g_vajraPulseWindow) return;
+	result = 1.0f;
+	pulse.observed = frame;
+	pulse.hasObserved = true;
+	LogF("[VajraEvent] recovered ch=%d motion=%d pc=%u raisedFrame=%u pollFrame=%u age=%u",
+		ch, pulse.motion, *reinterpret_cast<uint32_t*>(context + 0x28), pulse.raised, frame, frame - pulse.raised);
+}
+
+// CMD160(1,bit) readers can sleep across a one-render event pulse (animation
+// keyframe events: clip completion, landing, ...). Keep bounded history per bit
+// of the selector-1 word (+0x1a0) without changing the live AI words or
+// consuming another script's event. Only an already-polling reader may recover
+// a missed pulse. Bit 1 (motion completion) was the chapter-4 roof Vajra case;
+// bit 0 (landing) is the chapter-4 boss-arena Vajra case (2026-09-18).
+struct ScriptMotionPulse {
+	uintptr_t actor = 0;
+	uint32_t request = 0, validMask = 0;
+	int motion = -1;
+	uint32_t raised[32] = {}, sequence[32] = {};
+};
+struct ScriptMotionReader {
+	uintptr_t context = 0, script = 0, actor = 0;
+	uint32_t pc = 0, request = 0, sequence = 0, polled = 0, delivered = 0;
+	int motion = -1, bit = -1;
+	bool waiting = false, hasDelivered = false;
+};
+static ScriptMotionPulse g_scriptMotionPulses[0x42];
+// Direct-mapped collisions discard history and fall back to native behaviour.
+// No allocation or unbounded state in the game's event-clear path.
+static ScriptMotionReader g_scriptMotionReaders[1024];
+static uint32_t g_scriptMotionWindow = 0;
+// [Movement] ScriptMotionEventMask (hex, default FFFFFFFF): bits of the selector-1
+// word that may be recovered. 2 = the original completion-only behaviour.
+static uint32_t g_scriptMotionMask = 0xFFFFFFFFu;
+// [Diagnostics] TraceAiEvents=<ch>: log every non-zero selector-1 word seen at the
+// clear site for that channel (bounded), to correlate raises with script polls.
+static int g_traceAiEventChannel = -1;
+static uint32_t g_traceAiEventLines = 0, g_traceEventPollLines = 0;
+
+static uintptr_t ScriptMotionActor(int ch)
+{
+	if (!g_gameBase || ch < 0 || ch >= 0x42) return 0;
+	const uintptr_t table = *reinterpret_cast<uintptr_t*>(g_gameBase + 0x667E20);
+	return table ? *reinterpret_cast<uintptr_t*>(table + 0x18 + ch * 8) : 0;
+}
+
+static ScriptMotionPulse& ScriptMotionPulseFor(int ch, uintptr_t actor)
+{
+	auto& pulse = g_scriptMotionPulses[ch];
+	const int motion = *reinterpret_cast<int*>(actor + 0x5c8);
+	const uint32_t request = *reinterpret_cast<uint32_t*>(actor + 0x40);
+	if (pulse.actor != actor || pulse.motion != motion || pulse.request != request) {
+		pulse = {};
+		pulse.actor = actor;
+		pulse.motion = motion;
+		pulse.request = request;
+	}
+	return pulse;
+}
+
+static void CaptureScriptMotionCompletion(uintptr_t ai)
+{
+	if (!g_scriptFrames) return;
+	const uint32_t word = *reinterpret_cast<uint32_t*>(ai + 0x1a0);
+	if (!word) return;
+	const int ch = *reinterpret_cast<int8_t*>(ai + 8);
+	const uint32_t frame = *g_scriptFrames;
+	if (ch == g_traceAiEventChannel && g_traceAiEventLines < 20000) {
+		++g_traceAiEventLines;
+		LogF("[AiEvent] ch=%d frame=%u word1a0=%08X word1a8=%08X word1ac=%08X", ch, frame, word,
+			*reinterpret_cast<uint32_t*>(ai + 0x1a8), *reinterpret_cast<uint32_t*>(ai + 0x1ac));
+	}
+	const uint32_t bits = word & g_scriptMotionMask;
+	if (!bits) return;
+	const uintptr_t actor = ScriptMotionActor(ch);
+	if (!actor) return;
+	auto& pulse = ScriptMotionPulseFor(ch, actor);
+	for (uint32_t bit = 0; bit < 32; ++bit) {
+		const uint32_t m = 1u << bit;
+		if (!(bits & m)) continue;
+		if ((pulse.validMask & m) && pulse.raised[bit] == frame) continue;
+		pulse.raised[bit] = frame;
+		++pulse.sequence[bit];
+		pulse.validMask |= m;
+	}
+}
+
+static void QueryScriptMotionCompletion(uintptr_t context)
+{
+	g_nativeEventQuery(context);
+	if (!g_scriptFrames || *reinterpret_cast<float*>(context + 0x38) != 1.0f) return;
+	const float bitArg = *reinterpret_cast<float*>(context + 0x3c);
+	if (!(bitArg >= 0.0f && bitArg < 32.0f)) return;
+	const int bit = static_cast<int>(bitArg);
+	const uint32_t bitMask = 1u << bit;
+	if (!(g_scriptMotionMask & bitMask)) return;
+	const float channel = *reinterpret_cast<float*>(context + 0x34);
+	if (!(channel >= 0.0f && channel < 66.0f)) return;
+	const int ch = static_cast<int>(channel);
+	const uintptr_t actor = ScriptMotionActor(ch);
+	if (!actor) return;
+	auto& pulse = ScriptMotionPulseFor(ch, actor);
+	const uintptr_t script = *reinterpret_cast<uintptr_t*>(context + 8);
+	const uint32_t pc = *reinterpret_cast<uint32_t*>(context + 0x28);
+	if (ch == g_traceAiEventChannel && g_traceEventPollLines < 60000) {
+		// Pair with [AiEvent] raises (same frame counter) to measure poll phase vs raise length.
+		++g_traceEventPollLines;
+		LogF("[EventPoll] ch=%d frame=%u bit=%d native=%g pc=%u", ch, *g_scriptFrames, bit,
+			*reinterpret_cast<float*>(context + 0x30), pc);
+	}
+	auto& reader = g_scriptMotionReaders[((context >> 4) ^ (script >> 8) ^ pc ^ (static_cast<uint32_t>(bit) * 0x9E3779B9u)) & 1023];
+	if (reader.context != context || reader.script != script || reader.pc != pc || reader.bit != bit ||
+		reader.actor != actor || reader.motion != pulse.motion || reader.request != pulse.request) {
+		reader = {};
+		reader.context = context; reader.script = script; reader.pc = pc; reader.bit = bit;
+		reader.actor = actor; reader.motion = pulse.motion; reader.request = pulse.request;
+		reader.sequence = pulse.sequence[bit];
+	}
+	const uint32_t frame = *g_scriptFrames;
+	float& result = *reinterpret_cast<float*>(context + 0x30);
+	if (result != 0.0f) {
+		reader.waiting = false;
+		reader.hasDelivered = true;
+		reader.delivered = frame;
+		reader.sequence = pulse.sequence[bit];
+		return;
+	}
+	// Preserve read-only query semantics for repeated reads in this render.
+	if (reader.hasDelivered && reader.delivered == frame) {
+		result = 1.0f;
+		return;
+	}
+	const bool valid = (pulse.validMask & bitMask) != 0;
+	const uint32_t raised = pulse.raised[bit];
+	const bool recover = reader.waiting && valid && reader.sequence != pulse.sequence[bit] &&
+		frame - reader.polled <= g_scriptMotionWindow + 1 &&
+		frame - raised <= g_scriptMotionWindow &&
+		frame - raised <= frame - reader.polled &&
+		!(reader.hasDelivered && reader.delivered == raised);
+	reader.sequence = pulse.sequence[bit];
+	reader.polled = frame;
+	reader.waiting = !recover;
+	if (!recover) return;
+	result = 1.0f;
+	reader.hasDelivered = true;
+	reader.delivered = frame;
+	LogF("[ScriptMotionEvent] recovered ch=%d bit=%d motion=%d pc=%u request=%u raisedFrame=%u pollFrame=%u age=%u",
+		ch, bit, pulse.motion, pc, pulse.request, raised, frame, frame - raised);
+}
+
+static volatile int g_brainTraceCh = -1;
+static BrainTraceEntry g_brainRing[256];
+static volatile uint32_t g_brainHead = 0;
+static int BrainTraceHook(uintptr_t actor, int result)
+{
+	if (!actor || g_brainTraceCh < 0) return result;
+	const int ch = *reinterpret_cast<int8_t*>(actor + 0x18);
+	if (ch != g_brainTraceCh) return result;
+	BrainTraceEntry& e = g_brainRing[g_brainHead & 0xff];
+	e.frame = g_scriptFrames ? *g_scriptFrames : 0u;
+	e.ch = static_cast<uint8_t>(ch); e.result = static_cast<uint8_t>(result);
+	e.action = *reinterpret_cast<uint8_t*>(g_gameBase + 0x65866c + ch);
+	e.state = *reinterpret_cast<uint8_t*>(g_gameBase + 0x65867c + ch);
+	e.cd5f8 = *reinterpret_cast<int16_t*>(g_gameBase + 0x6585f8 + ch * 4);
+	e.cd5fa = *reinterpret_cast<int16_t*>(g_gameBase + 0x6585fa + ch * 4);
+	e.cd620 = *reinterpret_cast<int32_t*>(g_gameBase + 0x658620 + ch * 4);
+	e.cd644 = *reinterpret_cast<int16_t*>(g_gameBase + 0x658644 + ch * 2);
+	e.mode9c0 = static_cast<int16_t>(*reinterpret_cast<int32_t*>(g_gameBase + 0x6579c0));
+	e.qcount = *reinterpret_cast<uint32_t*>(actor + 0x7c0);
+	const uint32_t cap = *reinterpret_cast<uint32_t*>(actor + 0x7b8), hd = *reinterpret_cast<uint32_t*>(actor + 0x7bc);
+	e.qhead = (e.qcount && cap) ? *reinterpret_cast<uint32_t*>(actor + 0x7c4 + (hd % cap) * 0x28 + 0x24) : 0xffffffffu;
+	memset(e.pa, 0, sizeof(e.pa));
+	const uintptr_t tbl = *reinterpret_cast<uintptr_t*>(g_gameBase + 0x667E20);
+	const uintptr_t player = tbl ? *reinterpret_cast<uintptr_t*>(tbl + 0x18) : 0;
+	if (player) memcpy(e.pa, reinterpret_cast<void*>(player + 0xa08), sizeof(e.pa));
+	g_brainHead++;
+	return result;
+}
 
 // Sound-trace mode ([Diagnostics] TraceSounds=1): a hook on the game's central
 // "request sound by id" function writes every id into this ring buffer; a
@@ -248,7 +933,6 @@ static void PatchIAT(const char* funcName, void* hook, void** orig)
 // currently playing path (ptr at base+0x655EE0) is one of the opening movies.
 static uintptr_t g_introBase = 0;
 
-static uintptr_t g_gameBase = 0;
 static float g_framerate = 30.0f; //effective framerate, for diagnostics that compare fps
 static volatile uint8_t g_bootPhaseOver; // set once the first movie is reached (defined below)
 
@@ -380,14 +1064,85 @@ static void StartBootTraceWatcher()
 // undo them. Values below the Far preset (negative) are experimental.
 static int g_camFree = -9999;
 static int g_camLock = -9999;
-// Lock-on camera follow ([Camera] LockFollowPercent / LockDeadZoneDegrees): the lock-on
-// camera has NO smoothing - every frame yaw = current + clamp(angle to target) (fn
-// 0x1402f1ef0, site 0x1402f278a). The hook turns the relative angle into
-// sign(rel)*max(|rel|-deadzone,0)*gain before it is added. gain is recomputed per fps so
-// the camera catches up in the same wall-clock time at 30 and 120 (100% = stock snap).
-static int g_lockFollowX10 = 1000, g_lockDeadDeg = 0;   // follow strength in tenths of a percent (1000 = 100% = stock)
-static volatile float* g_lockGainCell = nullptr;
-static volatile float* g_lockDeadCell = nullptr;
+// (0.5.4's [Camera] LockFollowPercent / LockDeadZoneDegrees "soft follow" hook at 0x1402f278a was
+// REMOVED 2026-09-22: that yaw-commit site only runs in camera mode [0x658f48]==4, which normal
+// lock-on never enters (traced 2026-09-18), so the settings were inert. LockTurnMaxDegPerSec /
+// LockTurnDeadZoneDegrees below are the working lock-on smoothing.)
+// [Camera] LockTurnMaxDegPerSec (0 = off): the target-camera update 0x1402f1ef0 ends by
+// handing the camera mover 0x1402f0120 a look point (the locked enemy's position when
+// its flag +0x9f2 bit 0 is set). The mover turns the camera onto that point at up to
+// ~2000 deg/s in the stock game at ANY framerate (traced 2026-09-18 at 30 and 120), so
+// stepping around an adjacent enemy spins the view. Replace the point with one that
+// orbits the player no faster than this many degrees per second; height and distance
+// follow the real point directly. Live in the tuner. Not a framerate fix.
+// The camera mover ALSO reads the target's position itself (vtable +0x28 at 0x1402f0603
+// into [rbp+0x10]) and builds its framing angles from that, so the smoothed point must be
+// applied there too (SmoothLockTargetInPlace). One shared smoothed point, advanced in
+// real time (QPC) so several calls per frame do not multiply the step.
+// [Camera] LockTurnDeadZoneDegrees: the enemy may drift this far from the smoothed
+// bearing before the point starts to follow (Witcher-style loose framing).
+static volatile int g_lockTurnMaxDeg = 0;
+static volatile int g_lockTurnDeadDeg = 0;
+static float g_lockLook[3] = {};
+static bool g_lockLookValid = false;
+static LONGLONG g_lockLookTick = 0;
+static int g_lockLookCh = -1;
+static bool AdvanceLockLook(uintptr_t actor, const float* target)
+{
+	const int limit = g_lockTurnMaxDeg;
+	if (limit <= 0 || !actor || !target || !g_gameBase) { g_lockLookValid = false; return false; }
+	// Only while a target is locked ([0x658D30] = channel, -1 none); the mover also serves
+	// other target cameras. A new lock or a target switch starts from the real position,
+	// otherwise the view would first aim at a stale point ("camera slides off at lock-on").
+	const int lockT = *reinterpret_cast<volatile int*>(g_gameBase + 0x658D30);
+	if (lockT < 0 || lockT > 0x41) { g_lockLookValid = false; g_lockLookCh = -1; return false; }
+	if (lockT != g_lockLookCh) { g_lockLookValid = false; g_lockLookCh = lockT; }
+	const int mi = *reinterpret_cast<int8_t*>(actor + 0x364);
+	const uintptr_t mv = (mi >= 0 && mi < 8) ? *reinterpret_cast<uintptr_t*>(actor + 0x2D0 + mi * 0x38) : 0;
+	if (!mv) { g_lockLookValid = false; return false; }
+	LARGE_INTEGER now, freq;
+	QueryPerformanceCounter(&now); QueryPerformanceFrequency(&freq);
+	float dt = g_lockLookTick ? static_cast<float>(now.QuadPart - g_lockLookTick) / static_cast<float>(freq.QuadPart) : 0.0f;
+	g_lockLookTick = now.QuadPart;
+	if (dt < 0.0f) dt = 0.0f;
+	if (dt > 0.1f) dt = 0.1f;
+	const float px = *reinterpret_cast<float*>(mv + 0x08), pz = *reinterpret_cast<float*>(mv + 0x10);
+	const float tx = target[0] - px, tz = target[2] - pz;
+	const float radius = sqrtf(tx * tx + tz * tz);
+	const float gap = sqrtf((g_lockLook[0] - target[0]) * (g_lockLook[0] - target[0]) + (g_lockLook[2] - target[2]) * (g_lockLook[2] - target[2]));
+	if (!g_lockLookValid || radius < 1.0f || gap > 3.0f * radius + 3000.0f) {
+		g_lockLook[0] = target[0]; g_lockLook[1] = target[1]; g_lockLook[2] = target[2];
+		g_lockLookValid = true;
+		return true;
+	}
+	float aS = atan2f(g_lockLook[0] - px, g_lockLook[2] - pz);
+	float d = atan2f(tx, tz) - aS;
+	while (d > 3.14159265f) d -= 6.2831853f;
+	while (d < -3.14159265f) d += 6.2831853f;
+	// Loose framing: inside the zone the camera still re-centres the enemy, but at a
+	// quarter of the limit (a hard stop left the enemy parked off-centre); outside
+	// it turns at the full limit.
+	int deadDeg = g_lockTurnDeadDeg; if (deadDeg < 0) deadDeg = 0; if (deadDeg > 60) deadDeg = 60;
+	const float dead = static_cast<float>(deadDeg) * (3.14159265f / 180.0f);
+	const float ad = d < 0.0f ? -d : d;
+	float step = static_cast<float>(limit) * (3.14159265f / 180.0f) * dt;
+	if (ad <= dead) step *= 0.25f;
+	if (d > step) d = step; else if (d < -step) d = -step;
+	aS += d;
+	g_lockLook[0] = px + sinf(aS) * radius;
+	g_lockLook[1] = target[1];
+	g_lockLook[2] = pz + cosf(aS) * radius;
+	return true;
+}
+static float* SmoothLockLookTarget(uintptr_t actor, float* target)
+{
+	return AdvanceLockLook(actor, target) ? g_lockLook : target;
+}
+static void SmoothLockTargetInPlace(float* buf, uintptr_t actor)
+{
+	if (!AdvanceLockLook(actor, buf)) return;
+	buf[0] = g_lockLook[0]; buf[1] = g_lockLook[1]; buf[2] = g_lockLook[2];
+}
 static int g_padTurnPct = -1;
 static int g_mouseTurnPct = -1;
 static int g_vertTurnPct = -1; // vertical axis multiplier at base+0x611C8C, shared by pad and mouse
@@ -445,7 +1200,7 @@ static void StartPitchTraceWatcher()
 // movement speed. Logs the left stick, the controlled character's current
 // mover speed, the walk-toggle tier counter (its holder object is captured
 // by a hook on the L3 handler), and any change in the static per-player
-// control-state block at base+0x658CE0..0x658D80. The 3-minute window starts
+// control-state block at base+0x658CE0..0x658D80. The 15-minute window starts
 // only once the player actor exists (i.e. after a save is loaded).
 // Protocol: stand still; tilt the left stick slightly and hold; tilt fully
 // and hold; then press L3 and move at each of the three speed tiers.
@@ -456,6 +1211,28 @@ static volatile uint8_t* g_spdRing = nullptr;
 static bool g_dashAtCap = true;
 static int g_stickSat = 85;
 static volatile uint32_t g_applyCount = 0; // analog watcher applySpeed calls (TraceMove)
+static volatile uint32_t* g_mpRestoreCalls = nullptr; // candidate ability grant checks, all party targets
+
+// An effect counter is held constant between native ticks. Consume each eligible
+// value on first observation, rather than waiting for the next global beat and
+// potentially losing its final grant when the gauge empties. The effect address
+// separates concurrent effects; owner/request identity handles pool-slot reuse.
+static bool ConsumeMpRegenCounter(uintptr_t effect, uintptr_t owner)
+{
+	struct GrantState { uintptr_t owner; uint32_t request; int16_t counter; uint16_t action; };
+	static std::unordered_map<uintptr_t, GrantState> states;
+	const GrantState current = { owner, *reinterpret_cast<uint32_t*>(owner + 0x40),
+		*reinterpret_cast<int16_t*>(effect + 0x86), *reinterpret_cast<uint16_t*>(effect + 4) };
+	const auto found = states.find(effect);
+	if (found != states.end()) {
+		const auto& last = found->second;
+		if (last.owner == current.owner && last.request == current.request &&
+			last.counter == current.counter && last.action == current.action) return false;
+		found->second = current;
+	}
+	else states.emplace(effect, current);
+	return true;
+}
 // The character the player is actually steering. NOT [0x658CF4] (that stays at the
 // original leader's channel across in-field character switches - traced): the game's own
 // L3 handler 0x140273d10 takes slot = [0x740598] (when [0x74126D] or [0x740940] is set,
@@ -475,6 +1252,203 @@ static int ReadControlledChannel()
 	return ch;
 }
 static volatile uint32_t* g_spLog = nullptr;  // speed-param write ring: [0]=seq, entries of 24 bytes at +8: param,value,chan,pc
+
+// [Effects] AnimQuatAlignFix: quaternion hemisphere alignment after EVERY cursor move of the pose sampler
+// 0x1403BEB50 (the game's 0x1403BEA50 runs only after a rewind of a flag-4 layer). Layer = [sampler+0];
+// bones: count word [[layer]+0x44C], tracks [layer+0x18] + 0x370 + b*0x268, quaternion x/y/z/w = tracks
+// 0..3 (0x58 apart), cur (key at the cursor, the decoder's accumulator) at +0x42, prev at +0x44. Only
+// prev is touched (a lerp input the decoder overwrites on the next key). Unlike the game's 16-bit neg,
+// -32768 saturates to 32767, so a pair like w = -32768 / +32767 is fixed too.
+static volatile uint32_t g_quatAlignCalls = 0, g_quatAlignFlips = 0, g_quatAlignSat = 0;
+static volatile uint32_t g_quatAlignLogged = 0;
+static bool g_quatAlignCallHooked = false; // the rewind-path hook is in place (AnimLoopSeamFix not needed)
+static bool g_traceQuatAlign = false;      // [Diagnostics] TraceQuatAlign: log flips (file I/O on the game thread)
+static void AlignLayerQuats(uintptr_t layer)
+{
+	++g_quatAlignCalls;
+	const uintptr_t container = *reinterpret_cast<uintptr_t*>(layer);
+	const uintptr_t tracks = *reinterpret_cast<uintptr_t*>(layer + 0x18);
+	if (!container || !tracks)
+		return;
+	const int bones = *reinterpret_cast<int16_t*>(container + 0x44C);
+	for (int b = 0; b < bones; ++b)
+	{
+		const uintptr_t t = tracks + 0x370 + static_cast<uintptr_t>(b) * 0x268;
+		int16_t* prev[4];
+		int16_t cur[4];
+		int64_t dot = 0;
+		for (int c = 0; c < 4; ++c)
+		{
+			prev[c] = reinterpret_cast<int16_t*>(t + c * 0x58 + 0x44);
+			cur[c] = *reinterpret_cast<int16_t*>(t + c * 0x58 + 0x42);
+			dot += static_cast<int64_t>(*prev[c]) * cur[c];
+		}
+		if (dot >= 0)
+			continue;
+		bool sat = false;
+		int16_t before[4];
+		for (int c = 0; c < 4; ++c)
+		{
+			before[c] = *prev[c];
+			sat |= before[c] == INT16_MIN;
+			*prev[c] = before[c] == INT16_MIN ? INT16_MAX : static_cast<int16_t>(-before[c]);
+		}
+		const uint32_t flips = ++g_quatAlignFlips;
+		if (sat)
+			++g_quatAlignSat;
+		if (g_traceQuatAlign && (g_quatAlignLogged < 40 || (flips & 0x3FFF) == 0))
+		{
+			++g_quatAlignLogged;
+			LogF("[QuatAlign] t=%llu flips=%u sat=%u calls=%u container=%llX layer=%d bone=%d/%d frame=%.3f clip=%llX prev=(%d,%d,%d,%d) cur=(%d,%d,%d,%d)",
+				GetTickCount64(), flips, g_quatAlignSat, g_quatAlignCalls, static_cast<unsigned long long>(container),
+				static_cast<int>((layer - container - 8) / 0xD8), b, bones, *reinterpret_cast<int32_t*>(layer + 0x6C) / 256.0,
+				static_cast<unsigned long long>(*reinterpret_cast<uintptr_t*>(layer + 8)),
+				before[0], before[1], before[2], before[3], cur[0], cur[1], cur[2], cur[3]);
+		}
+	}
+}
+
+// The dodge-input dispatcher consumes a script permission on the NEXT frame.
+// Retain that native 30 Hz reaction delay, without delaying initial dodges or
+// gating movement/the VM. CMD17F publishes AI flag 0x4000; 2d9af0 consumes it.
+static uint32_t g_dodgeReadyDelay = 0;
+static bool DelayDodgePermission(uintptr_t actor, uintptr_t ai)
+{
+	struct ReadyState { uintptr_t actor; uint32_t request, firstFrame; bool seen; };
+	static ReadyState states[3] = {};
+	const int ch = *reinterpret_cast<int8_t*>(actor + 0x18);
+	if (ch < 0 || ch >= 3 || !g_scriptFrames) return false;
+	auto& state = states[ch];
+	const int capacity = *reinterpret_cast<int*>(actor + 0x7b8);
+	const int count = *reinterpret_cast<int*>(actor + 0x7c0);
+	const uint32_t head = *reinterpret_cast<uint32_t*>(actor + 0x7bc);
+	const uintptr_t entry = capacity > 0 && count > 0 ? actor + 0x7c4 + (head % capacity) * 0x28 : 0;
+	if (ch != ReadControlledChannel() || *reinterpret_cast<int*>(g_gameBase + 0x658f70) != 0 ||
+		*reinterpret_cast<uint8_t*>(actor + 0x965) != 0 || !entry ||
+		*reinterpret_cast<uint16_t*>(entry + 4) != 0x5001 ||
+		(*reinterpret_cast<uint32_t*>(ai + 0x48) & 0x4000) == 0)
+	{
+		state.seen = false;
+		return false;
+	}
+	const uint32_t frame = *g_scriptFrames;
+	const uint32_t request = *reinterpret_cast<uint32_t*>(actor + 0x40);
+	if (!state.seen || state.actor != actor || state.request != request) {
+		state = { actor, request, frame, true };
+	}
+	return frame - state.firstFrame < g_dodgeReadyDelay;
+}
+
+// Exact command-time telemetry: the older [Param] timestamps belong to the
+// watcher's 100 ms drain, not to the writes. Wrap the VM table entries so no
+// instruction relocation or gameplay timing changes are needed (also at 30 FPS).
+using MoveCommand = void (*)(uintptr_t);
+static MoveCommand g_moveMotionCommand = nullptr, g_moveCancelCommand = nullptr, g_moveFinishedCommand = nullptr;
+struct MoveCommandEntry {
+	double ms;
+	int ch, phase, motion, result;
+	float counter, x, z, motionRate, actorRate;
+	uint8_t stance;
+	int animFrame, animFlags, queueCount, liveMotion;
+	float animLength, animRate;
+};
+static MoveCommandEntry g_moveCommandRing[128];
+static uint32_t g_moveCommandHead = 0, g_moveCommandSeen = 0;
+static SRWLOCK g_moveCommandLock = SRWLOCK_INIT;
+static LARGE_INTEGER g_moveCommandClock, g_moveCommandFrequency;
+static int g_moveCommandMotion[0x42] = {};
+static bool g_moveCommandActive[0x42] = {};
+
+static void RecordMoveCommand(uintptr_t context, int phase, int motion, int result)
+{
+	const int ch = static_cast<int>(*reinterpret_cast<float*>(context + 0x34));
+	if (ch < 0 || ch >= 0x42 || ch != ReadControlledChannel()) return;
+	if (phase >= 4 && !g_moveCommandActive[ch]) return;
+	const uintptr_t table = *reinterpret_cast<uintptr_t*>(g_gameBase + 0x667E20);
+	const uintptr_t actor = table ? *reinterpret_cast<uintptr_t*>(table + 0x18 + ch * 8) : 0;
+	if (!actor) return;
+	if (phase == 0) {
+		g_moveCommandMotion[ch] = motion;
+		g_moveCommandActive[ch] = true;
+	}
+	if (phase == 3 || phase == 5) g_moveCommandActive[ch] = false;
+	MoveCommandEntry e = {};
+	LARGE_INTEGER tick;
+	QueryPerformanceCounter(&tick);
+	e.ms = (tick.QuadPart - g_moveCommandClock.QuadPart) * 1000.0 / g_moveCommandFrequency.QuadPart;
+	e.ch = ch; e.phase = phase; e.motion = g_moveCommandMotion[ch]; e.result = result;
+	e.counter = phase >= 3 ? -1.0f : *reinterpret_cast<float*>(context + 0x4c);
+	e.queueCount = *reinterpret_cast<int*>(actor + 0x6d0);
+	e.liveMotion = *reinterpret_cast<int*>(actor + 0x5c8);
+	e.animFrame = -1;
+	e.stance = *reinterpret_cast<uint8_t*>(actor + 0x6b8);
+	e.motionRate = *reinterpret_cast<float*>(actor + 0x5d4);
+	e.actorRate = *reinterpret_cast<float*>(actor + 0x5d8);
+	const int mi = *reinterpret_cast<int8_t*>(actor + 0x364);
+	const uintptr_t mover = mi >= 0 && mi < 8 ? *reinterpret_cast<uintptr_t*>(actor + 0x2d0 + mi * 0x38) : 0;
+	if (mover) {
+		e.x = *reinterpret_cast<float*>(mover + 0x08);
+		e.z = *reinterpret_cast<float*>(mover + 0x10);
+		// Mover's animation container is +0x590 (3addf0: this+0x4e0,
+		// where this=mover+0xb0); layer 0 starts at container+8. Validate
+		// the layer backpointer and owner before interpreting its fields.
+		const uintptr_t container = mover + 0x590, layer = container + 8;
+		if (*reinterpret_cast<uintptr_t*>(layer) == container &&
+			*reinterpret_cast<uintptr_t*>(container + 0x478) == actor) {
+			e.animFrame = *reinterpret_cast<int*>(layer + 0x6c);
+			e.animFlags = *reinterpret_cast<int*>(layer + 0x84);
+			e.animLength = *reinterpret_cast<float*>(layer + 0x7c);
+			e.animRate = *reinterpret_cast<float*>(layer + 0x74);
+		}
+	}
+	AcquireSRWLockExclusive(&g_moveCommandLock);
+	g_moveCommandRing[g_moveCommandHead++ & 127] = e;
+	ReleaseSRWLockExclusive(&g_moveCommandLock);
+}
+
+static void MoveMotionCommandTrace(uintptr_t context)
+{
+	if (*reinterpret_cast<float*>(context + 0x4c) == 0.0f)
+		RecordMoveCommand(context, 0, static_cast<int>(*reinterpret_cast<float*>(context + 0x38)), 0);
+	g_moveMotionCommand(context);
+	RecordMoveCommand(context, *reinterpret_cast<uint8_t*>(context + 0x2c) ? 1 : 2, 0, 0);
+}
+
+static void MoveCancelCommandTrace(uintptr_t context)
+{
+	g_moveCancelCommand(context);
+	const int result = static_cast<int>(*reinterpret_cast<float*>(context + 0x30));
+	if (result > 0) RecordMoveCommand(context, 3, 0, result);
+}
+
+static void MoveFinishedCommandTrace(uintptr_t context)
+{
+	g_moveFinishedCommand(context);
+	const int result = static_cast<int>(*reinterpret_cast<float*>(context + 0x30));
+	RecordMoveCommand(context, result > 0 ? 5 : 4, 0, result);
+}
+
+static void DrainMoveCommands()
+{
+	MoveCommandEntry entries[128];
+	uint32_t count = 0, dropped = 0;
+	AcquireSRWLockExclusive(&g_moveCommandLock);
+	if (g_moveCommandHead - g_moveCommandSeen > 128) {
+		dropped = g_moveCommandHead - g_moveCommandSeen - 128;
+		g_moveCommandSeen = g_moveCommandHead - 128;
+	}
+	while (g_moveCommandSeen != g_moveCommandHead)
+		entries[count++] = g_moveCommandRing[g_moveCommandSeen++ & 127];
+	ReleaseSRWLockExclusive(&g_moveCommandLock);
+	if (dropped) LogF("[MoveCmd] dropped=%u", dropped);
+	const char* phases[] = { "request", "wait", "start", "cancel", "poll", "finished" };
+	for (uint32_t i = 0; i < count; ++i) {
+		const auto& e = entries[i];
+		LogF("[MoveCmd %.3f] ch=%d phase=%s motion=%d result=%d counter=%.3f pos=%.3f,%.3f f6b8=%02X motionRate=%.6f actorRate=%.6f animFrame=%d animLength=%.3f animRate=%.6f animFlags=%X queue=%d liveMotion=%d",
+			e.ms, e.ch, phases[e.phase], e.motion, e.result, e.counter, e.x, e.z, e.stance, e.motionRate, e.actorRate,
+			e.animFrame, e.animLength, e.animRate, e.animFlags, e.queueCount, e.liveMotion);
+	}
+}
 static volatile uint32_t* g_spdHead = nullptr;
 
 // Battle event-script "move actor" telemetry ([Diagnostics] TraceScriptMove=1).
@@ -524,19 +1498,27 @@ static volatile uint32_t* g_chkCells[9] = {};
 // every instruction writing it. Names the code that raises the "attack now" event bit
 // (bit 1) that General Qator Bashtar's idle loop waits on and that stops arriving at 120fps.
 static bool g_watchAiEvent = false;
-static volatile uint32_t g_hwHitRip[64];
+static volatile uint32_t g_hwHitRip[64];   // RVA when inside the exe (rip - g_gameBase), else low 32 bits of rip
 static volatile uint32_t g_hwHitCnt[64];
 static volatile uint32_t g_hwHitVal[64];
+static volatile uint32_t g_hwHitRet[64];   // first return address on the stack ([rsp]) as exe RVA, if inside the exe
 static LONG CALLBACK HwWatchVEH(PEXCEPTION_POINTERS ep)
 {
 	if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_SINGLE_STEP && (ep->ContextRecord->Dr6 & 1))
 	{
-		const uint32_t rip = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(ep->ExceptionRecord->ExceptionAddress));
+		const uintptr_t ripFull = reinterpret_cast<uintptr_t>(ep->ExceptionRecord->ExceptionAddress);
+		const uint32_t rip = (g_gameBase && ripFull >= g_gameBase && ripFull < g_gameBase + 0xB00000) ? static_cast<uint32_t>(ripFull - g_gameBase) : static_cast<uint32_t>(ripFull);
 		const uint32_t val = *reinterpret_cast<volatile uint32_t*>(static_cast<uintptr_t>(ep->ContextRecord->Dr0));
+		uint32_t ret = 0;
+		for (int k = 0; k < 8; k++)
+		{
+			const uintptr_t v = *reinterpret_cast<volatile uintptr_t*>(ep->ContextRecord->Rsp + k * 8);
+			if (g_gameBase && v >= g_gameBase && v < g_gameBase + 0xB00000) { ret = static_cast<uint32_t>(v - g_gameBase); break; }
+		}
 		for (int i = 0; i < 64; i++)
 		{
 			if (g_hwHitRip[i] == rip) { g_hwHitCnt[i]++; g_hwHitVal[i] = val; break; }
-			if (g_hwHitRip[i] == 0) { g_hwHitRip[i] = rip; g_hwHitCnt[i] = 1; g_hwHitVal[i] = val; break; }
+			if (g_hwHitRip[i] == 0) { g_hwHitRip[i] = rip; g_hwHitCnt[i] = 1; g_hwHitVal[i] = val; g_hwHitRet[i] = ret; break; }
 		}
 		ep->ContextRecord->Dr6 = 0;
 		ep->ContextRecord->EFlags |= 0x10000; // RF
@@ -582,7 +1564,7 @@ static void ArmHwWatch(uintptr_t addr)
 				const uint32_t rip = g_hwHitRip[i];
 				if (!rip) break;
 				const uint32_t c = g_hwHitCnt[i];
-				if (c != seen[i]) { LogF("[HwWatch] writer rip=%X hits=%u lastval=%X", rip, c, g_hwHitVal[i]); seen[i] = c; }
+				if (c != seen[i]) { LogF("[HwWatch] writer exe+%X (stack ret exe+%X) hits=%u lastval=%X", rip, g_hwHitRet[i], c, g_hwHitVal[i]); seen[i] = c; }
 			}
 		}
 	}).detach();
@@ -634,7 +1616,7 @@ static void StartCombatTraceWatcher()
 		const ULONGLONG t0 = GetTickCount64();
 		uintptr_t prevActor = 0; uint32_t prevHp = 0;
 		uint32_t minHits = 0, minDmg = 0, totHits = 0, totDmg = 0; ULONGLONG lastSum = 0;
-		while (GetTickCount64() - t0 < 900000)
+		while (GetTickCount64() - t0 < g_traceMs)
 		{
 			Sleep(50);
 			const ULONGLONG now = GetTickCount64() - t0;
@@ -663,7 +1645,13 @@ static void StartCombatTraceWatcher()
 	}).detach();
 }
 
-static void StartBossPosTraceWatcher()
+// [Diagnostics] TraceActorTimers=1 (2026-10-31, audit of per-render actor counters): byte [actor+0x5E6] hit-freeze
+// (set 2 at 0x1401964EF, 10 at 0x14029AAB9; while > 0 the motion queue step is skipped), byte [+0x9A9] no-hit-reaction
+// (10 at 0x140198695 TakeDamage), byte [+0x9B8] invulnerability (10 at 0x14025CB82, 30 at 0x14025F112), all decremented
+// once per RENDERED frame in the resource update 0x1401A0EE0, i.e. they last 30/fps of their native time above 30 fps.
+// A 1 ms sampler (high-resolution waitable timer) logs every episode of every actor: start value and the time to reach
+// 0. Native: 33.3 ms per unit; 16.7 at 60; 8.3 at 120. Read-only; compare the same fight at 30 and 60.
+static void StartActorTimerTraceWatcher()
 {
 	if (!g_logEnabled || !g_gameBase)
 		return;
@@ -677,7 +1665,196 @@ static void StartBossPosTraceWatcher()
 				break;
 			Sleep(200);
 		}
-		LogF("[BossPos] armed at framerate=%.0f", g_framerate);
+		HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, 0x00000002 /*CREATE_WAITABLE_TIMER_HIGH_RESOLUTION*/, TIMER_ALL_ACCESS);
+		LogF("[ActorTimer] armed at framerate=%.0f, 1 ms sampler (%s): bytes +5E6 hit-freeze, +9A9 no-hit-reaction, +9B8 invulnerable",
+			g_framerate, timer ? "high-resolution timer" : "Sleep(1)");
+		LARGE_INTEGER qpf; QueryPerformanceFrequency(&qpf);
+		struct Ep { uintptr_t actor; uint8_t last[3]; uint8_t startVal[3]; LONGLONG start[3]; };
+		static Ep ep[0x42] = {};
+		static const uint16_t offs[3] = { 0x5E6, 0x9A9, 0x9B8 };
+		static const char* names[3] = { "5E6 hit-freeze", "9A9 no-hit-react", "9B8 invuln" };
+		uint32_t count[2][3] = {}; double sumPerUnit[2][3] = {};   // [0] = party classes 0x00xx, [1] = enemies 0x20xx
+		const ULONGLONG t0 = GetTickCount64();
+		ULONGLONG lastSummary = t0;
+		while (GetTickCount64() - t0 < g_traceMs) {
+			if (timer) { LARGE_INTEGER due; due.QuadPart = -10000; SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE); WaitForSingleObject(timer, 5); }
+			else Sleep(1);
+			LARGE_INTEGER qpc; QueryPerformanceCounter(&qpc);
+			const ULONGLONG now = GetTickCount64();
+			const uintptr_t tbl = *reinterpret_cast<volatile uintptr_t*>(g_gameBase + 0x667E20);
+			if (!tbl) continue;
+			for (int ch = 0; ch <= 0x41; ch++) {
+				Ep& e = ep[ch];
+				const uintptr_t a = *reinterpret_cast<volatile uintptr_t*>(tbl + ch * 8 + 0x18);
+				if (a != e.actor) { e.actor = a; for (int i = 0; i < 3; i++) { e.last[i] = 0; e.startVal[i] = 0; } }
+				if (!a) continue;
+				const uint16_t cls = *reinterpret_cast<volatile uint16_t*>(a + 0x360);
+				for (int i = 0; i < 3; i++) {
+					const uint8_t v = *reinterpret_cast<volatile uint8_t*>(a + offs[i]);
+					if (v > e.last[i]) { e.startVal[i] = v; e.start[i] = qpc.QuadPart; }   // (re)armed
+					else if (!v && e.last[i]) {
+						const double ms = (qpc.QuadPart - e.start[i]) * 1000.0 / qpf.QuadPart;
+						const int side = (cls & 0xFF00) == 0x2000 ? 1 : 0;
+						if (e.startVal[i]) { count[side][i]++; sumPerUnit[side][i] += ms / e.startVal[i]; }
+						LogF("[ActorTimer +%llus] ch=%d class=%04X %s: %u -> 0 in %.1f ms (%.1f ms per unit, native 33.3)",
+							(now - t0) / 1000ULL, ch, cls, names[i], e.startVal[i], ms, e.startVal[i] ? ms / e.startVal[i] : 0.0);
+					}
+					e.last[i] = v;
+				}
+			}
+			if (now - lastSummary >= 30000) {
+				lastSummary = now;
+				char line[512]; int n = 0;
+				for (int side = 0; side < 2; side++)
+					for (int i = 0; i < 3; i++)
+						if (count[side][i]) n += snprintf(line + n, sizeof(line) - n, " %s/%s: %u episodes, %.1f ms per unit;", side ? "enemy" : "party", names[i], count[side][i], sumPerUnit[side][i] / count[side][i]);
+				if (n) LogF("[ActorTimer +%llus] summary:%s", (now - t0) / 1000ULL, line);
+			}
+		}
+		if (timer) CloseHandle(timer);
+		LogF("[ActorTimer] trace window over");
+	}).detach();
+}
+
+// [Diagnostics] TraceEnemySpeed=1 (2026-10-31, Nexus report "game occasionally speeds up, mostly enemies",
+// Togoreth Stronghold at 60 fps): sample every mover of every channel at 50 ms and log each burst of horizontal
+// speed above TraceEnemySpeedMin units/s (default 60; the party runs 26 at tier 1 and 52 at tier 3) when it
+// ends: channel, class, peak and mean speed, distance, duration, motion factor [+0x5D4], clip [+0x5C8], HP.
+// The same enemies at 30 and 60 fps should give the same peaks; a difference points at the bug. Read-only.
+// Same evening: the body yaw (mover+0x6C; the first build read the move direction +0x58/+0x60, which only equals the
+// facing while standing) is tracked too and every turn burst above TraceEnemyTurnMin deg/s
+// (default 120) is logged as [EnemyTurn] with peak/mean rate and total degrees: EnemyTurnFullRate steps enemy turn
+// profiles 1.0 per render, so a scripted enemy turn would be fps/30 x faster above 30 fps if that path is live.
+// Later the same night: [EnemyVert] bursts of vertical speed above TraceEnemyVertMin u/s (default 150; upstream scales
+// only the X/Z mover delta, so falls, jumps and hover of every actor may run fps/30 x fast), and the actor/mover
+// disappearance and warp lines. Companion sampler: TraceActorTimers (see StartActorTimerTraceWatcher).
+static void StartEnemySpeedTraceWatcher(int minSpeed, int minTurn, int minVert)
+{
+	if (!g_logEnabled || !g_gameBase)
+		return;
+	std::thread([minSpeed, minTurn, minVert] {
+		const ULONGLONG armDeadline = GetTickCount64() + 15 * 60000ULL;
+		for (;;) {
+			if (GetTickCount64() > armDeadline) return;
+			const int pc = *reinterpret_cast<volatile int*>(g_gameBase + 0x658CF4);
+			const uintptr_t tbl = *reinterpret_cast<volatile uintptr_t*>(g_gameBase + 0x667E20);
+			if (tbl && pc >= 0 && pc <= 0x41 && *reinterpret_cast<volatile uintptr_t*>(tbl + pc * 8 + 0x18))
+				break;
+			Sleep(200);
+		}
+		LogF("[EnemySpeed] armed at framerate=%.0f, bursts above %d units/s, turns above %d deg/s, vertical above %d u/s", g_framerate, minSpeed, minTurn, minVert);
+		const auto rf = [](uintptr_t a) -> float { return *reinterpret_cast<volatile float*>(a); };
+		struct Track { uintptr_t mover; float x, z; ULONGLONG t; bool in; ULONGLONG start; float peak, dist, startX, startZ; int samples; float factorAtPeak; uint16_t clipAtPeak; float yaw; bool tin; ULONGLONG tstart; float tpeak, tdeg, tdur, tfactor; uint16_t tclip; float y; uint16_t cls, clip; uint32_t hp, hpMax; bool vin; ULONGLONG vstart; float vpeak, vup, vdown, vdur; uint16_t vclip; };
+		static Track tr[0x42] = {};
+		float chMax[0x42] = {}; float chTurnMax[0x42] = {}; float chVertMax[0x42] = {};
+		const ULONGLONG t0 = GetTickCount64();
+		ULONGLONG lastSummary = t0;
+		while (GetTickCount64() - t0 < g_traceMs) {
+			Sleep(50);
+			const ULONGLONG now = GetTickCount64();
+			const uintptr_t tbl = *reinterpret_cast<volatile uintptr_t*>(g_gameBase + 0x667E20);
+			if (!tbl) continue;
+			for (int ch = 0; ch <= 0x41; ch++) {
+				Track& k = tr[ch];
+				const uintptr_t a = *reinterpret_cast<volatile uintptr_t*>(tbl + ch * 8 + 0x18);
+				const int mi = a ? *reinterpret_cast<volatile signed char*>(a + 0x364) : -1;
+				const uintptr_t mv = (a && mi >= 0 && mi < 8) ? *reinterpret_cast<volatile uintptr_t*>(a + 0x2D0 + mi * 0x38) : 0;
+				if (!mv) {
+					if (k.mover && k.hp)   // a live actor lost its mover or was removed: where was it?
+						LogF("[EnemySpeed +%llus] ch=%d class=%04X gone: last (%.0f,%.0f,%.0f) hp=%u/%u clip=%u%s", (now - t0) / 1000ULL, ch, k.cls,
+							k.x, k.y, k.z, k.hp, k.hpMax, k.clip, a ? " (actor kept, mover lost)" : " (actor removed)");
+					k.mover = 0; k.in = false; k.tin = false; k.vin = false; continue;
+				}
+				k.cls = *reinterpret_cast<volatile uint16_t*>(a + 0x360); k.clip = *reinterpret_cast<volatile uint16_t*>(a + 0x5C8);
+				k.hp = *reinterpret_cast<volatile uint32_t*>(a + 0x934); k.hpMax = *reinterpret_cast<volatile uint32_t*>(a + 0x938);
+				const float x = rf(mv + 0x08), y = rf(mv + 0x0c), z = rf(mv + 0x10);
+				const float yaw = rf(mv + 0x6C) * 57.29578f;   // body yaw (mover+0x6C, radians, written by SetYaw 0x1401B8770) -> degrees
+				if (k.mover != mv || now - k.t > 500) { k.mover = mv; k.x = x; k.y = y; k.z = z; k.yaw = yaw; k.t = now; k.in = false; k.tin = false; k.vin = false; continue; }
+				const float dt = (now - k.t) / 1000.0f;
+				const float d = sqrtf((x - k.x) * (x - k.x) + (z - k.z) * (z - k.z));
+				const float v = dt > 0 ? d / dt : 0;
+				float dyaw = yaw - k.yaw; if (dyaw > 180.0f) dyaw -= 360.0f; else if (dyaw < -180.0f) dyaw += 360.0f;
+				const float w = dt > 0 ? fabsf(dyaw) / dt : 0;   // turn rate, deg/s
+				const float dy = y - k.y;
+				k.x = x; k.y = y; k.z = z; k.yaw = yaw; k.t = now;
+				if (v > 2000.0f || fabsf(dy) > 1500.0f) {   // teleport / scene change: log it, do not count it as a burst
+					LogF("[EnemySpeed +%llus] ch=%d class=%04X warp: %.0f u, %+.0f up in %.2f s to (%.0f,%.0f,%.0f) hp=%u/%u clip=%u", (now - t0) / 1000ULL, ch, k.cls,
+						d, dy, dt, x, y, z, k.hp, k.hpMax, k.clip);
+					k.in = false; k.tin = false; k.vin = false; continue;
+				}
+				const float vy = dt > 0 ? fabsf(dy) / dt : 0;   // vertical speed, u/s
+				if (vy > chVertMax[ch]) chVertMax[ch] = vy;
+				if (vy >= minVert) {
+					if (!k.vin) { k.vin = true; k.vstart = now; k.vpeak = 0; k.vup = 0; k.vdown = 0; k.vdur = 0; }
+					if (dy > 0) k.vup += dy; else k.vdown -= dy;
+					k.vdur += dt;
+					if (vy > k.vpeak) { k.vpeak = vy; k.vclip = k.clip; }
+				} else if (k.vin) {
+					k.vin = false;
+					LogF("[EnemyVert +%llus] ch=%d class=%04X vertical: peak %.0f u/s, up %.0f down %.0f in %.2f s, clip=%u hp=%u/%u at (%.0f,%.0f,%.0f)",
+						(now - t0) / 1000ULL, ch, k.cls, k.vpeak, k.vup, k.vdown, k.vdur, k.vclip, k.hp, k.hpMax, x, y, z);
+				}
+				if (w > chTurnMax[ch]) chTurnMax[ch] = w;
+				if (w >= minTurn) {
+					if (!k.tin) { k.tin = true; k.tstart = now; k.tpeak = 0; k.tdeg = 0; k.tdur = 0; }
+					k.tdeg += fabsf(dyaw); k.tdur += dt;
+					if (w > k.tpeak) { k.tpeak = w; k.tfactor = rf(a + 0x5D4); k.tclip = *reinterpret_cast<volatile uint16_t*>(a + 0x5C8); }
+				} else if (k.tin) {
+					k.tin = false;
+					LogF("[EnemyTurn +%llus] ch=%d class=%04X turn: peak %.0f deg/s, %.0f deg in %.2f s (mean %.0f deg/s), factor x%.2f clip=%u hp=%u/%u",
+						(now - t0) / 1000ULL, ch, *reinterpret_cast<volatile uint16_t*>(a + 0x360), k.tpeak, k.tdeg, k.tdur,
+						k.tdur > 0 ? k.tdeg / k.tdur : 0.f, k.tfactor, k.tclip,
+						*reinterpret_cast<volatile uint32_t*>(a + 0x934), *reinterpret_cast<volatile uint32_t*>(a + 0x938));
+				}
+				if (v > chMax[ch]) chMax[ch] = v;
+				if (v >= minSpeed) {
+					if (!k.in) { k.in = true; k.start = now; k.peak = 0; k.dist = 0; k.samples = 0; k.startX = x; k.startZ = z; }
+					k.dist += d; k.samples++;
+					if (v > k.peak) { k.peak = v; k.factorAtPeak = rf(a + 0x5D4); k.clipAtPeak = *reinterpret_cast<volatile uint16_t*>(a + 0x5C8); }
+				} else if (k.in) {
+					k.in = false;
+					const float dur = (now - k.start) / 1000.0f;
+					LogF("[EnemySpeed +%llus] ch=%d class=%04X burst: peak %.0f u/s, mean %.0f u/s, %.0f units in %.2f s, factor x%.2f clip=%u hp=%u/%u from (%.0f,%.0f)",
+						(now - t0) / 1000ULL, ch, *reinterpret_cast<volatile uint16_t*>(a + 0x360), k.peak,
+						dur > 0 ? k.dist / dur : 0.f, k.dist, dur, k.factorAtPeak, k.clipAtPeak,
+						*reinterpret_cast<volatile uint32_t*>(a + 0x934), *reinterpret_cast<volatile uint32_t*>(a + 0x938), k.startX, k.startZ);
+				}
+			}
+			if (now - lastSummary >= 30000) {
+				lastSummary = now;
+				char line[1024]; int n = 0;
+				for (int ch = 0; ch <= 0x41 && n < 900; ch++)
+					if (chMax[ch] >= minSpeed) n += snprintf(line + n, sizeof(line) - n, " ch%d=%.0f", ch, chMax[ch]);
+				if (n) LogF("[EnemySpeed +%llus] max u/s so far:%s", (now - t0) / 1000ULL, line);
+				n = 0;
+				for (int ch = 0; ch <= 0x41 && n < 900; ch++)
+					if (chTurnMax[ch] >= minTurn) n += snprintf(line + n, sizeof(line) - n, " ch%d=%.0f", ch, chTurnMax[ch]);
+				if (n) LogF("[EnemyTurn +%llus] max deg/s so far:%s", (now - t0) / 1000ULL, line);
+				n = 0;
+				for (int ch = 0; ch <= 0x41 && n < 900; ch++)
+					if (chVertMax[ch] >= minVert) n += snprintf(line + n, sizeof(line) - n, " ch%d=%.0f", ch, chVertMax[ch]);
+				if (n) LogF("[EnemyVert +%llus] max u/s so far:%s", (now - t0) / 1000ULL, line);
+			}
+		}
+		LogF("[EnemySpeed] trace window over");
+	}).detach();
+}
+
+static void StartBossPosTraceWatcher(int selectedChannel)
+{
+	if (!g_logEnabled || !g_gameBase)
+		return;
+	std::thread([selectedChannel] {
+		const ULONGLONG armDeadline = GetTickCount64() + 15 * 60000ULL;
+		for (;;) {
+			if (GetTickCount64() > armDeadline) return;
+			const int pc = *reinterpret_cast<volatile int*>(g_gameBase + 0x658CF4);
+			const uintptr_t tbl = *reinterpret_cast<volatile uintptr_t*>(g_gameBase + 0x667E20);
+			if (tbl && pc >= 0 && pc <= 0x41 && *reinterpret_cast<volatile uintptr_t*>(tbl + pc * 8 + 0x18))
+				break;
+			Sleep(200);
+		}
+		LogF("[BossPos] armed at framerate=%.0f selectedChannel=%d tick=%llu", g_framerate, selectedChannel, GetTickCount64());
 		const auto rf = [](uintptr_t a) -> float { return *reinterpret_cast<volatile float*>(a); };
 		struct Prev { uintptr_t mover; float x, z; };
 		static Prev prev[8];
@@ -686,7 +1863,7 @@ static void StartBossPosTraceWatcher()
 		//Long window (6 min): the interesting experiment is to shove a stuck boss
 		//off the geometry it beelined into and see whether it then enters the run
 		//state (mode 6), which needs time to set up in-fight.
-		while (GetTickCount64() - t0 < 360000) {
+		while (GetTickCount64() - t0 < (selectedChannel >= 0 ? g_traceMs : min(g_traceMs, 360000ULL))) {
 			Sleep(40);
 			const unsigned long long now = GetTickCount64() - t0;
 			const uintptr_t tbl = *reinterpret_cast<volatile uintptr_t*>(g_gameBase + 0x667E20);
@@ -716,7 +1893,7 @@ static void StartBossPosTraceWatcher()
 				if (!a) continue;
 				{
 					const uint16_t st = *reinterpret_cast<volatile uint16_t*>(a + 0x360);
-					if (st != 0x2019 && st != 0x200B) continue; // boss/leader classes (0x200B = General Qator Bashtar)
+					if (selectedChannel >= 0 ? ch != selectedChannel : (st != 0x2019 && st != 0x200B)) continue;
 					// [Diagnostics] WatchAiEvent=1: arm the DR0 write watch on this boss's AI-block
 					// event word once (see ArmHwWatch)
 					static bool hwArmed = false;
@@ -1155,6 +2332,608 @@ static void StartWatchdogTraceWatcher()
 	}).detach();
 }
 
+// [Diagnostics] TraceCamera=1: while a lock-on target exists ([0x658D30] >= 0) log the
+// camera's look-at (0x725168/6c/70), the previous look-at (0x74f0b8/bc/c0), the two
+// camera-position caches (0x7268a0.. / 0x726890..), the controlled actor's and the
+// target's mover positions, every ~16 ms. Used for the close-range lock-on whip report
+// (2026-09-18): which quantity turns, and how fast, per rendered frame.
+static void StartCameraTraceWatcher()
+{
+	if (!g_logEnabled || !g_gameBase)
+		return;
+	std::thread([] {
+		const auto rf = [](uintptr_t a) -> float { return *reinterpret_cast<volatile float*>(a); };
+		const auto MoverOf = [](int chan) -> uintptr_t {
+			const uintptr_t table = *reinterpret_cast<volatile uintptr_t*>(g_gameBase + 0x667E20);
+			if (!table || chan < 0 || chan > 0x41) return 0;
+			const uintptr_t actor = *reinterpret_cast<volatile uintptr_t*>(table + chan * 8 + 0x18);
+			if (!actor) return 0;
+			const int mi = *reinterpret_cast<volatile signed char*>(actor + 0x364);
+			if (mi < 0 || mi >= 8) return 0;
+			return *reinterpret_cast<volatile uintptr_t*>(actor + 0x2D0 + mi * 0x38);
+		};
+		const ULONGLONG t0 = GetTickCount64();
+		uint32_t lines = 0;
+		LogF("[Cam] trace armed");
+		while (GetTickCount64() - t0 < g_traceMs && lines < 60000)
+		{
+			Sleep(16);
+			const int lockT = *reinterpret_cast<volatile int*>(g_gameBase + 0x658D30);
+			if (lockT < 0 || lockT > 0x41) continue;
+			const uintptr_t pm = MoverOf(ReadControlledChannel()), tm = MoverOf(lockT);
+			const uintptr_t b = g_gameBase;
+			++lines;
+			LogF("[Cam +%llu] lockT=%d camState=%d look=%.0f,%.0f,%.0f prev=%.0f,%.0f,%.0f camA=%.0f,%.0f,%.0f camB=%.0f,%.0f,%.0f pl=%.0f,%.0f,%.0f tgt=%.0f,%.0f,%.0f frame=%u",
+				GetTickCount64() - t0, lockT, *reinterpret_cast<volatile int*>(b + 0x658F48),
+				rf(b + 0x725168), rf(b + 0x72516C), rf(b + 0x725170),
+				rf(b + 0x74F0B8), rf(b + 0x74F0BC), rf(b + 0x74F0C0),
+				rf(b + 0x7268A0), rf(b + 0x7268A4), rf(b + 0x7268A8),
+				rf(b + 0x726890), rf(b + 0x726894), rf(b + 0x726898),
+				pm ? rf(pm + 0x08) : 0.f, pm ? rf(pm + 0x0c) : 0.f, pm ? rf(pm + 0x10) : 0.f,
+				tm ? rf(tm + 0x08) : 0.f, tm ? rf(tm + 0x0c) : 0.f, tm ? rf(tm + 0x10) : 0.f,
+				g_scriptFrames ? *g_scriptFrames : 0u);
+		}
+		LogF("[Cam] trace finished");
+	}).detach();
+}
+
+// [Diagnostics] TraceFecFlash=1 (2026-09-19): log every draw of the effect engine's
+// full-screen flash element (FunnyEffectsForPSP FecFlash, vtable 0x570FB8, draw
+// 0x140499580). The draw multiplies the element's keyframe colour (table at
+// [elem+0xe8], index [[elem+0xf0]+4]) by a scale ([elem+0xe0]+0x40..0x4c), clamps to
+// 0..255 and stores it in 0x76F470..7C. The chapter-5 turret shots flash white at
+// 120 fps but not at 30; this shows draws per shot, keyframe stepping and colours.
+static uint32_t g_fecFlashLines = 0;
+static void LogFecFlashDraw(uintptr_t, uintptr_t elem, uintptr_t)
+{
+	if (g_fecFlashLines >= 20000 || !elem) return;
+	++g_fecFlashLines;
+	const uintptr_t key = *reinterpret_cast<uintptr_t*>(elem + 0xf0);
+	const uintptr_t scale = *reinterpret_cast<uintptr_t*>(elem + 0xe0);
+	const auto rf = [](uintptr_t a) -> float { return a ? *reinterpret_cast<float*>(a) : 0.0f; };
+	const uintptr_t b = g_gameBase;
+	LogF("[FecFlash] frame=%u elem=%llX kf=%u colPrev=%.0f,%.0f,%.0f,%.0f scale=%.2f,%.2f,%.2f,%.2f",
+		g_scriptFrames ? *g_scriptFrames : 0u, static_cast<unsigned long long>(elem),
+		key ? *reinterpret_cast<uint32_t*>(key + 4) : 0u,
+		rf(b + 0x76F470), rf(b + 0x76F474), rf(b + 0x76F478), rf(b + 0x76F47C),
+		rf(scale ? scale + 0x40 : 0), rf(scale ? scale + 0x44 : 0), rf(scale ? scale + 0x48 : 0), rf(scale ? scale + 0x4c : 0));
+}
+
+// Turret controller 0x2d2cf0 fires action 0x500d when [0x658ce8] == 0.
+// Replace only its (counter + 1) % 7 arithmetic; keep the original store and
+// zero-gated input handling. The first shot stays immediate and aiming runs every render.
+static const char* kTurretCooldownAsm = "inc ecx; cmp ecx, $0; jl A; xor ecx, ecx; A: nop";
+
+// Log accepted turret fire requests, not the per-projectile age at slot+0x86.
+// QPC works at native 30 FPS too, where g_scriptFrames is not initialized.
+static void LogTurretFire()
+{
+	static LARGE_INTEGER frequency = {}, first = {}, previous = {};
+	static uint32_t count = 0;
+	if (count >= 4000) return;
+	LARGE_INTEGER now;
+	QueryPerformanceCounter(&now);
+	if (!frequency.QuadPart) { QueryPerformanceFrequency(&frequency); first = previous = now; }
+	LogF("[TurretFire] n=%u action=500D ms=%.3f dt=%.3f frame=%u",
+		++count, (now.QuadPart - first.QuadPart) * 1000.0 / frequency.QuadPart,
+		(now.QuadPart - previous.QuadPart) * 1000.0 / frequency.QuadPart,
+		g_scriptFrames ? *g_scriptFrames : 0u);
+	previous = now;
+}
+
+// [Diagnostics] TraceWeapon=1 (2026-09-19): at the weapon state-machine entry 0x14028E5B0
+// (ecx = slot index; base = [0x658C00] + idx*0x130) log the slot's phase and candidate
+// countdown fields once per render for slots that are firing (phase != 0), to find what
+// gates the chapter-5 turret's shot cadence and whether it advances per rendered frame.
+// CORRECTION: each slot is one projectile; legacy "shot" is its AGE, not shots fired.
+static uint32_t g_weapLines = 0; static uint32_t g_weapPrevFrame[24];
+static void LogWeapon(uint32_t idx)
+{
+	if (g_weapLines >= 8000 || !g_gameBase || idx >= 24) return;
+	const uintptr_t base = *reinterpret_cast<uintptr_t*>(g_gameBase + 0x658C00);
+	if (!base) return;
+	const uintptr_t slot = base + static_cast<uintptr_t>(idx) * 0x130;
+	const int16_t phase = *reinterpret_cast<int16_t*>(slot + 0x7a);
+	const int16_t shot = *reinterpret_cast<int16_t*>(slot + 0x86);
+	const uint16_t clip = *reinterpret_cast<uint16_t*>(slot + 4);
+	// log an active weapon slot (firing, mid-burst, or the ch5 turret clip 0x500D)
+	if (phase == 0 && shot == 0 && clip != 0x500D) return;
+	const uint32_t now = g_scriptFrames ? *g_scriptFrames : static_cast<uint32_t>(GetTickCount64());
+	if (now == g_weapPrevFrame[idx]) return;   // once per render
+	g_weapPrevFrame[idx] = now;
+	++g_weapLines;
+	LogF("[Weap] f=%u idx=%u ph=%d clip=%04X shot=%d/%d chg=%.3f step=%.4f cap=%.3f c8=%d c4c=%.3f s100=%.4f x10c=%d",
+		now, idx, phase, clip,
+		shot, *reinterpret_cast<int16_t*>(slot + 0x88),
+		*reinterpret_cast<float*>(slot + 0xbc), *reinterpret_cast<float*>(slot + 0xc4),
+		*reinterpret_cast<float*>(slot + 0xc0), *reinterpret_cast<int32_t*>(slot + 0xc8),
+		*reinterpret_cast<float*>(slot + 0xb8), *reinterpret_cast<float*>(slot + 0x100),
+		*reinterpret_cast<int32_t*>(slot + 0x10c));
+}
+
+// [Diagnostics] TraceAnimRate=1 (2026-09-19): at the animation event-track player entry
+// (0x1403BD780, rcx = layer), log layers whose rate [layer+0x74] is >= 0.5 above 30 fps,
+// i.e. layers the mod's 30/fps rate patches do not reach (suspected turret fire clip).
+static uint32_t g_animRateLines = 0;
+static struct { uintptr_t layer; uint32_t last; } g_animRateSeen[256];
+static void LogAnimRate(uintptr_t layer)
+{
+	if (g_animRateLines >= 3000 || !layer || !g_scriptFrames) return;
+	const float rate = *reinterpret_cast<float*>(layer + 0x74);
+	if (rate < 0.5f && rate > -0.5f) return;
+	const uint32_t now = *g_scriptFrames;
+	auto& e = g_animRateSeen[(layer >> 4) & 255];
+	if (e.layer == layer && now - e.last < 120) return;
+	e.layer = layer; e.last = now;
+	++g_animRateLines;
+	const uintptr_t owner = *reinterpret_cast<uintptr_t*>(layer);  // first qword: owner/mover per KB
+	LogF("[AnimRate] frame=%u layer=%llX rate=%.3f animframe=%d len=%d owner=%llX ownerCls=%04X", now,
+		static_cast<unsigned long long>(layer), rate, *reinterpret_cast<int32_t*>(layer + 0x6c) >> 8,
+		*reinterpret_cast<int32_t*>(layer + 0x7c), static_cast<unsigned long long>(owner),
+		owner ? *reinterpret_cast<uint16_t*>(owner + 0x360) : 0u);
+}
+
+// [Diagnostics] TraceLoopWrap=1 (2026-09-21): the field save stone's looping rotation hitches
+// once per revolution above 30 fps (normal speed otherwise). Trace both loop mechanisms around
+// their wrap so one run at the stone shows which system it is and what the wrap does:
+// (a) effect engine (FunnyEffectsForPSP): element loop wrap 0x1404A88D0 (called from
+//     0x1404A8980 when the element clock [elem+0x40] reached the def's loop end word[def+0xe];
+//     the clock is rebased to start + overshoot % length + fraction), the per-render clock
+//     advance at 0x1404A99B0 (clock += effect step), and the FecRotmv per-render update
+//     (vtable 572138 slot 2: rot = base[+0x10..] + vel[+0x20..] * t, t = clock - key start);
+// (b) animation layers: step 0x1403BDB60 (frame 24.8 at +0x6c += rate*256; loop flag 8 in
+//     +0x84; wrap frame -= (len - start)*256 when frame >= len*256).
+static uint32_t g_loopFecLines = 0, g_loopAnimLines = 0;
+static struct { uintptr_t elem; uint32_t frame; } g_wrapRecent[32]; static uint32_t g_wrapRecentN = 0;
+static bool RecentWrap(uintptr_t elem, uint32_t now)
+{
+	for (const auto& e : g_wrapRecent) if (e.elem == elem && now - e.frame <= 24) return true;
+	return false;
+}
+static bool NearLoopEnd(uintptr_t elem)
+{
+	const uintptr_t def = *reinterpret_cast<uintptr_t*>(elem + 0x58);
+	if (!def || !(*reinterpret_cast<uint16_t*>(elem + 4) & 2)) return false;   // element does not loop
+	const float clock = *reinterpret_cast<float*>(elem + 0x40);
+	return clock >= static_cast<float>(*reinterpret_cast<int16_t*>(def + 0xe)) - 1.25f;
+}
+// 0x1404A89C7 (right after the wrap call): rcx = element (rbx), rdx = draw/update context (rdi)
+static void LogFecWrap(uintptr_t elem, uintptr_t ctx)
+{
+	if (g_loopFecLines >= 12000 || !elem || !g_scriptFrames) return;
+	const uint32_t now = *g_scriptFrames;
+	auto& slot = g_wrapRecent[g_wrapRecentN++ & 31]; slot.elem = elem; slot.frame = now;
+	++g_loopFecLines;
+	const uintptr_t def = *reinterpret_cast<uintptr_t*>(elem + 0x58);
+	const uintptr_t effect = ctx ? *reinterpret_cast<uintptr_t*>(ctx + 0xe0) : 0;
+	LogF("[LoopWrap] frame=%u elem=%llX effect=%llX def=%llX clock=%.4f key=%d flags=%04X/%04X loop=%d..%d effStep=%.4f effTime=%.3f",
+		now, static_cast<unsigned long long>(elem), static_cast<unsigned long long>(effect), static_cast<unsigned long long>(def),
+		*reinterpret_cast<float*>(elem + 0x40), *reinterpret_cast<int16_t*>(elem + 0x46),
+		*reinterpret_cast<uint16_t*>(elem + 2), *reinterpret_cast<uint16_t*>(elem + 4),
+		def ? *reinterpret_cast<int16_t*>(def + 0xc) : -1, def ? *reinterpret_cast<int16_t*>(def + 0xe) : -1,
+		effect ? *reinterpret_cast<float*>(effect + 0x13c) : 0.0f, effect ? *reinterpret_cast<float*>(effect + 0x138) : 0.0f);
+}
+// 0x1404A99B0 (element clock advance, every element every render): rcx = element (rbx); clock is still the OLD value
+static void LogFecClock(uintptr_t elem)
+{
+	if (g_loopFecLines >= 12000 || !elem || !g_scriptFrames) return;
+	const uint32_t now = *g_scriptFrames;
+	if (!RecentWrap(elem, now) && !NearLoopEnd(elem)) return;
+	++g_loopFecLines;
+	LogF("[LoopClock] frame=%u elem=%llX clock=%.4f key=%d flags=%04X", now, static_cast<unsigned long long>(elem),
+		*reinterpret_cast<float*>(elem + 0x40), *reinterpret_cast<int16_t*>(elem + 0x46), *reinterpret_cast<uint16_t*>(elem + 2));
+}
+// FecRotmv slot 2 entry (handler, ctx, def, r9, state, t): rot = base + vel * t; the same code
+// may serve other *mv classes (identical bodies), so the handler's vtable is checked.
+static void LogFecRotmv(uintptr_t handler, uintptr_t ctx, uintptr_t, uintptr_t, uintptr_t state, float t)
+{
+	if (g_loopFecLines >= 12000 || !ctx || !state || !handler || !g_gameBase || !g_scriptFrames) return;
+	const uintptr_t elem = *reinterpret_cast<uintptr_t*>(ctx + 0xe8);
+	const uint32_t now = *g_scriptFrames;
+	if (!elem || (!RecentWrap(elem, now) && !NearLoopEnd(elem))) return;
+	++g_loopFecLines;
+	const float* s = reinterpret_cast<const float*>(state);
+	LogF("[LoopRot] frame=%u elem=%llX cls=%llX state=%llX t=%.4f base=%.3f,%.3f,%.3f vel=%.4f,%.4f,%.4f out=%.3f,%.3f,%.3f",
+		now, static_cast<unsigned long long>(elem), static_cast<unsigned long long>(*reinterpret_cast<uintptr_t*>(handler) - g_gameBase),
+		static_cast<unsigned long long>(state), t, s[4], s[5], s[6], s[8], s[9], s[10],
+		s[4] + s[8] * t, s[5] + s[9] * t, s[6] + s[10] * t);
+}
+// 0x1403BDB60 entry (rcx = layer): looping layers within one frame of their loop end / 0.75 of the start.
+// Track layout (clip binder 0x1403BE260): tracks of 0x58 bytes at [layer+0x18]; 0..9 root (0-2 position,
+// 3 = root yaw in turns, 0x8000 = one turn), bones from +0x370 with 7 tracks each (0-3 quaternion xyzw in
+// 1/32768, 4-6 position). Per track: +0x42 value at the cursor key, +0x44 value at the key before, +0x48
+// interpolated output (sampler 0x1403BEB50: out = prev + (cur - prev) * frac, cursor key = ceil(frame)).
+static void LogAnimStep(uintptr_t layer)
+{
+	if (g_loopAnimLines >= 6000 || !layer || !g_scriptFrames) return;
+	const uint32_t flags = *reinterpret_cast<uint32_t*>(layer + 0x84);
+	if (!(flags & 8)) return;
+	const int32_t frame = *reinterpret_cast<int32_t*>(layer + 0x6c);
+	const float start = *reinterpret_cast<float*>(layer + 0x78), len = *reinterpret_cast<float*>(layer + 0x7c);
+	if (frame < static_cast<int32_t>((len - 1.0f) * 256.0f) && frame >= static_cast<int32_t>((start + 0.75f) * 256.0f)) return;
+	++g_loopAnimLines;
+	const uintptr_t owner = *reinterpret_cast<uintptr_t*>(layer);
+	// container+0x478 = owning actor for party/enemy movers (KB); resolve its channel if it is one
+	const uintptr_t ownerActor = owner ? *reinterpret_cast<uintptr_t*>(owner + 0x478) : 0;
+	int ownerCh = -1;
+	if (ownerActor && g_gameBase)
+	{
+		const uintptr_t table = *reinterpret_cast<uintptr_t*>(g_gameBase + 0x667E20);
+		for (int ch = 0; table && ch < 0x42; ch++)
+			if (*reinterpret_cast<uintptr_t*>(table + ch * 8 + 0x18) == ownerActor) { ownerCh = ch; break; }
+	}
+	const uintptr_t tr = *reinterpret_cast<uintptr_t*>(layer + 0x18);
+	// bone count lives in the CONTAINER (sampler sign fix 0x1403BEA50 reads word[container+0x44c])
+	const int bones = owner ? *reinterpret_cast<int16_t*>(owner + 0x44c) : 0;
+	char q[1400]; int n = 0;
+	if (tr)
+	{
+		const auto w = [tr](uintptr_t off) { return static_cast<int>(*reinterpret_cast<int16_t*>(tr + off)); };
+		// root yaw track 3: cur/prev/out
+		n += sprintf_s(q + n, sizeof(q) - n, " yaw=%d/%d/%d", w(0x108 + 0x42), w(0x108 + 0x44), w(0x108 + 0x48));
+		// party members (ch 0..2) only get bone 0; other actors (the save stone is ch 9) get every bone's quaternion
+		const int maxBones = ownerCh >= 0 && ownerCh < 3 ? 1 : 12;
+		for (int b = 0; b < maxBones && b < bones && n < 1300; b++)
+		{
+			const uintptr_t bb = 0x370 + b * 0x268;
+			n += sprintf_s(q + n, sizeof(q) - n, " q%d=", b);
+			for (int k = 0; k < 4; k++) n += sprintf_s(q + n, sizeof(q) - n, "%d/%d/%d%s", w(bb + k * 0x58 + 0x42), w(bb + k * 0x58 + 0x44), w(bb + k * 0x58 + 0x48), k < 3 ? "," : "");
+		}
+	}
+	LogF("[LoopAnim] frame=%u layer=%llX owner=%llX ownerCh=%d cls=%04X clip=%llX f=%.4f rate=%.4f start=%.0f len=%.0f flags=%X loops=%u noRoot=%d bones=%d%s", *g_scriptFrames,
+		static_cast<unsigned long long>(layer), static_cast<unsigned long long>(owner), ownerCh,
+		ownerActor ? *reinterpret_cast<uint16_t*>(ownerActor + 0x360) : 0u, static_cast<unsigned long long>(*reinterpret_cast<uintptr_t*>(layer + 8)),
+		frame / 256.0, *reinterpret_cast<float*>(layer + 0x74), start, len, flags, *reinterpret_cast<uint16_t*>(layer + 0x80),
+		*reinterpret_cast<uint8_t*>(layer + 0x82), bones, q);
+}
+
+// [Diagnostics] TraceSummon=1 (2026-09-22): the Eidolon's on-screen summon timer runs fps/30 x
+// too fast (upstream #20; measured 2:00 elapsing in 45 s at 90 fps). To locate the counter, while
+// a party channel (0..2) holds an Eidolon-class actor (class word 0x0010..0x00FF; Odin-like
+// summon seen as 0x0013, HP 5242) snapshot every 250 ms into <ini>_summon_<n>.bin, fixed record
+// layout: header {u32 tickMs, u32 ch, u64 actor, u32 class, u32 renderFrame} then the actor
+// (0x1000), its AI block (0x5a8), battle globals 0x658800 (0x800), party globals 0x740000
+// (0x2000), 0x655C00 (0x400) and the three party entry structs (0x100 each); unreadable = zeros.
+static void StartSummonTraceWatcher()
+{
+	if (!g_logEnabled || !g_gameBase) return;
+	std::thread([] {
+		FILE* out = nullptr; unsigned fileNo = 0; uint32_t samples = 0;
+		const unsigned long long t0 = GetTickCount64();
+		auto region = [&](uintptr_t addr, size_t size) {
+			static uint8_t buf[0x2000];
+			SIZE_T got = 0;
+			if (!addr || !ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(addr), buf, size, &got) || got != size)
+				memset(buf, 0, size);
+			fwrite(buf, 1, size, out);
+		};
+		for (;;)
+		{
+			Sleep(250);
+			const uintptr_t tbl = *reinterpret_cast<volatile uintptr_t*>(g_gameBase + 0x667E20);
+			int ch = -1; uintptr_t actor = 0; uint16_t cls = 0;
+			for (int c = 0; tbl && c < 3; c++)
+			{
+				const uintptr_t a = *reinterpret_cast<volatile uintptr_t*>(tbl + c * 8 + 0x18);
+				if (!a) continue;
+				const uint16_t w = *reinterpret_cast<volatile uint16_t*>(a + 0x360);
+				if (w >= 0x10 && w < 0x100) { ch = c; actor = a; cls = w; break; }
+			}
+			if (ch < 0)
+			{
+				if (out) { fclose(out); out = nullptr; LogF("[Summon] end after %u samples", samples); }
+				continue;
+			}
+			if (!out)
+			{
+				wchar_t path[MAX_PATH];
+				swprintf_s(path, L"%s_summon_%u.bin", wcModulePath, ++fileNo);
+				if (_wfopen_s(&out, path, L"wb") != 0 || !out) { out = nullptr; continue; }
+				samples = 0;
+				LogF("[Summon] start ch=%d class=%04X actor=%llX tick=%llu -> %ls", ch, cls, static_cast<unsigned long long>(actor), GetTickCount64() - t0, path);
+			}
+			struct { uint32_t tick, ch; uint64_t actor; uint32_t cls, frame; } hdr = {
+				static_cast<uint32_t>(GetTickCount64() - t0), static_cast<uint32_t>(ch), static_cast<uint64_t>(actor), cls, g_scriptFrames ? *g_scriptFrames : 0u };
+			fwrite(&hdr, 1, sizeof(hdr), out);
+			region(actor, 0x1000);
+			const uintptr_t aitbl = *reinterpret_cast<volatile uintptr_t*>(g_gameBase + 0x658840);
+			region(aitbl ? aitbl + static_cast<uintptr_t>(ch) * 0x5a8 : 0, 0x5a8);
+			region(g_gameBase + 0x658800, 0x800);
+			region(g_gameBase + 0x740000, 0x2000);
+			region(g_gameBase + 0x655C00, 0x400);
+			for (int i = 0; i < 3; i++)
+				region(*reinterpret_cast<volatile uintptr_t*>(g_gameBase + 0x655C10 + i * 8), 0x100);
+			fflush(out);
+			++samples;
+		}
+	}).detach();
+	LogF("[TraceSummon] armed: snapshots every 250 ms while a party channel holds an Eidolon-class actor");
+}
+
+// [Diagnostics] TraceSoundNew=1 (2026-09-19): log the call stack of every sound-instance
+// construction (SQEX Sd RootSound ctor 0x14009DBA0, instance counter 0x65ECF8). The
+// chapter-5 turret shot sound fires ~8/s at 120 fps; its callers lead to the reload timer.
+static uint32_t g_sndNewLines = 0;
+static void LogSoundNew(uintptr_t, uintptr_t p2, uintptr_t p3)
+{
+	if (g_sndNewLines >= 4000 || !g_gameBase) return;
+	++g_sndNewLines;
+	// The trampoline stub has no unwind info, so RtlCaptureStackBackTrace stops after one
+	// frame. Reconstruct the hooked function's entry RSP from our own return-address slot
+	// (stub layout: 0x88 scratch + 8 regs/flags = 0xD0 above it) and unwind the game's own
+	// frames with RtlVirtualUnwind using its .pdata.
+	char line[520]; int m = 0;
+	uintptr_t rspEntry = reinterpret_cast<uintptr_t>(_AddressOfReturnAddress()) + 8 + 0x88 + 0x40;
+	CONTEXT c = {}; c.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+	c.Rip = *reinterpret_cast<uintptr_t*>(rspEntry);  // return address into the ctor's caller
+	c.Rsp = rspEntry + 8;
+	for (int i = 0; i < 16 && m < 480; i++)
+	{
+		const uintptr_t a = static_cast<uintptr_t>(c.Rip);
+		if (a >= g_gameBase && a < g_gameBase + 0xB00000) m += sprintf_s(line + m, sizeof(line) - m, " +%llX", static_cast<unsigned long long>(a - g_gameBase));
+		else { m += sprintf_s(line + m, sizeof(line) - m, " x"); break; }
+		DWORD64 imageBase = 0;
+		PRUNTIME_FUNCTION rf = RtlLookupFunctionEntry(c.Rip, &imageBase, nullptr);
+		if (!rf) break;
+		PVOID handlerData = nullptr; DWORD64 establisher = 0;
+		RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, c.Rip, rf, &c, &handlerData, &establisher, nullptr);
+		if (!c.Rip) break;
+	}
+	LogF("[SndNew] frame=%u p2=%llX p3=%llX stack:%s", g_scriptFrames ? *g_scriptFrames : 0u,
+		static_cast<unsigned long long>(p2), static_cast<unsigned long long>(p3), line);
+}
+
+// [Diagnostics] TraceFecAnm=1 (2026-09-19): log every FecAnm_plus draw (animated sprite,
+// vtable 0x570B08, draw 0x1404CCF80): element, keyframe index [[elem+0xf0]+4], texture slot
+// [data+0xc], scale [data+0x14]. Hiding this class removed the whole turret shot effect
+// including the white strobe, so the strobe is one of these sprites' keyframes.
+static uint32_t g_fecAnmLines = 0;
+static void LogFecAnmDraw(uintptr_t, uintptr_t elem, uintptr_t data, uintptr_t, uintptr_t state)
+{
+	if (g_fecAnmLines >= 30000 || !elem) return;
+	++g_fecAnmLines;
+	// data (r8) = per-sprite definition (+0xc texture slot, +0x14 scale); state (5th arg,
+	// [rsp+0x28] at entry) = per-sprite runtime state (+4 short cell index, -1 = inactive).
+	char hx[200]; int n = 0;
+	for (int i = 0; i < 8 && n < 180; i++) n += sprintf_s(hx + n, sizeof(hx) - n, " %08X", state ? *reinterpret_cast<uint32_t*>(state + i * 4) : 0u);
+	char hd[300]; int m = 0;
+	for (int i = 0; i < 16 && m < 280; i++) m += sprintf_s(hd + m, sizeof(hd) - m, " %08X", data ? *reinterpret_cast<uint32_t*>(data + i * 4) : 0u);
+	LogF("[FecAnm] frame=%u tex=%d cell=%d state=%s | def=%s",
+		g_scriptFrames ? *g_scriptFrames : static_cast<uint32_t>(GetTickCount64()), data ? *reinterpret_cast<int32_t*>(data + 0xc) : -9,
+		state ? *reinterpret_cast<int16_t*>(state + 4) : -9, hx, hd);
+}
+
+// [Diagnostics] TraceFecDraw=1 (2026-09-19): one log line per rendered frame listing which
+// effect element classes were drawn and how many times. The effect engine's draw loop
+// (two clones, 0x1404A8E6B / 0x1404AA11B) fetches the class handler singleton from the
+// table 0x631780[type] and calls its vtable slot 3; the handler's vtable RVA identifies
+// the class (map with the RTTI scan in the knowledge base: 570FB8 = FecFlash, ...).
+static uint32_t g_fecDrawLines = 0, g_fecDrawFrame = 0xFFFFFFFFu, g_fecDrawCnt[12], g_fecDrawN = 0;
+static uintptr_t g_fecDrawVt[12];
+// [Diagnostics] FecSkipClass=<hex vtable RVA>[,<rva>...]: do not draw elements of these
+// classes (the stub tests g_fecSkipDraw after the logger). Experiment tool only.
+static uintptr_t g_fecSkipVt[8]; static int g_fecSkipN = 0;
+// The skip flag must live in trampoline memory: [rip+?N] displacements are computed from
+// the trampoline, and a DLL static can be farther than 2 GB away (crash on first draw).
+static volatile uint8_t* g_fecSkipCell = nullptr;
+// Hotkeys 1..7 toggle skipping of these classes live (0 = clear); logged on each toggle.
+static const struct { uintptr_t vt; const char* name; } g_fecHotClasses[7] = {
+	{ 0x570FB8, "FecFlash" }, { 0x570A18, "FecGaussian_filter" }, { 0x570928, "FecMonochrome_filter" },
+	{ 0x570B58, "FecMegaanm_plus" }, { 0x570AB8, "FecMdlts_plus" }, { 0x570B08, "FecAnm_plus" }, { 0x570A68, "FecMdl_plus" } };
+static volatile uint32_t g_fecHotMask = 0;
+static void StartFecHotkeyWatcher()
+{
+	std::thread([] {
+		for (;;)
+		{
+			Sleep(30);
+			if (GetAsyncKeyState(VK_SHIFT) & 0x8000) continue;
+			if (GetAsyncKeyState('0') & 1) { g_fecHotMask = 0; LogF("[FecSkip] all classes drawn again"); }
+			for (int i = 0; i < 7; i++)
+				if (GetAsyncKeyState('1' + i) & 1)
+				{
+					g_fecHotMask ^= 1u << i;
+					LogF("[FecSkip] key %d: %s now %s (mask %02X)", i + 1, g_fecHotClasses[i].name, (g_fecHotMask & (1u << i)) ? "HIDDEN" : "drawn", g_fecHotMask);
+				}
+		}
+	}).detach();
+}
+// [Diagnostics] FecSkipFirstRenders=N (experiment, default 0): do not draw an effect
+// sprite instance (keyed by its runtime-state pointer, 5th draw argument) during its
+// first N rendered frames. Above 30 fps the element clock ticks fps/30 times per native
+// frame, so the first draws show sub-frame phases that never appear at 30 fps; if the
+// muzzle sprite's first key is the white burst, N = fps/30 - 1 hides exactly those.
+static int g_fecSkipFirst = 0;
+static struct { uintptr_t key; uint32_t first, last; } g_fecSeen[512];
+// [Effects] FirstFrameFix=1 (2026-09-19): the element clock [element+0x40] is a float that
+// advances 30/fps per render; modifiers are evaluated at (int)clock. A new element is
+// therefore drawn at clock 0.25/0.5/0.75 with key 0 before its first native frame, which a
+// 30 fps game never shows (first draw at clock 1). The chapter-5 turret muzzle sprite's
+// key 0 is a screen-filling white burst -> strobe per shot. Skip draws while 0 < clock < 1.
+// The draw context's +0xe8 is the element being drawn (set by the update/draw loops).
+static bool g_effectFirstFrameFix = false;
+static bool g_traceFecDraw = false;
+// Read-only diagnostics for the repeated death overlay. No render parameters
+// are changed: identify whether the overlay uses this tiling texture filter.
+static void TraceDeathTextureFilter(uintptr_t handler, uintptr_t ctx, uintptr_t def, uintptr_t arg4, uintptr_t state)
+{
+	static ULONGLONG last = 0;
+	static uintptr_t lastDef = 0;
+	static int lastCount = -999;
+	static unsigned lines = 0;
+	const int count = *reinterpret_cast<int*>(g_gameBase + 0x657944);
+	const ULONGLONG now = GetTickCount64();
+	if (def && state && lines < 60000 && (def != lastDef || count != lastCount || now - last >= 500)) {
+		++lines;
+		last = now; lastDef = def; lastCount = count;
+		int d[9] = {}; float s[8] = {}; uintptr_t info = 0; int extent[2] = {};
+		SIZE_T got = 0;
+		if (ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(def), d, sizeof(d), &got) && got == sizeof(d) &&
+			ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(state), s, sizeof(s), &got) && got == sizeof(s)) {
+			ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(ctx + 0x128), &info, sizeof(info), nullptr);
+			if (info) ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(info + 0x18), extent, sizeof(extent), nullptr);
+			LogF("[DeathOverlay] FecTexfilter count=%d def=%llX texture=%d tile=%lldx%lld context=%dx%d flags=%08X/%08X stateRGBA=%g/%g/%g/%g scroll=%g/%g",
+				count, static_cast<unsigned long long>(def), d[0], static_cast<long long>(d[3]) * 4, static_cast<long long>(d[4]) * 4,
+				extent[0], extent[1], static_cast<unsigned>(d[7]), static_cast<unsigned>(d[8]), s[2], s[3], s[4], s[5], s[6], s[7]);
+		}
+	}
+	reinterpret_cast<void(*)(uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t)>(g_gameBase + 0x4D2FE0)(handler, ctx, def, arg4, state);
+}
+
+static void LogFecDraw(uintptr_t handler, uintptr_t ctx, uintptr_t, uintptr_t, uintptr_t state)
+{
+	uint8_t skip = 0;
+	// Only sprite classes: filter elements (blur/monochrome/...) render buffers that other
+	// passes consume, and hiding their first frames left the party menu background as an
+	// uninitialised texture (2026-09-19). FecFlash is drawn black here and is left alone too.
+	const uintptr_t hvt = (handler && g_gameBase) ? *reinterpret_cast<uintptr_t*>(handler) - g_gameBase : 0;
+	const bool spriteClass = hvt == 0x570B08 /*FecAnm_plus*/ || hvt == 0x571F08 /*FecAnm*/ || hvt == 0x570B58 /*FecMegaanm_plus*/;
+	// Rule (the one that removed the strobe with the shot effect intact): a sprite INSTANCE
+	// (runtime-state pointer, 5th draw argument; slots are reused, so a gap > 8 renders means
+	// a new instance) is not drawn during its first fps/30-1 rendered frames. Element clock
+	// and loop flags are deliberately not used: the muzzle effect is a looping element whose
+	// clock never drops below 1, and clock-based hiding flickered the title screen.
+	if (g_effectFirstFrameFix && spriteClass && state && g_scriptFrames)
+	{
+		const uint32_t now = *g_scriptFrames;
+		auto& e = g_fecSeen[(state >> 4) & 511];
+		if (e.key != state || now - e.last > 8) { e.key = state; e.first = now; }
+		e.last = now;
+		// Audit 2026-09-26 (R14): ceil, the renders a native frame spans (same at 60/90/120).
+		const uint32_t k = static_cast<uint32_t>(ceilf(g_framerate / 30.0f - 0.001f));
+		if (k > 1 && now - e.first < k - 1) skip = 1;
+	}
+	if (g_fecSkipFirst > 0 && state && g_scriptFrames)
+	{
+		const uint32_t now = *g_scriptFrames;
+		auto& e = g_fecSeen[(state >> 4) & 511];
+		if (e.key != state || now - e.last > 8) { e.key = state; e.first = now; }
+		e.last = now;
+		if (now - e.first < static_cast<uint32_t>(g_fecSkipFirst)) skip = 1;
+	}
+	if ((g_fecSkipN || g_fecHotMask) && handler && g_gameBase)
+	{
+		const uintptr_t v = *reinterpret_cast<uintptr_t*>(handler) - g_gameBase;
+		for (int i = 0; i < g_fecSkipN; i++) if (g_fecSkipVt[i] == v) { skip = 1; break; }
+		for (int i = 0; i < 7 && !skip; i++) if ((g_fecHotMask & (1u << i)) && g_fecHotClasses[i].vt == v) skip = 1;
+	}
+	if (g_fecSkipCell) *g_fecSkipCell = skip;
+	if (!g_traceFecDraw) return;
+	const uint32_t frame = g_scriptFrames ? *g_scriptFrames : static_cast<uint32_t>(GetTickCount64() >> 3);
+	if (frame != g_fecDrawFrame)
+	{
+		if (g_fecDrawN && g_fecDrawLines < 20000)
+		{
+			char line[400]; int n = 0;
+			for (uint32_t i = 0; i < g_fecDrawN && n < 340; i++)
+				n += sprintf_s(line + n, sizeof(line) - n, " %llX:%u", static_cast<unsigned long long>(g_fecDrawVt[i]), g_fecDrawCnt[i]);
+			LogF("[FecDraw] frame=%u%s", g_fecDrawFrame, line);
+			++g_fecDrawLines;
+		}
+		g_fecDrawFrame = frame; g_fecDrawN = 0;
+	}
+	const uintptr_t vt = (handler && g_gameBase) ? *reinterpret_cast<uintptr_t*>(handler) - g_gameBase : 0;
+	for (uint32_t i = 0; i < g_fecDrawN; i++)
+		if (g_fecDrawVt[i] == vt) { ++g_fecDrawCnt[i]; return; }
+	if (g_fecDrawN < 12) { g_fecDrawVt[g_fecDrawN] = vt; g_fecDrawCnt[g_fecDrawN] = 1; ++g_fecDrawN; }
+}
+
+// [Diagnostics] FlashScan=1 (2026-09-18): find per-frame effect cells by hotkey.
+//   key 8 = record a 2 s idle baseline (cells that change while nothing happens are excluded)
+//   key 9 = start / stop a capture window (fire the turret, or bracket the mission banner)
+// Every 8 ms all 4-byte cells of the writable image (0x60B000..) are compared with the
+// previous sample. At stop, report cells that changed only inside the window: floats that
+// peak in [0.3, 4] (screen-flash alpha and the like) and monotonic small-integer counters
+// with >= 20 steps (frame counters). Feed the winner to WriteWatchRva.
+static void StartFlashScanWatcher()
+{
+	if (!g_logEnabled || !g_gameBase)
+		return;
+	std::thread([] {
+		const uint32_t start_rva = 0x60B000, n = 0x3E2890 / 4;
+		auto last = static_cast<uint32_t*>(malloc(n * 4));
+		auto first = static_cast<uint32_t*>(malloc(n * 4));
+		auto idle = static_cast<uint8_t*>(calloc(n, 1));
+		auto cnt = static_cast<uint16_t*>(calloc(n, 2));
+		auto inc = static_cast<uint16_t*>(calloc(n, 2));
+		auto peak = static_cast<float*>(calloc(n, 4));
+		if (!last || !first || !idle || !cnt || !inc || !peak) return;
+		auto mem = reinterpret_cast<const volatile uint32_t*>(g_gameBase + start_rva);
+		LogF("[FlashScan] armed: 8 = 2 s idle baseline, 9 = start/stop capture (plain digits, no Shift)");
+		bool capturing = false; ULONGLONG capStart = 0;
+		for (;;)
+		{
+			if (!capturing)
+			{
+				Sleep(30);
+				if ((GetAsyncKeyState('8') & 1) && !(GetAsyncKeyState(VK_SHIFT) & 0x8000))
+				{
+					memset(idle, 0, n);
+					for (uint32_t i = 0; i < n; i++) last[i] = mem[i];
+					const ULONGLONG t0 = GetTickCount64();
+					while (GetTickCount64() - t0 < 2000)
+					{
+						Sleep(8);
+						for (uint32_t i = 0; i < n; i++) { const uint32_t v = mem[i]; if (v != last[i]) { idle[i] = 1; last[i] = v; } }
+					}
+					uint32_t k = 0; for (uint32_t i = 0; i < n; i++) k += idle[i];
+					LogF("[FlashScan] idle baseline: %u cells excluded", k);
+				}
+				if ((GetAsyncKeyState('9') & 1) && !(GetAsyncKeyState(VK_SHIFT) & 0x8000))
+				{
+					memset(cnt, 0, n * 2); memset(inc, 0, n * 2); memset(peak, 0, n * 4);
+					for (uint32_t i = 0; i < n; i++) { last[i] = mem[i]; first[i] = last[i]; }
+					capturing = true; capStart = GetTickCount64();
+					LogF("[FlashScan] capture START");
+				}
+				continue;
+			}
+			Sleep(8);
+			for (uint32_t i = 0; i < n; i++)
+			{
+				const uint32_t v = mem[i];
+				if (v == last[i]) continue;
+				if (cnt[i] < 65535) cnt[i]++;
+				if (static_cast<int32_t>(v - last[i]) > 0 && inc[i] < 65535) inc[i]++;
+				last[i] = v;
+				float f; memcpy(&f, &v, 4);
+				if (f == f && f > peak[i] && f < 1e6f) peak[i] = f;
+			}
+			if ((GetAsyncKeyState('9') & 1) || GetTickCount64() - capStart > 30000)
+			{
+				capturing = false;
+				const ULONGLONG len = GetTickCount64() - capStart;
+				int shownF = 0, shownC = 0;
+				for (uint32_t i = 0; i < n; i++)
+				{
+					if (idle[i] || cnt[i] == 0) continue;
+					float f0; memcpy(&f0, &first[i], 4);
+					// per-frame churn (camera matrices, physics) changes ~every sample; an effect changes only while it runs
+					float fl; memcpy(&fl, &last[i], 4);
+					// a transient effect rests at the same value before and after the window
+					// (fade/flash alpha 0 -> peak -> 0); per-frame churn ends elsewhere
+					const bool floatish = peak[i] >= 0.3f && peak[i] <= 4.0f && f0 >= -1.0f && f0 <= 4.0f && cnt[i] >= 2 &&
+						(fl - f0 < 0.01f && f0 - fl < 0.01f) && peak[i] - f0 >= 0.25f;
+					const uint32_t range = last[i] > first[i] ? last[i] - first[i] : first[i] - last[i];
+					const bool counter = cnt[i] >= 8 && (inc[i] == cnt[i] || inc[i] == 0) && range < 100000 && first[i] < 100000 && last[i] < 100000;
+					if (floatish && shownF < 150)
+					{
+						LogF("[FlashScan] FLOAT rva=0x%X changes=%u first=%g peak=%g last=0x%08X", start_rva + i * 4, cnt[i], f0, peak[i], last[i]);
+						shownF++;
+					}
+					else if (counter && shownC < 150)
+					{
+						LogF("[FlashScan] COUNTER rva=0x%X steps=%u %s first=%u last=%u (%.1f steps/s)", start_rva + i * 4, cnt[i],
+							inc[i] == cnt[i] ? "up" : "down", first[i], last[i], cnt[i] * 1000.0f / (len ? len : 1));
+						shownC++;
+					}
+				}
+				LogF("[FlashScan] capture STOP after %llu ms: %d float cells, %d counters shown", len, shownF, shownC);
+			}
+		}
+	}).detach();
+}
+
 static void StartMoveTraceWatcher()
 {
 	if (!g_logEnabled || !g_gameBase)
@@ -1188,18 +2967,51 @@ static void StartMoveTraceWatcher()
 		float prevSpd = -2.0f;
 		uintptr_t prevActor = 0, prevMover = 0;
 		ULONGLONG lastLine = 0;
-		while (GetTickCount64() - t0 < 900000)
+		while (GetTickCount64() - t0 < g_traceMs)
 		{
 			Sleep(100);
 			const ULONGLONG now = GetTickCount64() - t0;
+			DrainMoveCommands();
 			const int sx = *reinterpret_cast<volatile int*>(g_gameBase + 0x638B20);
 			const int sy = *reinterpret_cast<volatile int*>(g_gameBase + 0x638B24);
 			float spd = -1.0f, spdmax = -1.0f;
 			const uintptr_t mover = ReadMover(&actor);
 			if (mover)
 			{
+				const int actionCapacity = *reinterpret_cast<volatile int*>(actor + 0x7b8);
+				const int actionCount = *reinterpret_cast<volatile int*>(actor + 0x7c0);
+				const uint32_t actionHead = *reinterpret_cast<volatile uint32_t*>(actor + 0x7bc);
+				const uintptr_t actionEntry = actionCapacity > 0 && actionCount > 0
+					? actor + 0x7c4 + (actionHead % actionCapacity) * 0x28 : 0;
+				LogF("[ResourceState +%llu] ctl=%d class=%04X action=%04X hp=%d/%d mp=%d/%d ag=%d/%d mpFrac=%d agFrac=%d mpCost=%d agCost=%d+%d restoreChecks=%u",
+					now, ReadControlledChannel(), *reinterpret_cast<volatile uint16_t*>(actor + 0x360),
+					actionEntry ? *reinterpret_cast<volatile uint16_t*>(actionEntry + 4) : 0,
+					*reinterpret_cast<volatile int*>(actor + 0x934), *reinterpret_cast<volatile int*>(actor + 0x938),
+					*reinterpret_cast<volatile int*>(actor + 0x940), *reinterpret_cast<volatile int*>(actor + 0x944),
+					*reinterpret_cast<volatile int*>(actor + 0x948), *reinterpret_cast<volatile int*>(actor + 0x94c),
+					*reinterpret_cast<volatile int16_t*>(actor + 0x9be), *reinterpret_cast<volatile int16_t*>(actor + 0x9c0),
+					*reinterpret_cast<volatile int16_t*>(actor + 0x9c4), *reinterpret_cast<volatile int16_t*>(actor + 0x9c6),
+					*reinterpret_cast<volatile int16_t*>(actor + 0x9c8), g_mpRestoreCalls ? *g_mpRestoreCalls : 0);
 				spd = *reinterpret_cast<volatile float*>(mover + 0x78);
 				spdmax = *reinterpret_cast<volatile float*>(mover + 0x488);
+				// Sample even when SetSpeed is zero: dodges can move through animation
+				// translation. Record the combat state and animation rate alongside the
+				// position to compare the same action before/after drawing a weapon.
+				LogF("[MoveState +%llu] ctl=%d actor=%p mover=%p pos=%.3f,%.3f,%.3f delta=%.4f,%.4f,%.4f motion=%04X f6b8=%02X f878=%02X fcf8=%02X moverFlags=%X animRate=%.6f gameMode=%d",
+					now, ReadControlledChannel(), (void*)actor, (void*)mover,
+					*reinterpret_cast<volatile float*>(mover + 0x08),
+					*reinterpret_cast<volatile float*>(mover + 0x0c),
+					*reinterpret_cast<volatile float*>(mover + 0x10),
+					*reinterpret_cast<volatile float*>(mover + 0x18),
+					*reinterpret_cast<volatile float*>(mover + 0x1c),
+					*reinterpret_cast<volatile float*>(mover + 0x20),
+					*reinterpret_cast<volatile uint16_t*>(actor + 0x884),
+					*reinterpret_cast<volatile uint8_t*>(actor + 0x6b8),
+					*reinterpret_cast<volatile uint8_t*>(actor + 0x878),
+					*reinterpret_cast<volatile uint8_t*>(actor + 0xcf8),
+					*reinterpret_cast<volatile uint32_t*>(mover + 0xa8),
+					*reinterpret_cast<volatile float*>(actor + 0x5d8),
+					*reinterpret_cast<volatile int*>(g_gameBase + 0x658f70));
 			}
 			int tier = -1;
 			const uint64_t ctx = g_moveCtxCell ? *g_moveCtxCell : 0;
@@ -1638,13 +3450,27 @@ static void StartWriteWatch()
 		return;
 	g_wwAddr0 = g_gameBase + 0x658BD8;
 	g_wwAddr1 = g_gameBase + 0x658BD4;
-	std::thread([] {
+	{
+		// [Diagnostics] WriteWatchRva / WriteWatchRva2 (hex): watch these cells instead of the
+		// walk-tier pair (2026-09-18, used to find who writes a cell found by FlashScan).
+		wchar_t t[32] = L"";
+		GetPrivateProfileStringW(L"Diagnostics", L"WriteWatchRva", L"", t, 32, wcModulePath);
+		const uintptr_t r0 = wcstoull(t, nullptr, 16);
+		GetPrivateProfileStringW(L"Diagnostics", L"WriteWatchRva2", L"", t, 32, wcModulePath);
+		const uintptr_t r1 = wcstoull(t, nullptr, 16);
+		if (r0) { g_wwAddr0 = g_gameBase + r0; g_wwAddr1 = g_gameBase + (r1 ? r1 : r0); }
+	}
+	// [Diagnostics] WriteWatchMinutes (default 3): how long the watch stays armed after startup
+	// (2026-09-26: a cell written only while Cid's Crucible notice is on screen, reached later).
+	const int wwMinutes = GetPrivateProfileIntW(L"Diagnostics", L"WriteWatchMinutes", 3, wcModulePath);
+	const ULONGLONG wwMs = static_cast<ULONGLONG>(wwMinutes > 0 ? wwMinutes : 3) * 60000ULL;
+	std::thread([wwMs] {
 		PVOID veh = AddVectoredExceptionHandler(1, WwHandler);
-		LogF("[WW] armed: hardware write-watch on tier byte; press L3 a few times");
+		LogF("[WW] armed: hardware write-watch on +0x%llX and +0x%llX", static_cast<unsigned long long>(g_wwAddr0 - g_gameBase), static_cast<unsigned long long>(g_wwAddr1 - g_gameBase));
 		const ULONGLONG t0 = GetTickCount64();
 		LONG seen = 0;
 		uint64_t uniq[32]; int uniqSpd[32]; int nu = 0;
-		while (GetTickCount64() - t0 < 180000)
+		while (GetTickCount64() - t0 < wwMs)
 		{
 			WwApplyToThreads(true); // cover newly created threads too
 			for (int t = 0; t < 20; t++)
@@ -1924,20 +3750,11 @@ static void StartDynamicFovWatcher()
 
 static void StartCameraWatcher()
 {
-	if ((g_camFree == -9999 && g_camLock == -9999 && g_padTurnPct < 0 && g_mouseTurnPct < 0 && g_vertTurnPct < 0 && !g_tuneWindow && !g_lockGainCell) || !g_gameBase)
+	if ((g_camFree == -9999 && g_camLock == -9999 && g_padTurnPct < 0 && g_mouseTurnPct < 0 && g_vertTurnPct < 0 && !g_tuneWindow) || !g_gameBase)
 		return;
 	std::thread([] {
 		for (;;)
 		{
-			if (g_lockGainCell && g_lockDeadCell)
-			{
-				int x10 = g_lockFollowX10; if (x10 < 1) x10 = 1; if (x10 > 1000) x10 = 1000;
-				const float g = x10 / 1000.0f;
-				const float fps = g_framerate > 30.0f ? g_framerate : 30.0f;
-				*g_lockGainCell = (x10 >= 1000) ? 1.0f : 1.0f - powf(1.0f - g, 30.0f / fps);
-				int deg = g_lockDeadDeg; if (deg < 0) deg = 0; if (deg > 120) deg = 120;
-				*g_lockDeadCell = deg * 3.14159265f / 180.0f;
-			}
 			if (g_camFree != -9999)
 				*reinterpret_cast<volatile float*>(g_gameBase + 0x6BD128) = static_cast<float>(g_camFree);
 			if (g_camLock != -9999)
@@ -1982,14 +3799,14 @@ static TuneParam g_tuneParams[] = {
 	  L"Same, while locked onto an enemy",
 	  L"Camera distance while locked onto an enemy. Lower = farther.",
 	  L"Camera", L"LockCameraDistance",       -500, 300,  1, reinterpret_cast<volatile int*>(&g_camLock) },
-	{ L"Lock-on camera", L"Follow strength %",
-	  L"100 = instant snap, 1 or less = slow drift",
-	  L"How hard the lock-on camera chases the enemy. 100 = the game's original instant snap. 1 or less = a slow, calm drift. Steps of 0.1.",
-	  L"Camera", L"LockFollowPercent",           1, 1000, 10, reinterpret_cast<volatile int*>(&g_lockFollowX10) },
-	{ L"Lock-on camera", L"Dead zone (degrees)",
-	  L"No camera motion while enemy is near center",
-	  L"While the enemy is within this many degrees of the screen center the lock-on camera does not move. 0 = always follow.",
-	  L"Camera", L"LockDeadZoneDegrees",          0, 120,  1, reinterpret_cast<volatile int*>(&g_lockDeadDeg) },
+	{ L"Lock-on camera", L"Max turn speed (deg/s)",
+	  L"0 = original; try 120-240 against close enemies",
+	  L"Caps how fast the lock-on camera may swing around you when the enemy moves, in degrees per second. 0 = the game's original (up to ~2000 deg/s, whips when you step around a nearby enemy).",
+	  L"Camera", L"LockTurnMaxDegPerSec",         0, 720,  1, reinterpret_cast<volatile int*>(&g_lockTurnMaxDeg) },
+	{ L"Lock-on camera", L"Loose framing (degrees)",
+	  L"Enemy may drift this far off before the camera turns",
+	  L"With the turn limit on: the enemy can wander this many degrees away from where the camera is aimed before the camera starts turning after it. 0 = always track; 15-30 = calm, Witcher-like framing.",
+	  L"Camera", L"LockTurnDeadZoneDegrees",     0, 60,   1, reinterpret_cast<volatile int*>(&g_lockTurnDeadDeg) },
 	{ L"Turn speed", L"Gamepad %",
 	  L"Left/right speed, 100 = original",
 	  L"Fastest left/right camera speed on the gamepad, as % of the game's default.",
@@ -2410,12 +4227,126 @@ static void StartSoundTraceWatcher()
 	}).detach();
 }
 
+// Optional read-only scene/party snapshot. Region files retain addresses in the
+// log so pointer differences between launches can be normalized offline.
+// This is a sequential sample, not an atomic snapshot of the game thread.
+static void DumpSceneState()
+{
+	if (!g_gameBase || GetPrivateProfileIntW(L"Diagnostics", L"TraceSceneState", 0, wcModulePath) == 0) return;
+	static unsigned sequence = 0;
+	const unsigned sample = sequence++;
+	auto read = [](uintptr_t addr, void* dest, size_t size) {
+		SIZE_T got = 0;
+		return ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(addr), dest, size, &got) && got == size;
+	};
+	auto region = [&](const wchar_t* label, uintptr_t addr, size_t size) {
+		if (!addr || size > 0x2000) return;
+		uint8_t data[0x2000] = {};
+		if (!read(addr, data, size)) { LogF("[SceneState] %u %ls unreadable", sample, label); return; }
+		wchar_t path[MAX_PATH];
+		swprintf_s(path, L"%s_scene_%03u_%s.bin", wcModulePath, sample, label);
+		FILE* out = nullptr;
+		if (_wfopen_s(&out, path, L"wb") != 0 || !out) return;
+		const size_t written = fwrite(data, 1, size, out);
+		fclose(out);
+		LogF("[SceneState] %u %ls addr=%llX bytes=%zu/%zu -> %ls", sample, label,
+			static_cast<unsigned long long>(addr), written, size, path);
+	};
+	int leader = -1, slot = -1, mode = -1;
+	uint8_t partyGate = 0, controlGate = 0;
+	read(g_gameBase + 0x658CF4, &leader, sizeof(leader));
+	read(g_gameBase + 0x740598, &slot, sizeof(slot));
+	read(g_gameBase + 0x658F70, &mode, sizeof(mode));
+	read(g_gameBase + 0x74126D, &partyGate, sizeof(partyGate));
+	read(g_gameBase + 0x740940, &controlGate, sizeof(controlGate));
+	LogF("[SceneState] %u tick=%llu base=%llX leader=%d slot=%d gates=%u/%u mode=%d", sample,
+		GetTickCount64(), static_cast<unsigned long long>(g_gameBase), leader, slot, partyGate, controlGate, mode);
+	region(L"battle_globals", g_gameBase + 0x658800, 0x800);
+	region(L"party_globals", g_gameBase + 0x740000, 0x2000);
+	region(L"active_party", g_gameBase + 0x6559D0, 3 * 0x60);
+	region(L"party_counts", g_gameBase + 0x657940, 0x20);
+	uintptr_t table = 0;
+	read(g_gameBase + 0x667E20, &table, sizeof(table));
+	for (int ch = 0; table && ch < 6; ++ch)
+	{
+		uintptr_t actor = 0;
+		if (!read(table + 0x18 + ch * 8, &actor, sizeof(actor)) || !actor) continue;
+		wchar_t label[32]; swprintf_s(label, L"actor_ch%d", ch);
+		region(label, actor, 0x1000);
+	}
+	for (int i = 0; i < 3; ++i)
+	{
+		uintptr_t entry = 0;
+		if (!read(g_gameBase + 0x655C10 + i * 8, &entry, sizeof(entry)) || !entry) continue;
+		wchar_t label[32]; swprintf_s(label, L"party_slot%d", i);
+		region(label, entry, 0x100);
+	}
+	for (int i = 0; i < 3; ++i) {
+		const auto& cast = g_judeccaCast[i];
+		if (!cast.actor || JudeccaActorAt(cast.channel) != cast.actor) continue;
+		wchar_t label[32]; swprintf_s(label, L"standin_slot%d_ch%d", i, cast.channel);
+		region(label, cast.actor, 0xEA0);
+		const int moverIndex = *reinterpret_cast<int8_t*>(cast.actor + 0x364);
+		if (moverIndex >= 0 && moverIndex < 3) {
+			const uintptr_t mover = *reinterpret_cast<uintptr_t*>(cast.actor + 0x2D0 + moverIndex * 0x38);
+			swprintf_s(label, L"standin_mover%d", i);
+			region(label, mover, 0xB00);
+		}
+	}
+}
+
+static void StartDeathOverlayWatcher()
+{
+	if (GetPrivateProfileIntW(L"Diagnostics", L"TraceDeathOverlay", 0, wcModulePath) == 0) return;
+	LogF("[DeathOverlay] automatic capture armed: living party -> all dead; snapshots at0/0.5/2 seconds, no hotkey required");
+	std::thread([] {
+		auto read = [](uintptr_t address, void* out, size_t bytes) {
+			SIZE_T got = 0;
+			return address && ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(address), out, bytes, &got) && got == bytes;
+		};
+		bool hadLivingParty = false;
+		ULONGLONG deathAt = 0;
+		int sample = 3;
+		const ULONGLONG start = GetTickCount64();
+		while (GetTickCount64() - start < g_traceMs) {
+			Sleep(50);
+			int living = 0, realActors = 0;
+			for (int ch = 0; ch < 3; ++ch) {
+				const uintptr_t actor = JudeccaActorAt(ch);
+				uint32_t hp[2] = {};
+				if (actor && read(actor + 0x934, hp, sizeof(hp)) && hp[1] > 0) {
+					++realActors;
+					if (hp[0] > 0) ++living;
+				}
+			}
+			if (living > 0) { hadLivingParty = true; sample = 3; continue; }
+			const ULONGLONG now = GetTickCount64();
+			if (hadLivingParty && realActors > 0) { hadLivingParty = false; deathAt = now; sample = 0; }
+			constexpr ULONGLONG delays[] = {0, 500, 2000};
+			if (sample >= 3 || now - deathAt < delays[sample]) continue;
+			uintptr_t vignette = 0, renderer = 0;
+			float params[4] = {}, effectScale[4] = {}; uint8_t enabled = 0;
+			read(g_gameBase + 0x6516E0, &vignette, sizeof(vignette));
+			if (vignette) { read(vignette + 0x58, params, sizeof(params)); read(vignette + 0x68, &enabled, 1); }
+			read(g_gameBase + 0x65F4B0, effectScale, sizeof(effectScale));
+			read(g_gameBase + 0x77E000, &renderer, sizeof(renderer));
+			int aa = -1;
+			if (renderer) read(renderer + 0x24A8, &aa, sizeof(aa));
+			LogF("[DeathOverlay] automatic sample%d tick=%llu age=%llu living=%d real=%d native-vignette=%u power=%g darkness=%g effectScale=%g/%g/%g/%g renderMode=%d",
+				sample, now, now - deathAt, living, realActors, enabled, params[0], params[1], effectScale[0], effectScale[1], effectScale[2], effectScale[3], aa);
+			DumpSceneState();
+			++sample;
+		}
+	}).detach();
+}
+
 // [HangWatch] report: freeze every other thread once, log each thread's RIP (module-relative
 // for the exe / the mod / the trampoline) and, for threads inside the exe, the return addresses
 // found in the top of the stack; then dump both script-command rings. Called by the stall
-// watcher (rendered-frame counter stuck for 8 s) and by the F9 hotkey.
+// watcher (rendered-frame counter stuck for 8 s) and by the numpad * hotkey.
 static void HangReport(const char* why)
 {
+	DumpSceneState();
 	LogF("[HangWatch] %s - thread report:", why);
 	const HMODULE self = reinterpret_cast<HMODULE>(&__ImageBase);
 	MODULEINFO mi = {};
@@ -2683,6 +4614,30 @@ static void HangReport(const char* why)
 			if (++inLine == 8 || k + 1 == head) { LogF("[HangWatch]  %s", line); ln = 0; inLine = 0; }
 		}
 	}
+	if (g_cmdqRing && g_cmdqHead)
+	{
+		const uint32_t head = *g_cmdqHead;
+		const uint32_t n = head < 96 ? head : 96;
+		LogF("[HangWatch] last %u command-queue pushes (oldest first): cmd:a1:a2 @caller q=fill f=frame", n);
+		char line[1000]; int ln = 0; int inLine = 0;
+		for (uint32_t k = head - n; k < head; k++)
+		{
+			volatile uint8_t* e = g_cmdqRing + (k & 0x1ff) * 24;
+			const uint32_t* d = const_cast<const uint32_t*>(reinterpret_cast<volatile uint32_t*>(e));
+			ln += snprintf(line + ln, sizeof(line) - ln, " %X:%X:%X@%X q%u f%u", d[0], d[1], d[2], d[3], d[4], d[5]);
+			if (++inLine == 6 || k + 1 == head) { LogF("[HangWatch]  %s", line); ln = 0; inLine = 0; }
+		}
+	}
+	if (g_brainTraceCh >= 0 && g_brainHead)
+	{
+		const uint32_t head = g_brainHead, n = head < 64 ? head : 64;
+		LogF("[HangWatch] last %u brain calls for ch%d (oldest first): f=frame r=result a=action s=state cd=5f8/5fa/620/644 m=9c0 q=count:headcmd pa=a08..a1f", n, g_brainTraceCh);
+		for (uint32_t k = head - n; k < head; k++)
+		{
+			const BrainTraceEntry& e = g_brainRing[k & 0xff];
+			LogF("[HangWatch]   f%u r%u a%02X s%02X cd=%d/%d/%d/%d m=%d q=%u:%X pa=%08X %08X %08X %08X %08X %08X", e.frame, e.result, e.action, e.state, e.cd5f8, e.cd5fa, e.cd620, e.cd644, e.mode9c0, e.qcount, e.qhead, e.pa[0], e.pa[1], e.pa[2], e.pa[3], e.pa[4], e.pa[5]);
+		}
+	}
 	LogF("[HangWatch] report done");
 }
 
@@ -2696,9 +4651,9 @@ static void StartHangWatcher()
 		for (;;)
 		{
 			Sleep(100);
-			if ((GetAsyncKeyState(VK_MULTIPLY) & 0x8000) == 0)
+			if (g_dataRingOn || !StarKeyDown())
 				continue;
-			HangReport("numpad * pressed");
+			HangReport("* pressed");
 			Sleep(2000);
 		}
 	}).detach();
@@ -2766,6 +4721,291 @@ static void StartActorVarWatcher()
 	}).detach();
 }
 
+// [Diagnostics] WatchMover = <channel>,<hex offset>: DR0 write watch on the actor's current mover
+// sub-object (actor+0x2D0+mi*0x38 -> mover) at mover+offset (0x78 = speed, 0xa8 = mode flags), plus a
+// change log of the 4-byte value with the rendered-frame counter. Used to find who ends a walk leg.
+static void StartMoverWatcher()
+{
+	wchar_t spec[64] = {};
+	GetPrivateProfileStringW(L"Diagnostics", L"WatchMover", L"", spec, 64, wcModulePath);
+	int ch = -1; unsigned off = 0;
+	if (swscanf_s(spec, L"%d,%x", &ch, &off) != 2 || ch < 0 || ch >= 0x42 || off > 0x1000 || !g_gameBase)
+		return;
+	LogF("[MoverWatch] watching channel %d mover+0x%X", ch, off);
+	std::thread([ch, off] {
+		uintptr_t armed = 0; uint32_t lastVal = 0xFFFFFFFF;
+		for (;;)
+		{
+			Sleep(50);
+			const uintptr_t tbl = *reinterpret_cast<volatile uintptr_t*>(g_gameBase + 0x667E20);
+			if (!tbl) continue;
+			uintptr_t actor = 0, mv = 0; int8_t mi = -1;
+			if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(tbl + 0x18 + ch * 8), &actor, 8, nullptr) || !actor) continue;
+			if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(actor + 0x364), &mi, 1, nullptr) || mi < 0 || mi >= 8) continue;
+			if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(actor + 0x2D0 + mi * 0x38), &mv, 8, nullptr) || !mv) continue;
+			const uintptr_t cell = mv + off;
+			uint32_t v = 0;
+			if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(cell), &v, 4, nullptr)) continue;
+			if (cell != armed)
+			{
+				armed = cell; lastVal = v;
+				LogF("[MoverWatch] ch%d actor=%llX mover[%d]=%llX cell=%llX value=%X (%g) frame %u - arming write watch", ch, static_cast<unsigned long long>(actor), mi, static_cast<unsigned long long>(mv), static_cast<unsigned long long>(cell), v, *reinterpret_cast<float*>(&v), g_scriptFrames ? *g_scriptFrames : 0u);
+				ArmHwWatch(cell);
+			}
+			else if (v != lastVal)
+			{
+				LogF("[MoverWatch] ch%d mover+0x%X %X -> %X (%g) frame %u", ch, off, lastVal, v, *reinterpret_cast<float*>(&v), g_scriptFrames ? *g_scriptFrames : 0u);
+				lastVal = v;
+			}
+		}
+	}).detach();
+}
+
+// [Diagnostics] LegScan = <channel>: while that actor's mover speed is > 0 (a walk leg), sample the
+// actor struct (0..0xE00) and its AI block (0..0x5a8) every 33 ms; when the leg ends, report the dwords
+// that decreased on every sample of the leg (int or float) and the ones that were nonzero during the
+// leg and became 0 at its end - the candidates for the leg's frame budget.
+// [Diagnostics] WatchActorOff = <channel>,<hex offset>: DR0 write watch on actor+offset (4 bytes) with a
+// change log. Generic version of WatchActorVar / WatchMover for any actor field (e.g. 9a8 = the
+// state byte 0x9ab read by script command 0x99).
+static void StartActorOffWatcher()
+{
+	wchar_t spec[64] = {};
+	GetPrivateProfileStringW(L"Diagnostics", L"WatchActorOff", L"", spec, 64, wcModulePath);
+	int ch = -1; unsigned off = 0;
+	if (swscanf_s(spec, L"%d,%x", &ch, &off) != 2 || ch < 0 || ch >= 0x42 || off > 0x2000 || !g_gameBase)
+		return;
+	LogF("[ActorOff] watching channel %d actor+0x%X", ch, off);
+	std::thread([ch, off] {
+		uintptr_t armed = 0; uint32_t lastVal = 0xFFFFFFFF;
+		for (;;)
+		{
+			Sleep(20);
+			const uintptr_t tbl = *reinterpret_cast<volatile uintptr_t*>(g_gameBase + 0x667E20);
+			if (!tbl) continue;
+			uintptr_t actor = 0;
+			if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(tbl + 0x18 + ch * 8), &actor, 8, nullptr) || !actor) continue;
+			const uintptr_t cell = actor + off;
+			uint32_t v = 0;
+			if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(cell), &v, 4, nullptr)) continue;
+			if (cell != armed)
+			{
+				armed = cell; lastVal = v;
+				LogF("[ActorOff] ch%d actor=%llX +0x%X = %08X at frame %u - arming write watch", ch, static_cast<unsigned long long>(actor), off, v, g_scriptFrames ? *g_scriptFrames : 0u);
+				ArmHwWatch(cell);
+			}
+			else if (v != lastVal)
+			{
+				LogF("[ActorOff] ch%d +0x%X %08X -> %08X at frame %u", ch, off, lastVal, v, g_scriptFrames ? *g_scriptFrames : 0u);
+				lastVal = v;
+			}
+		}
+	}).detach();
+}
+
+static void StartLegScanner()
+{
+	const int ch = GetPrivateProfileIntW(L"Diagnostics", L"LegScan", -1, wcModulePath);
+	if (ch < 0 || ch >= 0x42 || !g_gameBase)
+		return;
+	LogF("[LegScan] watching channel %d", ch);
+	std::thread([ch] {
+		const int NA = 0xE00 / 4, NB = 0x5a8 / 4, NM = 0x100 / 4; // actor, AI block, mover object
+		static uint32_t first[0xE00 / 4 + 0x5a8 / 4 + 0x100 / 4], prev[0xE00 / 4 + 0x5a8 / 4 + 0x100 / 4], cur[0xE00 / 4 + 0x5a8 / 4 + 0x100 / 4];
+		static uint8_t down[0xE00 / 4 + 0x5a8 / 4 + 0x100 / 4], up[0xE00 / 4 + 0x5a8 / 4 + 0x100 / 4];
+		bool inLeg = false; int samples = 0; ULONGLONG legStart = 0;
+		auto asF = [](uint32_t v) { float f; memcpy(&f, &v, 4); return f; };
+		for (;;)
+		{
+			Sleep(33);
+			const uintptr_t tbl = *reinterpret_cast<volatile uintptr_t*>(g_gameBase + 0x667E20);
+			const uintptr_t aib = *reinterpret_cast<volatile uintptr_t*>(g_gameBase + 0x658840);
+			if (!tbl) continue;
+			uintptr_t actor = 0, mv = 0; int8_t mi = -1; float spd = 0;
+			if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(tbl + 0x18 + ch * 8), &actor, 8, nullptr) || !actor) continue;
+			if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(actor + 0x364), &mi, 1, nullptr) || mi < 0 || mi >= 8) continue;
+			if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(actor + 0x2D0 + mi * 0x38), &mv, 8, nullptr) || !mv) continue;
+			if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(mv + 0x78), &spd, 4, nullptr)) continue;
+			const bool moving = spd > 0.01f;
+			if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(actor), cur, NA * 4, nullptr)) continue;
+			if (aib) ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(aib + ch * 0x5a8), cur + NA, NB * 4, nullptr);
+			else memset(cur + NA, 0, NB * 4);
+			memset(cur + NA + NB, 0, NM * 4);
+			ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(mv), cur + NA + NB, NM * 4, nullptr);
+			// idle scan: between legs, find dwords that move monotonically for many samples in a row
+			// (a gap timer wherever it lives: actor, AI block or mover)
+			{
+				static uint32_t iprev[0xE00 / 4 + 0x5a8 / 4 + 0x100 / 4];
+				static uint16_t istreak[0xE00 / 4 + 0x5a8 / 4 + 0x100 / 4];
+				static int8_t idir[0xE00 / 4 + 0x5a8 / 4 + 0x100 / 4];
+				static bool ihave = false; static int isamples = 0; static ULONGLONG ilast = 0;
+				if (!moving && !inLeg)
+				{
+					if (ihave)
+					{
+						for (int i = 0; i < NA + NB + NM; i++)
+						{
+							const int32_t a = static_cast<int32_t>(iprev[i]), b = static_cast<int32_t>(cur[i]);
+							const float fa = asF(iprev[i]), fb = asF(cur[i]);
+							const bool fOk = fabsf(fa) < 1e6f && fabsf(fb) < 1e6f && fabsf(fa) > 1e-6f;
+							int d = 0;
+							if (b > a || (fOk && fb > fa + 1e-4f)) d = 1;
+							else if (b < a || (fOk && fb < fa - 1e-4f)) d = -1;
+							if (d != 0 && d == idir[i]) istreak[i]++;
+							else { istreak[i] = d ? 1 : 0; idir[i] = static_cast<int8_t>(d); }
+						}
+						isamples++;
+						if (GetTickCount64() - ilast > 3000)
+						{
+							ilast = GetTickCount64();
+							char line[1000]; int n = snprintf(line, sizeof(line), "[IdleScan] ch%d %d samples, ticking:", ch, isamples); int shown = 0;
+							for (int i = 0; i < NA + NB + NM && shown < 24; i++)
+							{
+								if (istreak[i] < 8 || i == 0x5DC / 4 || i == 0x6E0 / 4) continue;
+								const char* where = i < NA ? "a" : (i < NA + NB ? "ai" : "mv");
+								const int off = i < NA ? i * 4 : (i < NA + NB ? (i - NA) * 4 : (i - NA - NB) * 4);
+								n += snprintf(line + n, sizeof(line) - n, " %s+%X=%d/%g(%s%d)", where, off, static_cast<int32_t>(cur[i]), asF(cur[i]), idir[i] > 0 ? "+" : "-", istreak[i]);
+								shown++;
+							}
+							if (shown) LogF("%s", line);
+						}
+					}
+					else { ihave = true; isamples = 0; memset(istreak, 0, sizeof(istreak)); memset(idir, 0, sizeof(idir)); }
+					memcpy(iprev, cur, sizeof(iprev));
+				}
+				else ihave = false;
+			}
+			if (!moving && !inLeg) { Sleep(67); continue; }
+			if (moving && !inLeg)
+			{
+				inLeg = true; samples = 0; legStart = GetTickCount64();
+				memcpy(first, cur, sizeof(cur)); memcpy(prev, cur, sizeof(cur));
+				memset(down, 1, sizeof(down)); memset(up, 1, sizeof(up));
+				LogF("[LegScan] leg START ch%d spd=%.2f mover=%llX mode=%X", ch, spd, static_cast<unsigned long long>(mv), cur[NA + NB + 0xa8 / 4]);
+				{
+					char line[900]; int n = snprintf(line, sizeof(line), "[LegScan]  mover dwords:");
+					for (int i = 0; i < NM && n < 850; i++) n += snprintf(line + n, sizeof(line) - n, " %X", cur[NA + NB + i]);
+					LogF("%s", line);
+				}
+				continue;
+			}
+			samples++;
+			if (samples <= 60)
+			{
+				auto w16 = [&](int off) { return static_cast<unsigned>(cur[off / 4] >> ((off & 2) ? 16 : 0)) & 0xFFFF; };
+				const uint32_t* m = cur + NA + NB;
+				LogF("[LegScan]  t+%llums spd=%.2f ccc=%u cd6=%u cnt=%u D04=%g | mover mode=%X m80=%g m84=%g m88=%g m8c=%g m90=%g m94=%g m98=%g m9c=%g ma0=%g ma4=%g mac=%X mb0=%X mb4=%X mb8=%X mbc=%X",
+					GetTickCount64() - legStart, spd, cur[0xCCC / 4], w16(0xCD6), w16(0xC6A), asF(cur[0xD04 / 4]),
+					m[0xa8 / 4], asF(m[0x80 / 4]), asF(m[0x84 / 4]), asF(m[0x88 / 4]), asF(m[0x8c / 4]), asF(m[0x90 / 4]), asF(m[0x94 / 4]), asF(m[0x98 / 4]), asF(m[0x9c / 4]), asF(m[0xa0 / 4]), asF(m[0xa4 / 4]),
+					m[0xac / 4], m[0xb0 / 4], m[0xb4 / 4], m[0xb8 / 4], m[0xbc / 4]);
+			}
+			for (int i = 0; i < NA + NB + NM; i++)
+			{
+				const int32_t a = static_cast<int32_t>(prev[i]), b = static_cast<int32_t>(cur[i]);
+				const float fa = asF(prev[i]), fb = asF(cur[i]);
+				const bool fOk = fabsf(fa) < 1e6f && fabsf(fb) < 1e6f;
+				const bool dec = (b < a) || (fOk && fb < fa && fa - fb > 1e-4f);
+				const bool inc = (b > a) || (fOk && fb > fa && fb - fa > 1e-4f);
+				if (!dec) down[i] = 0;
+				if (!inc) up[i] = 0;
+			}
+			memcpy(prev, cur, sizeof(cur));
+			if (!moving)
+			{
+				inLeg = false;
+				LogF("[LegScan] leg END ch%d after %llu ms, %d samples", ch, GetTickCount64() - legStart, samples);
+				if (samples < 3) continue;
+				int shown = 0;
+				for (int i = 0; i < NA + NB + NM && shown < 60; i++)
+				{
+					const bool zeroedAtEnd = first[i] != 0 && cur[i] == 0;
+					const bool moverChanged = i >= NA + NB && first[i] != cur[i];
+					if (down[i] || up[i] || zeroedAtEnd || moverChanged)
+					{
+						const char* where = i < NA ? "actor" : (i < NA + NB ? "aib" : "mover");
+						const int off = i < NA ? i * 4 : (i < NA + NB ? (i - NA) * 4 : (i - NA - NB) * 4);
+						LogF("[LegScan]  %s+0x%X: %s first=%d/%g last=%d/%g", where, off, down[i] ? "DOWN" : (up[i] ? "UP" : (zeroedAtEnd ? "zeroed" : "changed")),
+							static_cast<int32_t>(first[i]), asF(first[i]), static_cast<int32_t>(cur[i]), asF(cur[i]));
+						shown++;
+					}
+				}
+			}
+		}
+	}).detach();
+}
+
+// [Diagnostics] TraceHitDedup=1 (2026-09-27, audit B2): upstream's hit dedup at the entry of the damage call
+// 0x14025FD20(attackerCh ecx, victim actor rdx, hit info r8/r9, ...) returns "hit" without damage when the
+// caller's rbx (the attack object) is already in the 20-slot list that the 30 Hz beat clears. Callers that walk
+// several victims with one object would lose every victim after the first. Called before the dedup check with
+// (object, victim, attacker channel); read-only on the list. Counts accepted calls and suppressed ones split
+// into: same victim again (the intended dedup), a new victim (a LOST hit), and repeats of a lost hit.
+static uint64_t* g_hitDedupList = nullptr;
+static volatile uint32_t g_hitAccepted = 0, g_hitSuppSame = 0, g_hitLostFirst = 0, g_hitLostRepeat = 0, g_hitMultiVictim = 0;
+struct HitSeen { uintptr_t obj, victim; uint32_t beat; bool accepted; };
+static HitSeen g_hitSeen[128] = {};
+static uint32_t g_hitSeenPos = 0;
+struct HitLost { uintptr_t obj; int attackerCh, victimCh; uint32_t beat; };
+static HitLost g_hitLost[16] = {};
+static volatile uint32_t g_hitLostLogged = 0;
+static bool g_hitDedupPairKey = false;                         // [Effects] HitDedupPerVictim
+static const uint64_t kHitPairMul = 0x5851F42D4C957F2DULL;    // < 2^63 so keystone takes the decimal
+static void NoteHitCall(uintptr_t obj, uintptr_t victim, int attackerCh)
+{
+	const uint64_t key = g_hitDedupPairKey ? obj + victim * kHitPairMul : obj;
+	bool listed = false;
+	for (int i = 0; i < 20 && g_hitDedupList[i]; ++i)
+		if (g_hitDedupList[i] == key) { listed = true; break; }
+	const uint32_t beat = g_scriptFrames ? g_scriptFrames[1] : 0;
+	if (!listed)
+	{
+		++g_hitAccepted;
+		// another victim of an object that already hit someone in this window: with the upstream key this
+		// call would have been dropped, so it counts the area hits that land thanks to HitDedupPerVictim
+		for (const auto& s : g_hitSeen)
+			if (s.obj == obj && s.victim != victim && s.accepted && beat - s.beat <= 2)
+			{
+				++g_hitMultiVictim;
+				break;
+			}
+		g_hitSeen[g_hitSeenPos++ & 127] = { obj, victim, beat, true };
+		return;
+	}
+	for (const auto& s : g_hitSeen)
+		if (s.obj == obj && s.victim == victim && beat - s.beat <= 2)
+		{
+			if (s.accepted) ++g_hitSuppSame; else ++g_hitLostRepeat;
+			return;
+		}
+	const uint32_t n = ++g_hitLostFirst;
+	g_hitSeen[g_hitSeenPos++ & 127] = { obj, victim, beat, false };
+	if (n <= 16)
+		g_hitLost[n - 1] = { obj, attackerCh, victim ? *reinterpret_cast<int8_t*>(victim + 0x18) : -1, beat };
+}
+
+// [Diagnostics] TraceMotionSpeed=1 (2026-10-26, Nexus bug "game occasionally speeds up, mostly enemies"): CMD134
+// (0x140351D60) queues a motion and sets the actor's motion speed factor [actor+0x5D4] from the GLOBAL tier m3
+// [0x63700C] (0x140351F79). Party channels 0..2 may be reset to 1.0 by mode flags [0x658F38]/[0x658F3B], enemies
+// never. With [Movement] AnalogTiers=1 + DashAtCap the analog watcher keeps m3 at the cap row (1.5x / 2x), so
+// enemy CMD134 motions would run 1.5x / 2x. Hooked at 0x140351FAC (after the factor and the party reset);
+// counts motion starts per side and factor and keeps the first enemy starts with a factor != 1 for the log.
+static volatile uint32_t g_msCount[2][4] = {};  // [party, enemy][x1.0, x1.5, x2.0, other]
+struct MotionSpeedEvent { int ch; float factor, m1, m3; ULONGLONG t; };
+static MotionSpeedEvent g_msEvents[24] = {};
+static volatile uint32_t g_msEventCount = 0, g_msEventLogged = 0;
+static bool g_traceMotionSpeed = false;
+static void NoteMotionSpeed(uintptr_t actor)
+{
+	const int ch = *reinterpret_cast<int8_t*>(actor + 0x18);
+	const float f = *reinterpret_cast<float*>(actor + 0x5D4);
+	const int side = (ch >= 0 && ch < 3) ? 0 : 1;
+	const int bucket = fabsf(f - 1.0f) < 0.01f ? 0 : fabsf(f - 1.5f) < 0.01f ? 1 : fabsf(f - 2.0f) < 0.01f ? 2 : 3;
+	++g_msCount[side][bucket];
+	if (side == 1 && bucket != 0 && g_msEventCount < 24)
+		g_msEvents[g_msEventCount++] = { ch, f, *reinterpret_cast<float*>(g_gameBase + 0x637004),
+			*reinterpret_cast<float*>(g_gameBase + 0x63700C), GetTickCount64() };
+}
+
 static void StartStatsWatcher()
 {
 	if (!g_logEnabled || !g_stats)
@@ -2786,6 +5026,44 @@ static void StartStatsWatcher()
 					cur[0], cur[1], cur[2], cur[3], cur[4], cur[7], cur[8], cur[5] + 1, cur[6] + 1);
 				memcpy(last, cur, sizeof(cur));
 			}
+			if (g_traceMotionSpeed)
+			{
+				static uint32_t lastM[8] = {};
+				uint32_t curM[8];
+				for (int i = 0; i < 8; ++i)
+					curM[i] = g_msCount[i / 4][i % 4];
+				if (memcmp(curM, lastM, sizeof(curM)) != 0)
+				{
+					LogF("[MotionSpeed +%llus] CMD134 starts - party: x1.0=%u x1.5=%u x2.0=%u other=%u | enemies: x1.0=%u x1.5=%u x2.0=%u other=%u | global m1=%.2f m3=%.2f",
+						(GetTickCount64() - start) / 1000ULL, curM[0], curM[1], curM[2], curM[3], curM[4], curM[5], curM[6], curM[7],
+						*reinterpret_cast<volatile float*>(g_gameBase + 0x637004), *reinterpret_cast<volatile float*>(g_gameBase + 0x63700C));
+					memcpy(lastM, curM, sizeof(curM));
+				}
+				for (const uint32_t n = g_msEventCount; g_msEventLogged < n; ++g_msEventLogged)
+				{
+					const MotionSpeedEvent& e = g_msEvents[g_msEventLogged];
+					LogF("[MotionSpeed] enemy motion #%u: ch %d started at x%.3f (global m1=%.2f m3=%.2f, t=%llu)",
+						g_msEventLogged + 1, e.ch, e.factor, e.m1, e.m3, e.t);
+				}
+			}
+			if (g_hitDedupList)
+			{
+				static uint32_t lastH[5] = {};
+				const uint32_t curH[5] = { g_hitAccepted, g_hitSuppSame, g_hitLostFirst, g_hitLostRepeat, g_hitMultiVictim };
+				if (memcmp(curH, lastH, sizeof(curH)) != 0)
+				{
+					LogF("[HitDedup +%llus] accepted=%u (extra victims of one attack=%u) suppressed: same victim=%u, LOST new victim=%u (+%u repeats)",
+						(GetTickCount64() - start) / 1000ULL, curH[0], curH[4], curH[1], curH[2], curH[3]);
+					memcpy(lastH, curH, sizeof(curH));
+				}
+				const uint32_t lost = curH[2] < 16 ? curH[2] : 16;
+				for (; g_hitLostLogged < lost; ++g_hitLostLogged)
+				{
+					const HitLost& h = g_hitLost[g_hitLostLogged];
+					LogF("[HitDedup] lost hit #%u: attack object %llX, attacker ch %d -> victim ch %d, beat %u",
+						g_hitLostLogged + 1, static_cast<unsigned long long>(h.obj), h.attackerCh, h.victimCh, h.beat);
+				}
+			}
 			if (g_scriptStats)
 			{
 				static uint32_t lastS[12] = {};
@@ -2803,6 +5081,111 @@ static void StartStatsWatcher()
 	}).detach();
 }
 
+// [Gameplay] ExpMultiplier: the AddExp hook sums into these trampoline cells (EXP before scaling,
+// EXP after scaling, number of scaled gains, number of level-setter calls left unscaled); this
+// thread logs the totals whenever they change, so a play session can be checked from the log.
+static volatile uint64_t* g_expCell[4] = {};
+static int g_expMul = 1;
+
+static void StartExpLogWatcher()
+{
+	if (!g_expCell[0])
+		return;
+	std::thread([] {
+		uint64_t lastGains = 0, lastSetter = 0;
+		for (;;)
+		{
+			Sleep(1000);
+			const uint64_t gains = *g_expCell[2], setter = *g_expCell[3];
+			if (gains == lastGains && setter == lastSetter)
+				continue;
+			LogF("[Gameplay] EXP x%d: %llu gains, +%llu EXP -> +%llu; level-setter calls left unscaled: %llu",
+				g_expMul, gains, *g_expCell[0], *g_expCell[1], setter);
+			lastGains = gains;
+			lastSetter = setter;
+		}
+	}).detach();
+}
+
+// [Diagnostics] DataRing=1 (2026-09-26): keeps the last 6 s of the game's .data section in memory
+// (a snapshot every 100 ms, ~234 MB) and writes them to <ini>_dataring_N.bin when * is pressed (numpad *
+// or Shift+8; F keys are taken by the game).
+// docs/tools/dataring_scan.py lists values that were idle, ran for a moment and stopped again, such as
+// a HUD message timer counted per rendered frame (Cid's Crucible notice vanishing too fast at 120 FPS).
+static void StartDataRingWatcher()
+{
+	if (!g_gameBase)
+		return;
+	uint32_t rva = 0x60B000, size = 0x3E2890;
+	{
+		const auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(g_gameBase);
+		const auto nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(g_gameBase + dos->e_lfanew);
+		const IMAGE_SECTION_HEADER* sec = IMAGE_FIRST_SECTION(nt);
+		for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; i++)
+			if (memcmp(sec[i].Name, ".data\0\0", 8) == 0)
+			{
+				rva = sec[i].VirtualAddress;
+				size = sec[i].Misc.VirtualSize;
+			}
+	}
+	std::thread([rva, size] {
+		constexpr uint32_t kCount = 60, kIntervalMs = 100;
+		struct Stamp { uint64_t tickMs; uint32_t frames; uint32_t pad; };
+		struct Header { char magic[4]; uint32_t version, count, rva, size, intervalMs; float fps; uint32_t reserved; };
+		auto ring = static_cast<uint8_t*>(VirtualAlloc(nullptr, size_t(size) * kCount, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+		if (!ring)
+		{
+			LogF("[DataRing] could not allocate %llu MB", (unsigned long long)size * kCount >> 20);
+			return;
+		}
+		Stamp stamps[kCount] = {};
+		uint32_t head = 0, filled = 0, saved = 0;
+		const auto src = reinterpret_cast<const uint8_t*>(g_gameBase + rva);
+		LogF("[DataRing] armed: .data rva 0x%X size 0x%X, %u snapshots x %u ms; press * right after the event", rva, size, kCount, kIntervalMs);
+		g_dataRingOn = true;
+		GetAsyncKeyState(VK_MULTIPLY);
+		GetAsyncKeyState('8');
+		for (;;)
+		{
+			const ULONGLONG t0 = GetTickCount64();
+			memcpy(ring + size_t(head) * size, src, size);
+			stamps[head] = { t0, g_scriptFrames ? *g_scriptFrames : 0, 0 };
+			head = (head + 1) % kCount;
+			if (filled < kCount)
+				filled++;
+			const bool star = (GetAsyncKeyState(VK_MULTIPLY) & 0x8001) != 0
+				|| ((GetAsyncKeyState('8') & 0x8001) != 0 && (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0);
+			if (star)
+			{
+				wchar_t path[MAX_PATH];
+				swprintf_s(path, L"%s_dataring_%u.bin", wcModulePath, ++saved);
+				FILE* f = nullptr;
+				if (_wfopen_s(&f, path, L"wb") == 0 && f)
+				{
+					const uint32_t first = filled < kCount ? 0 : head;
+					const Header h = { { 'D', 'R', 'N', 'G' }, 1, filled, rva, size, kIntervalMs, g_framerate, 0 };
+					fwrite(&h, sizeof(h), 1, f);
+					for (uint32_t i = 0; i < filled; i++)
+						fwrite(&stamps[(first + i) % kCount], sizeof(Stamp), 1, f);
+					for (uint32_t i = 0; i < filled; i++)
+						fwrite(ring + size_t((first + i) % kCount) * size, 1, size, f);
+					fclose(f);
+					LogF("[DataRing] saved %u snapshots (%.1f s) to %ls", filled, filled * kIntervalMs / 1000.0, path);
+				}
+				else
+					LogF("[DataRing] cannot write %ls", path);
+				while (StarKeyDown())
+					Sleep(50);
+				GetAsyncKeyState(VK_MULTIPLY);
+				GetAsyncKeyState('8');
+			}
+			const ULONGLONG spent = GetTickCount64() - t0;
+			if (spent < kIntervalMs)
+				Sleep(static_cast<DWORD>(kIntervalMs - spent));
+		}
+	}).detach();
+}
+
 struct byte_patch {
 	int32_t offset;
 	uint8_t val;
@@ -2815,7 +5198,7 @@ ks_free_dll ks_free_fnc;
 HMODULE hDLLKeystone;
 
 constexpr float SIXTEENBYNINE = 16.0f / 9.0f;
-const uint8_t ALLOCATED_FLOATS = 30;
+const uint8_t ALLOCATED_FLOATS = 64; // audit 2026-09-26 (R16): was 30, ~21 used at 2560x1440@120, ~27 ultrawide
 const uint8_t CONSTANTS_ARRAY_SIZE = 5;
 const uint8_t POINTERS_ARRAY_SIZE = 10;
 const uint8_t FLOATS_ARRAY_SIZE = 10;
@@ -2872,6 +5255,12 @@ int ParametricASMJump(const char* asmstring, hook::pattern_match match, int32_t 
 	for (int i = 0; i < FLOATS_ARRAY_SIZE; i++) {
 		std::regex e("%" + std::to_string(i));
 		totalpointers[POINTERS_ARRAY_SIZE + i] = FindOrInsertFloat(param_floats[i]); //Find the float addresses
+		// Audit 2026-09-26 (R16): a full pool used to give a silently truncated rip displacement.
+		if (totalpointers[POINTERS_ARRAY_SIZE + i] == NULL && replace_constants.find("%" + std::to_string(i)) != std::string::npos)
+		{
+			LogF("  [FLOAT POOL FULL] %%%d = %f not placed, hook skipped: %s", i, param_floats[i], asmstring);
+			return 1;
+		}
 		replace_floats = std::regex_replace(replace_floats, e, "dword ptr [rip + ?" + std::to_string(POINTERS_ARRAY_SIZE + i) + "]"); //Recreate the rip offset syntax, with range outside of what could be used so it doesn't interfere with user defined ones
 	}
 
@@ -2997,6 +5386,11 @@ void OnInitializeHook()
 	g_logEnabled = GetPrivateProfileIntW(L"Diagnostics", L"EnableLog", 1, wcModulePath) != 0;
 	LogInit();
 	LogF("=== FFT0HD Unlocker init ===");
+	{
+		const int traceMinutes = GetPrivateProfileIntW(L"Diagnostics", L"TraceMinutes", 15, wcModulePath);
+		g_traceMs = static_cast<ULONGLONG>(traceMinutes > 0 ? traceMinutes : 15) * 60000ULL;
+		if (traceMinutes != 15) LogF("[Diagnostics] TraceMinutes=%d: bounded traces run for %llu ms", traceMinutes, g_traceMs);
+	}
 
 	g_traceFiles = GetPrivateProfileIntW(L"Diagnostics", L"TraceFiles", 0, wcModulePath) != 0;
 	g_skipIntroVideos = GetPrivateProfileIntW(L"Intro", L"SkipIntroVideos", 0, wcModulePath) != 0;
@@ -3029,6 +5423,11 @@ void OnInitializeHook()
 		g_trampolineLo = reinterpret_cast<uintptr_t>(trampoline->RawSpace(0));
 		g_trampolineHi = g_trampolineLo + 0x100000;
 		uintptr_t baseaddress = reinterpret_cast<uintptr_t>(GetModuleHandle(nullptr));
+		// Audit 2026-09-26 (R4, B10): hooks installed in the >30 fps block read these before the old
+		// assignment points near the end (DelayDodgePermission/TraceMove read g_gameBase; the LockTurn
+		// install condition reads g_tuneWindow).
+		g_gameBase = baseaddress;
+		g_tuneWindow = GetPrivateProfileIntW(L"Camera", L"TuneWindow", 0, wcModulePath) != 0;
 
 		floatpointers = reinterpret_cast<float*>(trampoline->RawSpace(ALLOCATED_FLOATS * sizeof(float)));
 		memset(floatpointers, 0, ALLOCATED_FLOATS * sizeof(float));
@@ -3117,6 +5516,35 @@ void OnInitializeHook()
 		// (L3) handler so the movement trace can watch the speed-tier counter live.
 		if (GetPrivateProfileIntW(L"Diagnostics", L"TraceMove", 0, wcModulePath) != 0)
 		{
+			// Candidate MP-restoration action 0x2a6cc0: count visits to its inline
+			// grant block without changing MP, AG, registers or flags. Also at 30 FPS.
+			auto mpChecks = trampoline->Pointer<uint32_t>();
+			*mpChecks = 0;
+			g_mpRestoreCalls = mpChecks;
+			pointers[0] = reinterpret_cast<uintptr_t>(mpChecks);
+			match = FindOne("44 8B 8E 44 09 00 00 44 8B 86 40 09 00 00 45 3B C1");
+			ParametricASMJump("pushfq; inc dword ptr [rip + ?0]; popfq; mov r9d, dword ptr [rsi + 0x944]", match, 0, 7);
+			LogF("[TraceMove] resource telemetry enabled: MP/AG + inline restoration checks at 0x2a701e");
+			// Bytecode command ids are one-based; VM table records are 48 bytes.
+			auto motionCommand = reinterpret_cast<MoveCommand*>(baseaddress + 0x612368 + (0x134 - 1) * 48);
+			auto cancelCommand = reinterpret_cast<MoveCommand*>(baseaddress + 0x612368 + (0x17f - 1) * 48);
+			auto finishedCommand = reinterpret_cast<MoveCommand*>(baseaddress + 0x612368 + (0xfc - 1) * 48);
+			if (reinterpret_cast<uintptr_t>(*motionCommand) == baseaddress + 0x351d60 &&
+				reinterpret_cast<uintptr_t>(*cancelCommand) == baseaddress + 0x355110 &&
+				reinterpret_cast<uintptr_t>(*finishedCommand) == baseaddress + 0x364490)
+			{
+				QueryPerformanceFrequency(&g_moveCommandFrequency);
+				QueryPerformanceCounter(&g_moveCommandClock);
+				g_moveMotionCommand = *motionCommand;
+				g_moveCancelCommand = *cancelCommand;
+				g_moveFinishedCommand = *finishedCommand;
+				Patch<MoveCommand>(motionCommand, &MoveMotionCommandTrace);
+				Patch<MoveCommand>(cancelCommand, &MoveCancelCommandTrace);
+				Patch<MoveCommand>(finishedCommand, &MoveFinishedCommandTrace);
+				LogF("[TraceMove] precise command timing enabled: CMD134 request/wait/start, CMD17F cancel (QPC ms since hook init)");
+				LogF("[TraceMove] motion completion enabled: CMDFC poll/finished, animation layer 0 and request queue");
+			}
+			else LogF("[TraceMove] MISS command table validation; precise timing disabled");
 			auto pctx = trampoline->Pointer<uint64_t>();
 			*pctx = 0;
 			g_moveCtxCell = pctx;
@@ -3573,6 +6001,20 @@ void OnInitializeHook()
 		int ResX = GetPrivateProfileIntW(L"OverrideRes", L"ResX", 0, wcModulePath);
 		int ResY = GetPrivateProfileIntW(L"OverrideRes", L"ResY", 0, wcModulePath);
 
+		//[fork] UseDesktopResolution = 1: take the primary display's current resolution instead of
+		//ResX/ResY (handy when switching between a monitor and a TV).
+		if (GetPrivateProfileIntW(L"OverrideRes", L"UseDesktopResolution", 0, wcModulePath) != 0)
+		{
+			DEVMODEW cur = {};
+			cur.dmSize = sizeof(cur);
+			if (EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &cur) && cur.dmPelsWidth > 0 && cur.dmPelsHeight > 0)
+			{
+				ResX = static_cast<int>(cur.dmPelsWidth);
+				ResY = static_cast<int>(cur.dmPelsHeight);
+				LogF("[Resolution] UseDesktopResolution: primary display is %dx%d", ResX, ResY);
+			}
+		}
+
 		//[fork] A resolution the primary display cannot show closes the game silently at startup
 		//(the ini asks for 4K on a 1440p monitor, nothing happens, no log). Check the requested
 		//mode against the display's mode list; if it is not there, fall back to the desktop
@@ -3700,8 +6142,13 @@ void OnInitializeHook()
 				ParametricASMJump("lea rdx, [rsp + 0x38]; cmp dword ptr [rdx], 0; jnz A; mov dword ptr [rdx], 0x15; A: nop;", match, 0, 0x5);
 
 				//Font fix
+				//[fork] Below 1080p the inset is 0, and FindOrInsertFloat(0) hands out the first FREE float
+				//slot, which the next inserted float then overwrites (MotionStartWaitFix's 2*fps/30 = 6 at
+				//90 fps cropped every glyph by 6 texels at 720p). A zero inset is a no-op, so skip the hook.
+				const float fontInset = max(max(static_cast<float>(ResX) / 1920.0f, static_cast<float>(ResY) / 1080.0f) - 1.0f, 0);
 				match = FindOne("02 F3 0F 10 5C 24 48 89 42 10 41 8B 42 04 0F 57");
-				param_floats[0] = max(max(static_cast<float>(ResX) / 1920.0f, static_cast<float>(ResY) / 1080.0f) - 1.0f, 0);
+				param_floats[0] = fontInset;
+				if (fontInset > 0.0f)
 				ParametricASMJump("movss xmm4, [r10]; addss xmm4, %0; movss [rdx + 0x10], xmm4; movss xmm4, [r10 + 0x4]; addss xmm4, %0; movss [rdx + 0x14], xmm4; movss xmm4, [r10 + 0x8]; subss xmm4, %0; movss [rdx + 0x28], xmm4; movss xmm4, [r10 + 0xC]; subss xmm4, %0; movss [rdx + 0x2C], xmm4; xorps xmm4, xmm4; movaps xmm0, xmm4;", match, 0X7, 0x25);
 
 				//Fix for a problematic texture with wrong coordinates
@@ -3725,12 +6172,12 @@ void OnInitializeHook()
 			const bool disableTriggerDedup = GetPrivateProfileIntW(L"Diagnostics", L"DisableTriggerDedup", 0, wcModulePath) != 0;
 			const bool scriptVarDedupAll = GetPrivateProfileIntW(L"Movement", L"ScriptVarDedupAll", 1, wcModulePath) != 0;
 			const bool scriptTick30Hz = GetPrivateProfileIntW(L"Movement", L"ScriptTick30Hz", 0, wcModulePath) != 0;
+			const bool aiBrain30Hz = GetPrivateProfileIntW(L"Movement", L"AiBrain30Hz", 0, wcModulePath) != 0;
 			if (disableCounterDedup)
 				LogF("[Framerate] counter dedup patches DISABLED via ini (bisect mode)");
 			if (disableTriggerDedup)
 				LogF("[Framerate] trigger dedup patches DISABLED via ini (bisect mode)");
 			float framerate = framerateint;
-			g_framerate = framerate;
 			if (framerate > 120.0f)
 			{
 				MessageBox(
@@ -3740,7 +6187,11 @@ void OnInitializeHook()
 					MB_ICONWARNING | MB_OK
 				);
 				framerate = 120.0f;
+				LogF("[Framerate] cap %d is above 120: running at 120", framerateint);
 			}
+			// Audit 2026-09-26 (B8): after the clamp, so fixes outside this block (TurretFireRateFix,
+			// FirstFrameFix, WeaponChargeRateFix) use the real rate at FpsCap > 120.
+			g_framerate = framerate;
 
 			/*[ref] points to the absolute address in the PSP elf on which similar patches were applied*/
 
@@ -3822,16 +6273,136 @@ void OnInitializeHook()
 			Patch<uint32_t>(frint12.get<void>(0x7), (framerate / 30.0f) * 25.0f);
 
 			//[ref: 0x000A9AF4]
+			//[Effects] AnimQuatAlignFix=1 (2026-09-26, supersedes AnimLoopSeamFix): the save-stone sign problem
+			//also hits consecutive keys INSIDE a clip. User A/B at 120 fps: with the character rate at an exact
+			//step (64/256 per render, CharAnimRateFix) lips flicker; at 63/256 (29.9/fps) they look right but
+			//bodies run 1.56% slow. Step 64 samples every key interval exactly at frac 128, where a sign-opposite
+			//pair (log: lip bones 25/26/28 of the face overlay layer, w +32766 / -32762) lerps to a near-zero
+			//quaternion (a one-render 180-degree snap of the bone); step 63 hits frac 128 once per 256 renders.
+			//Align prev to cur after every cursor move, rewind or advance, of every layer (AlignLayerQuats,
+			//saturating): 0x1403BEBEA..0x1403BEBFB (flag-4 test + call 0x1403BEA50) calls AlignLayerQuats, and
+			//0x1403BEBCC (7 bytes, mov rdx,[rbx+8]; mov r8d,esi, the advance path) also sets r14b = 1 like the
+			//rewind path. Installed here, before the character rate below, which needs both hooks (audit R3).
+			bool quatAlignFull = false;
+			if (GetPrivateProfileIntW(L"Effects", L"AnimQuatAlignFix", 1, wcModulePath) != 0)
+			{
+				g_traceQuatAlign = GetPrivateProfileIntW(L"Diagnostics", L"TraceQuatAlign", 0, wcModulePath) != 0;
+				auto qaCall = FindOne("4C 8B 74 24 40 74 11 48 8B 0B F6 81 84 00 00 00 04 74 05 E8");
+				auto qaAdv = FindOne("85 F6 7E 0F 48 8B 53 08 44 8B C6 E8");
+				constants[0] = reinterpret_cast<uintptr_t>(&AlignLayerQuats);
+				g_quatAlignCallHooked = ParametricASMJump("mov rcx, qword ptr [rbx]; mov rax, $0; call rax", qaCall, 7, 0x18) == 0;
+				if (g_quatAlignCallHooked)
+					quatAlignFull = ParametricASMJump("mov rdx, qword ptr [rbx + 8]; mov r8d, esi; mov r14b, 1", qaAdv, 4, 0xB) == 0;
+				if (quatAlignFull)
+					LogF("[Effects] AnimQuatAlignFix on: quaternion sign alignment after every key advance or rewind of every animation layer (saturating; supersedes AnimLoopSeamFix)");
+				else
+					LogF("[Effects] AnimQuatAlignFix: WARN hooks incomplete (rewind %d, advance %d); CharAnimRateFix stays off", g_quatAlignCallHooked ? 1 : 0, quatAlignFull ? 1 : 0);
+			}
 			auto charactersanimationspeed = FindOne("80 A3 B6 09 00 00 F7 C7 83 D8 05 00 00 00 00 80 3F");
 			//The lip sync function that the game uses for real time cutscenes REALLY
 			//doesn't like exactly representable values here: the original workaround
 			//nudged 0.5f (60fps) to 29.9f/60, but 120fps produces exactly 0.25f and
 			//broke lips the same way. Nudge whenever the division is exact (60, 120,
-			//also 40/48/80/96...), keep the true ratio for inexact ones (90 etc).
+			//also 40/48/80/96...; the float test is also true at 90/144 and most caps).
+			//2026-09-26: the real cause is a quaternion sign flip between consecutive keys
+			//of the face clip (see AnimQuatAlignFix); the downward nudge only hid it.
 			float charanimspeed = 30.0f / framerate;
 			if (charanimspeed * framerate == 30.0f)
-				charanimspeed = 29.9f / framerate;
+			{
+				//[Effects] CharAnimRateFix=1 (2026-09-26, user report after CameraAnimRateFix: in the chapter 8 Rem
+				//scene the camera now keeps the 30 fps pace but Rem's body lags behind it). The layer step 0x1403BDB60
+				//truncates (cvttss2si) rate*256, so 29.9/120 = 0.24917 steps 63/256 per render (252 per 30 Hz tick
+				//instead of 256, -1.56%; -0.78% for clips at speed 2). Nudge UP instead: 30.1/fps is still not an
+				//exact ratio, and truncates to the exact step (64, 128; 128 at 60 fps). The exact step alone made lips
+				//flicker (user A/B 2026-09-26): it needs AnimQuatAlignFix (see there), so it is tied to it.
+				const bool nudgeUp = GetPrivateProfileIntW(L"Effects", L"CharAnimRateFix", 1, wcModulePath) != 0
+					&& quatAlignFull;
+				charanimspeed = (nudgeUp ? 30.1f : 29.9f) / framerate;
+				LogF("[Effects] CharAnimRateFix %s: character animation rate %.6f (%d/256 per render, ideal %.2f)",
+					nudgeUp ? "on" : "off", charanimspeed, static_cast<int>(charanimspeed * 256.0f),
+					7680.0 / framerate);
+			}
 			Patch<float>(charactersanimationspeed.get<void>(0xD), charanimspeed);
+			//[Effects] CameraAnimRateFix=1 (2026-09-26, user report: chapter 8 l'Cie scene, Rem never lifts her
+			//head and her eyes glow at once at 120 fps). The line above rescales ActorCharacter only: its per-frame
+			//update 0x140191510 (vtable 0x1405665B8 slot 2) resets [actor+0x5D8] every frame, and the motion queue
+			//0x1401B49A0 starts clips at rate [+0x5D8] * [+0x5D4]. The cutscene cameras ActorCameraEye (vtable
+			//0x140566308, created by script op 0x27) and ActorCamera (0x140566058) update through 0x140190740 /
+			//0x140190370 = `sub rsp,28h; mov edx,1; call 0x1401B49A0` and keep the constructor's 1.0 (0x1401B48FD),
+			//so camera clips queued with op 0x28 play per RENDERED frame. Traced (dump/rem_scene): camera steps
+			//4.67 s / 3.86 s at 30 fps vs 1.16 s / 0.97 s at 120; the script waits for each step and queues Rem's
+			//next motion before her look-up is seen. Set [this+0x5D8] = 30/fps (exact) at the top of both updates.
+			//Verified 2026-09-26 at 120 fps (user + trace dump/rem_scene/fix120): the whole scene matches the 30 fps
+			//timeline within one 30 Hz tick (camera step 4.64 s vs 4.67 s). Default on.
+			if (GetPrivateProfileIntW(L"Effects", L"CameraAnimRateFix", 1, wcModulePath) != 0)
+			{
+				struct CamClass { uintptr_t vtable, update; const char* name; };
+				const CamClass cams[] = { { 0x566308, 0x190740, "ActorCameraEye" }, { 0x566058, 0x190370, "ActorCamera" } };
+				const float camRate = 30.0f / framerate;
+				uint32_t camRateBits;
+				memcpy(&camRateBits, &camRate, sizeof(camRateBits));
+				int camHooks = 0;
+				FindAll("48 83 EC 28 BA 01 00 00 00 E8 ? ? ? ? 32 C0 48 83 C4 28 C3", 3).for_each_result([&](auto found)
+				{
+					const uintptr_t at = reinterpret_cast<uintptr_t>(found.get<void>(0));
+					for (const auto& c : cams)
+					{
+						if (at != baseaddress + c.update || *reinterpret_cast<uintptr_t*>(baseaddress + c.vtable + 0x10) != at)
+							continue;
+						constants[0] = camRateBits;
+						if (ParametricASMJump("mov dword ptr [rcx + 0x5d8], $0; sub rsp, 0x28; mov edx, 1", found, 0, 9) == 0)
+							++camHooks;
+					}
+				});
+				if (camHooks == 2)
+					LogF("[Effects] CameraAnimRateFix on: ActorCameraEye/ActorCamera clips at %.4f per render", camRate);
+				else
+					LogF("[Effects] CameraAnimRateFix: %d of 2 camera updates hooked (vtables not as expected)", camHooks);
+			}
+			if (GetPrivateProfileIntW(L"Movement", L"DodgeCadenceFix", 1, wcModulePath) != 0)
+			{
+				// This assignment is the actor's PER-FRAME rate reset (191510),
+				// not its constructor. Use the exact ratio only during party dodge
+				// action 0x5001 in gameplay; retain the lip-sync nudge elsewhere.
+				float exactAnimSpeed = 30.0f / framerate;
+				uint32_t defaultBits, exactBits;
+				memcpy(&defaultBits, &charanimspeed, sizeof(defaultBits));
+				memcpy(&exactBits, &exactAnimSpeed, sizeof(exactBits));
+				constants[0] = defaultBits;
+				constants[1] = exactBits;
+				pointers[0] = baseaddress + 0x658f70;
+				ParametricASMJump(
+					"mov dword ptr [rbx + 0x5d8], $0; pushfq; push rax; push rdx; "
+					"cmp dword ptr [rip + ?0], 0; jne A; cmp byte ptr [rbx + 0x965], 0; jne A; "
+					"cmp byte ptr [rbx + 0x18], 3; jae A; cmp dword ptr [rbx + 0x7c0], 0; jle A; "
+					"cmp dword ptr [rbx + 0x7b8], 0; jle A; mov eax, dword ptr [rbx + 0x7bc]; xor edx, edx; "
+					"div dword ptr [rbx + 0x7b8]; imul rdx, rdx, 40; cmp word ptr [rbx + rdx + 0x7c8], 0x5001; jne A; "
+					"mov dword ptr [rbx + 0x5d8], $1; A: pop rdx; pop rax; popfq",
+					charactersanimationspeed, 0x7, 0x11);
+				g_dodgeReadyDelay = static_cast<uint32_t>(ceilf(framerate / 30.0f)) - 1;
+				match = FindOne("40 53 57 48 83 EC 78 F6 81 F2 09 00 00 01 48 8B FA 48 8B D9");
+				constants[0] = reinterpret_cast<uintptr_t>(&DelayDodgePermission);
+				// Entry has only two arguments. Preserve them and reserve Win64
+				// shadow space/alignment for the C++ predicate before the prologue.
+				ParametricASMJump(
+					"push rcx; push rdx; sub rsp, 0x28; mov rax, $0; call rax; add rsp, 0x28; pop rdx; pop rcx; "
+					"test al, al; je A; xor eax, eax; ret; A: push rbx; push rdi; sub rsp, 0x78",
+					match, 0, 0x7);
+				LogF("[Movement] DodgeCadenceFix on: exact party dodge animation rate, +%u rendered frames before consuming repeat permission", g_dodgeReadyDelay);
+			}
+
+			// CMD134 queues a motion after a two-frame setup wait. Its counter
+			// advances by one per rendered frame: measured 66.5 ms at 30 FPS,
+			// 16.5 ms at 120 FPS. Preserve the authored wait in real time by
+			// scaling its private threshold, not the shared constant 2.0 or VM tick.
+			// Experimental until the 120 FPS comparison with this patch is verified.
+			if (GetPrivateProfileIntW(L"Movement", L"MotionStartWaitFix", 1, wcModulePath) != 0)
+			{
+				match = FindOne("F3 0F 10 57 4C F3 0F 10 05 CF DF 22 00 0F 2F C2 76 31");
+				param_floats[0] = 2.0f * framerate / 30.0f;
+				ParametricASMJump("movss xmm0, %0", match, 0x5, 0xD);
+				LogF("[Movement] MotionStartWaitFix on: CMD134 setup wait 2 -> %.3f rendered frames at %.0f FPS", param_floats[0], framerate);
+			}
 
 			//Always use in conjunction with $ or damage will be registered multiple times
 			auto rtsanimationspeed = FindOne("85 D2 74 0A C7 82 0C 06 00 00 00 00 80 3F 48 83");
@@ -3856,20 +6427,58 @@ void OnInitializeHook()
 			// ch2 sub-boss. [Movement] BossVerticalFix=1 also scales xmm0, completing the
 			// fix. On this branch xmm0 feeds only the Y store (X uses xmm1), so scaling it
 			// cannot double-scale X; bit-exact no-op at 30fps.
-			const bool bossVerticalFix = GetPrivateProfileIntW(L"Movement", L"BossVerticalFix", 0, wcModulePath) != 0;
+			// [Movement] VerticalMotionFix=1 (2026-10-31, default 0 until verified): vertical motion is per-render and unscaled above
+			// 30 fps for everyone (GAME_INTERNALS "Enemies speed up at 60 fps"): (1) the speed-mover Y step (this inject, the old
+			// BossVerticalFix part), (2) ground-actor gravity in the mover update 0x1403AFB00: mover+0x80 += 4.0 per render while
+			// e3c bit 24 is set (0x1403AFB64 / 0x1403AFBE3) and dy -= v at 0x1403AFF1E, so ledge falls took 30/fps of their time,
+			// (3) the flyer pushes / drag (gravity 9.8, hover servo, walk legs; 0x14019C480 / 0x1401BA8E0 / 0x1401BA3A0). With
+			// k = 30/fps: v += a*k per render and y += v*k per render reproduce the native path and timing at any cap.
+			const bool verticalMotionFix = GetPrivateProfileIntW(L"Movement", L"VerticalMotionFix", 0, wcModulePath) != 0;
+			const bool bossVerticalFix = verticalMotionFix || GetPrivateProfileIntW(L"Movement", L"BossVerticalFix", 0, wcModulePath) != 0;
 			match = FindOne("24 0F 28 CE F3 0F 59 4C 24 20 F3 0F 11 43 1C F3");
 			param_floats[0] = 30.0f / framerate;
 			pointers[0] = baseaddress + 0x658F70;
 			pointers[1] = baseaddress + 0x6D1CEC;
+			pointers[2] = baseaddress + 0x74F0B0;   // camera mover object
 			{
 				std::string walkAsm = "mulss xmm1, dword ptr [rsp + 0x20]; cmp dword ptr [rip + ?0], 1; jnz A; cmp dword ptr [rip + ?1], 0; jnz B; A: mulss xmm1, %0; mulss xmm6, %0; ";
-				if (bossVerticalFix)
-					walkAsm += "mulss xmm0, %0; ";
+				if (bossVerticalFix)   // 2026-10-31: never scale the camera mover 0x14074F0B0 (same speed-mover function); rax is dead here
+					walkAsm += "lea rax, [rip + ?2]; cmp rbx, rax; je B; mulss xmm0, %0; ";
 				walkAsm += "B: nop";
 				ParametricASMJump(walkAsm.c_str(), match, 0x4, 0xA);
 			}
 			if (bossVerticalFix)
 				LogF("[Movement] BossVerticalFix on: run vertical delta scaled to 30/%.0f", framerate);
+			if (verticalMotionFix)
+			{
+				// ground gravity: the 4.0 constant (0x14057FFAC) is read rip-relative at both accumulate sites; each 8-byte
+				// instruction is unique by its displacement and is not a branch target. %0 = 4.0 * k.
+				param_floats[0] = 4.0f * 30.0f / framerate;
+				match = FindOne("F3 0F 58 05 40 04 1D 00");
+				ParametricASMJump("addss xmm0, %0", match, 0, 0x8);
+				match = FindOne("F3 0F 58 05 C1 03 1D 00");
+				ParametricASMJump("addss xmm0, %0", match, 0, 0x8);
+				// dy -= v (0x1403AFF1E, xmm1 = mover+0x80, dead afterwards; the region ends before the dy store, no branch targets
+				// inside; the function returns right after). %1 = k.
+				param_floats[1] = 30.0f / framerate;
+				match = FindOne("F3 0F 5C C1 89 83 3C 0E 00 00");
+				ParametricASMJump("mulss xmm1, %1; subss xmm0, xmm1; mov dword ptr [rbx + 0xE3C], eax", match, 0, 0xA);
+				// flyers (+0xD9): every velocity change is per render too. Push 0x1401BA8E0 (callers: walk-leg acceleration
+				// 0x14019BEA8, gravity 0x14019C524 and hover 0x14019C608 in 0x14019C480, locomotion 0x1401AA803/0x1401AA9EF; no
+				// one-shot impulse uses it, those go through AddImpulse 0x1401BACD0) multiplies the magnitude by arg6 at
+				// 0x1401BAA06 and re-adds the drag register xmm13 on the first push of a render; the velocity cap uses xmm13 too.
+				// Scale both by k for flyers, under upstream's cutscene gate so velocity and position scaling stay paired.
+				// Region 0x1401BA9FF..0x1401BAA11 (18 bytes), only entered at its first byte (je 0x1401BA9EE).
+				pointers[0] = baseaddress + 0x658F70;
+				pointers[1] = baseaddress + 0x6D1CEC;
+				match = FindOne("80 BB DB 00 00 00 00 F3 0F 59 F7 75 05 F3 41 0F 58 F5 C6 83 DB 00 00 00 01");
+				ParametricASMJump("mulss xmm6, xmm7; cmp byte ptr [rbx + 0xD9], 0; je C; cmp dword ptr [rip + ?0], 1; jne D; cmp dword ptr [rip + ?1], 0; jne C; D: mulss xmm6, %1; mulss xmm13, %1; C: cmp byte ptr [rbx + 0xDB], 0; jne B; addss xmm6, xmm13; B: nop", match, 0, 0x12);
+				// drag in the physics update 0x1401BA3A0, flyer branch join 0x1401BA63D (xmm6 = [+0x10C] or 0.8*[+0x10C], both
+				// subtractive): scale by k for flyers; the ground branch (v.y = 0, friction) is untouched. 8-byte movss region.
+				match = FindOne("F3 0F 10 B1 0C 01 00 00 F3 0F 59 35 ? ? ? ? F3 0F 10 B9 E0 00 00 00 F3 44 0F 10 89 DC 00 00 00");
+				ParametricASMJump("cmp byte ptr [rcx + 0xD9], 0; je C; cmp dword ptr [rip + ?0], 1; jne D; cmp dword ptr [rip + ?1], 0; jne C; D: mulss xmm6, %1; C: movss xmm7, dword ptr [rcx + 0xE0]", match, 0x10, 0x18);
+				LogF("[Movement] VerticalMotionFix on: speed-mover Y step, ground gravity (4.0 per render, dy -= v) and flyer pushes / drag scaled to 30/%.0f", framerate);
+			}
 
 			//---- Experimental high-fps boss-movement fixes -------------------
 			//All four are EXPERIMENTAL and default to OFF, so the stock high-fps
@@ -4041,7 +6650,12 @@ void OnInitializeHook()
 					// their turns finish on the same frame cadence as their AI, as at 30fps.
 					// Player/party (0x00xx) keep the servo-only rule (their spawn-turn timing
 					// regressed at full rate). Bit-exact no-op at 30fps (g_step==1.0 anyway).
-					if (GetPrivateProfileIntW(L"Movement", L"EnemyTurnFullRate", 1, wcModulePath) != 0)
+					// 2026-10-31: DEFAULT 0. Rule 2 made every scripted (phase > 0) enemy turn finish in (D+1)/fps s, i.e. 2x fast
+					// at 60 and 4x at 120 (Togoreth traces: in-place turns of soldiers 427 deg/s at 30 vs 1123 at 60, back to 475
+					// with the key off; the boss 521 / 1406 / 684). Qator and Schmitz replayed at 120 with the key off without a
+					// stall (AiEventKeepFix is the real Qator fix). User: enemies less twitchy, Break/Kill Sight easier to catch.
+					// The servo rule (phase 0) above is untouched and still carries the Schmitz stairwell fix. Opt-in value 1 kept.
+					if (GetPrivateProfileIntW(L"Movement", L"EnemyTurnFullRate", 0, wcModulePath) != 0)
 					{
 						ParametricASMJump("mov dword ptr [rip + ?0], 1; movzx r11d, word ptr [rbx + 0x360]; and r11d, 0xFF00; cmp r11d, 0x2000; jne H; mov dword ptr [rip + ?0], 2; H: lea r11, [rip + ?1]; call r11; mov dword ptr [rip + ?0], 0", match, 0xB, 0x10);
 						LogF("[Movement] TurnPhaseFullRate on: turn servo at full rate, scripted turns + translation kept at 30/%.0f; EnemyTurnFullRate on (enemy class 0x20xx turns always full rate)", framerate);
@@ -4172,18 +6786,12 @@ void OnInitializeHook()
 			}
 
 			//[Movement] AiEventKeepFix=1 - the actual General Qator Bashtar carrier.
-			//Enemy AI scripts (battle-script VM, runner 0x140370c70) tick at 30Hz, but
-			//the AI-block event words they poll (+0x1a0/+0x1a8, raised by animation
-			//keyframes through RaiseAiEvent) are zeroed by the begin-frame clear
-			//0x14027caf0 on EVERY rendered frame. Traced in-frame order at 120fps:
-			//raise -> [poll only on a tick frame] -> clear. A one-frame event raised on
-			//a frame without a script tick is wiped before any script sees it; Qator's
-			//"clip finished, act" event (kind 4 bit 0) is exactly that, so his idle loop
-			//never leaves and he hangs. At 30fps every frame is a tick frame, so nothing
-			//is ever lost. Fix: count VM runner entries; in the clear, zero the event
-			//words only if the counter moved since this block's last zeroing (i.e. a
-			//script tick happened), otherwise keep them for the next tick. At 30fps the
-			//counter moves every frame: identical to stock.
+			//The legacy Qator fix counts VM runner entries and preserves AI event
+			//words if no runner entry occurred since this block's last clearing.
+			//Runner entries are NOT a reliable 30-Hz actor-poll clock: the VM can
+			//run each render while an individual script is still inside Wait.
+			//ScriptMotionEventFix below handles missed CMD160(1,1) completion pulses
+			//for those polling scripts without extending the live event words.
 			if (framerate > 30.0f && GetPrivateProfileIntW(L"Movement", L"AiEventKeepFix", 1, wcModulePath) != 0)
 			{
 				auto vmTicks = trampoline->Pointer<uint32_t>(); *vmTicks = 0;
@@ -4197,11 +6805,75 @@ void OnInitializeHook()
 				match = FindOne("38 91 B4 01 00 00 75 0D 48 89 91 A8 01 00 00 89 91 A0 01 00 00");
 				pointers[0] = reinterpret_cast<uintptr_t>(vmTicks);
 				pointers[1] = reinterpret_cast<uintptr_t>(lastSeen);
-				ParametricASMJump(
+				std::string captureCompletion;
+				const bool vajraEventFix = GetPrivateProfileIntW(L"Movement", L"VajraEventFix", 0, wcModulePath) != 0;
+				const bool scriptMotionEventFix = GetPrivateProfileIntW(L"Movement", L"ScriptMotionEventFix", 1, wcModulePath) != 0;
+				if (vajraEventFix || scriptMotionEventFix) {
+					// This site is inside the leaf clear function, RSP%16==8.
+					// Preserve flags, all volatile GPRs/XMMs, and provide shadow space.
+					constants[0] = reinterpret_cast<uintptr_t>(scriptMotionEventFix ? &CaptureScriptMotionCompletion : &CaptureVajraCompletion);
+					captureCompletion =
+						"pushfq; push rax; push rcx; push rdx; push r8; push r9; push r10; push r11; sub rsp, 0x88; "
+						"movdqu xmmword ptr [rsp + 0x20], xmm0; movdqu xmmword ptr [rsp + 0x30], xmm1; movdqu xmmword ptr [rsp + 0x40], xmm2; "
+						"movdqu xmmword ptr [rsp + 0x50], xmm3; movdqu xmmword ptr [rsp + 0x60], xmm4; movdqu xmmword ptr [rsp + 0x70], xmm5; "
+						"mov rax, $0; call rax; "
+						"movdqu xmm0, xmmword ptr [rsp + 0x20]; movdqu xmm1, xmmword ptr [rsp + 0x30]; movdqu xmm2, xmmword ptr [rsp + 0x40]; "
+						"movdqu xmm3, xmmword ptr [rsp + 0x50]; movdqu xmm4, xmmword ptr [rsp + 0x60]; movdqu xmm5, xmmword ptr [rsp + 0x70]; "
+						"add rsp, 0x88; pop r11; pop r10; pop r9; pop r8; pop rdx; pop rcx; pop rax; popfq; ";
+				}
+				const int eventHook = ParametricASMJump((captureCompletion +
 					"cmp byte ptr [rcx + 0x1b4], dl; jne K; push r10; push r11; mov eax, dword ptr [rip + ?0]; movsx r10, byte ptr [rcx + 8]; test r10, r10; js Z; cmp r10, 0x41; ja Z; "
 					"lea r11, [rip + ?1]; cmp eax, dword ptr [r11 + r10*4]; je S; mov dword ptr [r11 + r10*4], eax; "
-					"Z: pop r11; pop r10; mov qword ptr [rcx + 0x1a8], rdx; mov dword ptr [rcx + 0x1a0], edx; jmp K; S: pop r11; pop r10; K: nop", match, 0, 0x15);
-				LogF("[Movement] AiEventKeepFix on: AI event bits survive until the next 30Hz script tick");
+					"Z: pop r11; pop r10; mov qword ptr [rcx + 0x1a8], rdx; mov dword ptr [rcx + 0x1a0], edx; jmp K; S: pop r11; pop r10; K: nop").c_str(), match, 0, 0x15);
+				LogF("[Movement] AiEventKeepFix on: AI event bits survive until the VM runner counter advances");
+				if ((vajraEventFix || scriptMotionEventFix) && eventHook != 0)
+					throw std::runtime_error("Motion event fix: completion capture hook failed");
+				if (vajraEventFix || scriptMotionEventFix) {
+					const uintptr_t handlerCell = baseaddress + 0x612368 + 0x15F * 0x30;
+					if (*reinterpret_cast<uintptr_t*>(handlerCell) != baseaddress + 0x354160)
+						throw std::runtime_error("Motion event fix: unexpected CMD160 handler");
+					g_nativeEventQuery = reinterpret_cast<void(*)(uintptr_t)>(baseaddress + 0x354160);
+					if (scriptMotionEventFix) {
+						g_scriptMotionWindow = static_cast<uint32_t>(ceilf(framerate / 30.0f));
+						wchar_t maskText[32] = L"";
+						GetPrivateProfileStringW(L"Movement", L"ScriptMotionEventMask", L"FFFFFFFF", maskText, 32, wcModulePath);
+						g_scriptMotionMask = static_cast<uint32_t>(wcstoul(maskText, nullptr, 16));
+						g_traceAiEventChannel = GetPrivateProfileIntW(L"Diagnostics", L"TraceAiEvents", -1, wcModulePath);
+						Patch<uintptr_t>(handlerCell, reinterpret_cast<uintptr_t>(&QueryScriptMotionCompletion));
+						LogF("[Movement] ScriptMotionEventFix on: CMD160(1,bit) missed pulses retained up to %u renders per polling script, all actor classes, bit mask %08X, TraceAiEvents=%d",
+							g_scriptMotionWindow, g_scriptMotionMask, g_traceAiEventChannel);
+					} else {
+					g_vajraPulseWindow = static_cast<uint32_t>(ceilf(framerate / 30.0f));
+					Patch<uintptr_t>(handlerCell, reinterpret_cast<uintptr_t>(&QueryVajraCompletion));
+					LogF("[Movement] VajraEventFix on (EXPERIMENTAL): CMD160(1,1) completion pulse retained up to %u rendered frames for class206A", g_vajraPulseWindow);
+					}
+				}
+			}
+
+			//[Movement] WalkLegMinTicksFix=1 (EXPERIMENTAL, 2026-09-18): a scripted walk-to-point
+			//leg (CMD18: walk setter 0x14019b8e0 with the arrival-check bit, dispatcher state 1
+			//0x14019bcc0) can be ended by the arrival check 0x1401b92c0 on its very first tick,
+			//and the script re-issues it every native frame. Natively that one tick moves a
+			//full 30-Hz step; above 30 fps the tick is a 30/fps step, so the actor creeps at
+			//30/fps of the native speed (chapter-4 arena Vajra "running against the wall" for
+			//7 s before climbing; a party member walking into an Akademeia portal). Let the
+			//arrival check end a leg only once it has run round(fps/30) rendered ticks
+			//(+0xcd6 is incremented at the top of the state function, so the first tick sees 1).
+			if (framerate > 30.0f && GetPrivateProfileIntW(L"Movement", L"WalkLegMinTicksFix", 1, wcModulePath) != 0)
+			{
+				// Audit 2026-09-26 (R14): ceil, not round, since Wait(1) lasts ceil(fps/30) renders (same at 60/90/120).
+				const int k = static_cast<int>(ceilf(framerate / 30.0f - 0.001f));
+				// movzx eax, dil; cmp [rbx+0xccc], esi; je +1f (then or byte [rbx+0xcd4], 0x10 = kill on arrival).
+				// Audit 2026-09-26 (B9): 12-byte signature; the old 19-byte one overlapped TraceWatchdog's
+				// KILL_ARRIVAL hook at 0x19BF59, so TraceWatchdog=1 aborted the whole patch pass.
+				auto legMatch = FindOne("40 0F B6 C7 39 B3 CC 0C 00 00 74 1F");
+				constants[0] = static_cast<uint64_t>(k);
+				// Replaced: movzx eax, dil; cmp dword ptr [rbx+0xccc], esi (10 bytes). The je that
+				// follows takes ZF=1 as "leg already idle, do not kill"; cmp esi, esi forces that.
+				ParametricASMJump(
+					"cmp word ptr [rbx + 0xcd6], $0; jb Z; movzx eax, dil; cmp dword ptr [rbx + 0xccc], esi; jmp K; "
+					"Z: movzx eax, dil; cmp esi, esi; K: nop", legMatch, 0, 10);
+				LogF("[Movement] WalkLegMinTicksFix on: the arrival check may end a walk leg only after %d rendered ticks", k);
 			}
 
 			//[Movement] AiCountdownFix=1: the enemy action scheduler's pause between
@@ -4460,47 +7132,55 @@ void OnInitializeHook()
 					curveasm += "mulss xmm1, %3; mulss xmm2, xmm1";
 					ParametricASMJump(curveasm.c_str(), match, 0x4, 0xC);
 				}
-				if (curveExp > 0 || kneeCurve)
+				// Audit 2026-09-26 (B1): the region [0xE, 0x1A) is movss xmm0,[0x611418]; mulss xmm0,xmm1 and
+				// the jump back lands on the original mulss xmm2,xmm0 (0x1402F33F9). The stub used to end with
+				// its own mulss xmm2,xmm0 too, so the vertical mouse delta was multiplied twice (quadratic,
+				// ~10x weaker small moves) whenever the knee or an exponent was set (every release INI since
+				// 0.5.7). The knee is pad-only and exponent 1 is the stock mouse shape: hook only for >= 2.
+				if (curveExp >= 2)
 				{
 					pointers[0] = baseaddress + 0x611418;
-					std::string curveasm;
-					if (curveExp >= 2)
-					{
-						curveasm = "movaps xmm0, xmm1; ";
-						for (int i = 1; i < curveExp; i++)
-							curveasm += "mulss xmm1, xmm0; ";
-					}
-					curveasm += "movss xmm0, dword ptr [rip + ?0]; mulss xmm0, xmm1; mulss xmm2, xmm0";
+					std::string curveasm = "movaps xmm0, xmm1; ";
+					for (int i = 1; i < curveExp; i++)
+						curveasm += "mulss xmm1, xmm0; ";
+					curveasm += "movss xmm0, dword ptr [rip + ?0]; mulss xmm0, xmm1";
 					ParametricASMJump(curveasm.c_str(), match, 0xE, 0x1A);
 				}
 			}
 
-			//Lock-on camera soft follow ([Camera] LockFollowPercent, LockDeadZoneDegrees;
-			//live in the tuner). See the g_lockFollowPct comment. Installed only when a
-			//non-default value is set or the tuner is on, so stock stays byte-identical.
+			//[Camera] LockTurnMaxDegPerSec (see SmoothLockLookTarget). Both calls of the camera
+			//mover 0x1402f0120 inside 0x1402f1ef0 get their look-point pointer (rdx) replaced by
+			//the rate-limited point. Installed when the key is set or the tuner is on.
+			g_lockTurnMaxDeg = GetPrivateProfileIntW(L"Camera", L"LockTurnMaxDegPerSec", 0, wcModulePath);
+			if (g_lockTurnMaxDeg != 0 || g_tuneWindow)
 			{
-				wchar_t lf[32] = L"100";
-				GetPrivateProfileStringW(L"Camera", L"LockFollowPercent", L"100", lf, 32, wcModulePath);
-				g_lockFollowX10 = static_cast<int>(wcstof(lf, nullptr) * 10.0f + 0.5f);
-				if (g_lockFollowX10 < 1) g_lockFollowX10 = 1;
-				if (g_lockFollowX10 > 1000) g_lockFollowX10 = 1000;
-			}
-			g_lockDeadDeg = GetPrivateProfileIntW(L"Camera", L"LockDeadZoneDegrees", 0, wcModulePath);
-			if (g_lockFollowX10 != 1000 || g_lockDeadDeg != 0 || g_tuneWindow)
-			{
-				auto lockDead = trampoline->Pointer<float>(); *lockDead = 0.0f;
-				auto lockGain = trampoline->Pointer<float>(); *lockGain = 1.0f;
-				match = FindOne("F3 0F 10 4C 24 30 41 0F 28 C1 41 0F 47 C0 F3 41 0F 58 CC");
-				pointers[0] = reinterpret_cast<uintptr_t>(lockDead);
-				pointers[1] = reinterpret_cast<uintptr_t>(lockGain);
+				constants[0] = reinterpret_cast<uintptr_t>(&SmoothLockLookTarget);
+				const std::string bridge =
+					"sub rsp, 0x40; movdqu xmmword ptr [rsp + 0x20], xmm2; movdqu xmmword ptr [rsp + 0x30], xmm3; "
+					"mov rax, $0; call rax; "
+					"movdqu xmm2, xmmword ptr [rsp + 0x20]; movdqu xmm3, xmmword ptr [rsp + 0x30]; add rsp, 0x40; "
+					"mov rdx, rax; mov rcx, r13";
+				// early-return call: mov byte ptr [rip+0x366c1b], 0 (= 0x1406591c5); mov [rsp+0x20], eax; call
+				match = FindOne("C6 05 1B 6C 36 00 00 89 44 24 20 E8 6D DB FF FF");
+				pointers[0] = baseaddress + 0x6591C5;
+				// (r8 is free here; a register store keeps the rip-relative displacement last in the instruction)
+				ParametricASMJump(("xor r8d, r8d; mov byte ptr [rip + ?0], r8b; mov dword ptr [rsp + 0x20], eax; " + bridge).c_str(), match, 0, 11);
+				// final call: mov rcx, r13; mov [rsp+0x20], eax; call
+				match = FindOne("49 8B CD 89 44 24 20 E8 EE CE FF FF");
+				ParametricASMJump(("mov rcx, r13; mov dword ptr [rsp + 0x20], eax; " + bridge).c_str(), match, 0, 7);
+				// Inside the mover (rbx = param_1 = the player actor, r13 = the locked target,
+				// verified in the prologue: mov rbx, rcx / mov r13, [table + ch*8 + 0x18]):
+				// it reads the player into [rbp+0x10] and then the target into [rbp-0x28].
+				// Right after the second read, rewrite the target buffer with the smoothed
+				// point. RSP is 16-aligned (just returned from a call); the following code
+				// reloads xmm0/xmm2/xmm6 from memory, so no volatile register is live.
+				g_lockTurnDeadDeg = GetPrivateProfileIntW(L"Camera", L"LockTurnDeadZoneDegrees", 0, wcModulePath);
+				constants[1] = reinterpret_cast<uintptr_t>(&SmoothLockTargetInPlace);
+				match = FindOne("FF 50 28 F3 0F 10 45 18 F3 0F 10 55 10 F3 0F 10 75 14");
 				ParametricASMJump(
-					"movss xmm1, dword ptr [rsp + 0x30]; movaps xmm0, xmm9; cmova eax, r8d; "
-					"movaps xmm2, xmm1; mulss xmm2, xmm2; sqrtss xmm2, xmm2; subss xmm2, dword ptr [rip + ?0]; maxss xmm2, xmm9; "
-					"comiss xmm1, xmm9; jae P; xorps xmm3, xmm3; subss xmm3, xmm2; movaps xmm2, xmm3; "
-					"P: mulss xmm2, dword ptr [rip + ?1]; movaps xmm1, xmm2; addss xmm1, xmm12", match, 0, 0x13);
-				g_lockDeadCell = lockDead;
-				g_lockGainCell = lockGain;
-				LogF("[Camera] lock-on soft follow: strength %.1f%%, dead zone %d deg", g_lockFollowX10 / 10.0f, g_lockDeadDeg);
+					"lea rcx, [rbp - 0x28]; mov rdx, rbx; sub rsp, 0x20; mov rax, $1; call rax; add rsp, 0x20; "
+					"movss xmm0, dword ptr [rbp + 0x18]; movss xmm2, dword ptr [rbp + 0x10]", match, 3, 13); // jump-back offset is ABSOLUTE within the match: 3 + 10 bytes
+				LogF("[Camera] lock-on turn limit: %d deg/s, dead zone %d deg (0 = off, live in the tuner)", static_cast<int>(g_lockTurnMaxDeg), static_cast<int>(g_lockTurnDeadDeg));
 			}
 
 			//Fix controller camera speed (when transitioning to lock-on)
@@ -4629,7 +7309,43 @@ void OnInitializeHook()
 			pointers[1] = reinterpret_cast<uintptr_t>(reset_list);
 			pointers[2] = reinterpret_cast<uintptr_t>(&stats[0]);
 			pointers[3] = reinterpret_cast<uintptr_t>(&stats[5]);
-			ParametricASMJump("lea rax, [rip + ?0]; xor r10, r10; B: cmp r10b, $0; jge G; cmp qword ptr [rax + r10 * 8], 0; je A; cmp rbx, qword ptr [rax + r10 * 8]; je C; inc r10; jmp B; C: mov eax, 1; ret; G: inc dword ptr [rip + ?2]; jmp D; A: mov byte ptr [rip + ?1], 1; mov qword ptr [rax + r10 * 8], rbx; cmp dword ptr [rip + ?3], r10d; jge D; mov dword ptr [rip + ?3], r10d; D: push rbp; push rbx; push rsi; push rdi;", match, 0, 0x5);
+			// [Diagnostics] TraceHitDedup (see NoteHitCall): at the function entry RSP%16 == 8; 4 pushes +
+			// 0x68 align it; the four integer and four xmm argument registers are preserved.
+			std::string hitAsm;
+			if (GetPrivateProfileIntW(L"Diagnostics", L"TraceHitDedup", 0, wcModulePath) != 0)
+			{
+				g_hitDedupList = damage_and_audio_triggers;
+				constants[1] = reinterpret_cast<uintptr_t>(&NoteHitCall);
+				hitAsm = "push rcx; push rdx; push r8; push r9; sub rsp, 0x68; "
+					"movdqu xmmword ptr [rsp + 0x20], xmm0; movdqu xmmword ptr [rsp + 0x30], xmm1; "
+					"movdqu xmmword ptr [rsp + 0x40], xmm2; movdqu xmmword ptr [rsp + 0x50], xmm3; "
+					"mov r8, rcx; mov rcx, rbx; mov rax, $1; call rax; "
+					"movdqu xmm0, xmmword ptr [rsp + 0x20]; movdqu xmm1, xmmword ptr [rsp + 0x30]; "
+					"movdqu xmm2, xmmword ptr [rsp + 0x40]; movdqu xmm3, xmmword ptr [rsp + 0x50]; "
+					"add rsp, 0x68; pop r9; pop r8; pop rdx; pop rcx; ";
+				LogF("[HitDedup] trace armed on the damage call 0x14025FD20 (read-only)");
+			}
+			//[Effects] HitDedupPerVictim=1 (2026-09-28, audit B2): upstream keys this dedup on the caller's rbx,
+			//the attack object, so a second victim of the same object within the list's lifetime (one or two
+			//30 Hz windows) got "hit" (eax=1) without damage, and callers such as 0x140291018/0x1402ADD42 then
+			//mark it as already hit. TraceHitDedup at 120 fps: Sice's scythe hit 4 enemies at once, 3 lost
+			//(beat 7760); Ace's spells lost 3 more; 6 lost vs 5 real same-victim repeats in 5 minutes. Key on
+			//the (object, victim rdx) pair instead: key = rbx + rdx * 0x5851F42D4C957F2D (r11 is free here;
+			//computed after the trace call, which may clobber it). Same-victim repeats stay deduplicated.
+			//Verified 2026-09-28 at 120 and 60 fps: 0 lost hits, 9 extra victims of one attack landed, 12
+			//same-victim repeats still suppressed. Default on.
+			g_hitDedupPairKey = GetPrivateProfileIntW(L"Effects", L"HitDedupPerVictim", 1, wcModulePath) != 0;
+			const char* hitKey = "rbx";
+			if (g_hitDedupPairKey)
+			{
+				constants[2] = kHitPairMul;
+				hitAsm += "mov r11, $2; imul r11, rdx; add r11, rbx; ";
+				hitKey = "r11";
+				LogF("[Effects] HitDedupPerVictim on: the damage-call dedup keys on attack object + victim (area attacks damage every target)");
+			}
+			hitAsm += "lea rax, [rip + ?0]; xor r10, r10; B: cmp r10b, $0; jge G;";
+			hitAsm += std::string(" cmp qword ptr [rax + r10 * 8], 0; je A; cmp ") + hitKey + ", qword ptr [rax + r10 * 8]; je C; inc r10; jmp B; C: mov eax, 1; ret; G: inc dword ptr [rip + ?2]; jmp D; A: mov byte ptr [rip + ?1], 1; mov qword ptr [rax + r10 * 8], " + hitKey + "; cmp dword ptr [rip + ?3], r10d; jge D; mov dword ptr [rip + ?3], r10d; D: push rbp; push rbx; push rsi; push rdi;";
+			ParametricASMJump(hitAsm.c_str(), match, 0, 0x5);
 
 			//Remove audio trigger duplicates (ideally there should be a proper fix, like for the triggers above, for now it just mutes them)
 			match = FindOne("41 FF 46 10 49 89 76 08 49 8D 4D 18 48 8B 01 FF");
@@ -4681,12 +7397,42 @@ void OnInitializeHook()
 
 			//Various timings, used mainly in cutscenes but not exclusively [ref: 0x00127D90]
 			match = FindOne("2F C8 76 04 C6 41 2C 01 F3 0F 5C 0D 93 34 22 00");
+			if (GetPrivateProfileIntW(L"Diagnostics", L"NativeScriptWait", 0, wcModulePath) != 0)
+			{
+				// Bisect only CMDA: ScriptWaitFrameFix=0 normally restores the
+				// upstream address-dedup patch, not the original game handler.
+				// Leave its SUBSS untouched to test the wait/event interaction.
+				// This deliberately restores fast waits at high FPS; not a fix.
+				LogF("[Diagnostics] NativeScriptWait on: CMDA uses original per-render countdown; both wait patches bypassed (test only)");
+			}
+			else if (GetPrivateProfileIntW(L"Movement", L"ScriptWaitFrameFix", 1, wcModulePath) != 0)
+			{
+				// CMDA Wait(N): yielding is decided BEFORE the subtraction. The
+				// old dedup decrements 1 -> 0 immediately, so Wait(1) can finish
+				// on the next rendered frame (8 ms at 120 FPS instead of 33 ms).
+				// This is a private command countdown, not a script variable: use
+				// fractional time here while leaving the VM running every frame.
+				// Snap tiny residuals so non-binary steps (e.g. 30/90) do not add
+				// a spurious frame. Keep NaN unchanged, matching the native operand.
+				param_floats[0] = 30.0f / framerate;
+				// Audit 2026-09-26 (B11): the float residual of N - k*(30/90) grows past 1e-5 from N = 42, so
+				// 180 of Wait(1..300) ran one extra render at 90 fps (max residual 0.21 step for N <= 1800).
+				// Steps that are multiples of 1/256 (60, 120, 40, 48, 80, 96 fps) subtract exactly: keep 1e-5
+				// there (bit-identical, also for fractional counts); otherwise snap below a quarter step.
+				const float waitStep = 30.0f / framerate;
+				param_floats[1] = waitStep * 256.0f == floorf(waitStep * 256.0f) ? 0.00001f : waitStep * 0.25f;
+				ParametricASMJump("subss xmm1, %0; comiss xmm1, %1; jp A; ja A; xorps xmm1, xmm1; A: nop", match, 0x8, 0x10);
+				LogF("[Movement] ScriptWaitFrameFix on: CMDA private wait countdown steps by 30/%.0f per rendered frame", framerate);
+			}
+			else
+			{
 			constants[0] = floatcountersptrs_count;
 			param_floats[0] = 1.0f;
 			pointers[0] = reinterpret_cast<uintptr_t>(floatcountersptrs);
 			pointers[1] = reinterpret_cast<uintptr_t>(&stats[6]);
 			pointers[2] = reinterpret_cast<uintptr_t>(&stats[4]);
 			ParametricASMJump("push rax; push rdx; push r14; lea rax, [rcx + 0x38]; lea rdx, [rip + ?0]; xor r14, r14; A: cmp qword ptr [rdx + r14 * 8], rax; je D; inc r14; cmp r14b, $0; jl A; subss xmm1, %0; xor r14, r14; B: cmp r14b, $0; jge G; cmp qword ptr [rdx + r14 * 8], 0; jne C; mov qword ptr [rdx + r14 * 8], rax; cmp dword ptr [rip + ?1], r14d; jge D; mov dword ptr [rip + ?1], r14d; jmp D; C: inc r14; jmp B; G: inc dword ptr [rip + ?2]; D: pop r14; pop rdx; pop rax;", match, 0x8, 0x10);
+			}
 
 			//Script command 0x179: per-frame countdown that keeps a screen layer/fade
 			//visible for N frames ([rcx+0x38]--) while flagging the script context as
@@ -4774,6 +7520,36 @@ void OnInitializeHook()
 			LogF("[Movement] ScriptVarDedupAll on: script ++/-- whole step on the first touch per 30Hz frame and on in-tick repeats, 1/64 nudges in between (single-fire equality, exact truncation); upstream store-0 patches replaced");
 			}
 
+			//[fork, EXPERIMENTAL, default off] Enemy AI "brain" (0x140266010 -> 0x140258fd0) at 30Hz. The
+			//scheduler 0x1401949f0 calls it every rendered frame while an actor is deciding/acting; inside
+			//it, per-channel countdowns (0x6585f8/0x6585fa..) step once per call and a random 1/128 gate
+			//is rolled per call, so at 120fps its timers run 4x fast and its dice roll 4x as often.
+			//Chapter 4 mission 1: the pursuer (Akkad) approaches only in short bursts and stops as soon
+			//as the player moves. With this on, the two call sites run the brain only on the first
+			//rendered frame of each 30Hz frame and hand back the cached per-channel result otherwise.
+			const int traceBrain = GetPrivateProfileIntW(L"Diagnostics", L"TraceBrain", -1, wcModulePath);
+			if (aiBrain30Hz || (traceBrain >= 0 && traceBrain < 0x42))
+			{
+			//On the skipped frames the stub answers "no action" (0): in scheduler state 1 that just retries
+			//next frame (the countdown is already 0), in state 2 the bit is informational. Caching a
+			//previous "1" instead made the scheduler execute a stale/empty action and crash on save load.
+			//[TraceBrain] the C++ hook records the result for one channel and returns it unchanged
+			//(rbx = actor at both sites, the call site's stack frame/shadow space is reused).
+			constants[0] = baseaddress + 0x266010;
+			constants[1] = reinterpret_cast<uintptr_t>(&BrainTraceHook);
+			pointers[0] = reinterpret_cast<uintptr_t>(propagatecounters);
+			if (traceBrain >= 0 && traceBrain < 0x42) g_brainTraceCh = traceBrain;
+			const char* brainAsm = aiBrain30Hz
+				? "cmp byte ptr [rip + ?0], 1; jne S; mov rax, $0; call rax; mov rcx, rbx; mov edx, eax; mov rax, $1; call rax; jmp D; S: xor eax, eax; D: nop"
+				: "mov rax, $0; call rax; mov rcx, rbx; mov edx, eax; mov rax, $1; call rax; nop";
+			match = FindOne("EB 19 0F BE 4B 18 E8 ? ? ? ? 80 A3 68 0C");
+			ParametricASMJump(brainAsm, match, 0x6, 0xB);
+			match = FindOne("74 27 0F BE 4B 18 E8 ? ? ? ? 80 A3 68 0C");
+			ParametricASMJump(brainAsm, match, 0x6, 0xB);
+			if (aiBrain30Hz) LogF("[Movement] AiBrain30Hz on (EXPERIMENTAL): enemy AI decision function runs once per 30Hz frame");
+			if (g_brainTraceCh >= 0) LogF("[TraceBrain] armed for channel %d", g_brainTraceCh);
+			}
+
 			//[fork, EXPERIMENTAL, default off] Tick the global and field script VMs (0x14037f2a0,
 			//called once per rendered frame for each) only on the first rendered frame of every
 			//30Hz frame, i.e. at the cadence the scripts were written for. Makes every per-tick
@@ -4794,6 +7570,21 @@ void OnInitializeHook()
 			ParametricASMJump("cmp byte ptr [rip + ?0], 1; jne A; mov r8b, 1; xor edx, edx; mov rax, $0; call rax; A: nop", match, 0x3, 0xD);
 			LogF("[Movement] ScriptTick30Hz on (EXPERIMENTAL): global/field script VMs and per-actor script threads tick once per 30Hz frame");
 			}
+			}
+
+			//[fork] Script command CMD66 ("actor speed", handler 0x14035f910 -> [actor+0x110]) is the
+			//per-30Hz-frame speed, but per-actor scripts tick every rendered frame. The enemy AI library's
+			//FuncPlanCheckMove compares the position delta since the previous tick against
+			//0.3 * CMD66()^2 and flags "stuck" when the delta is smaller: at 120 fps the per-tick delta is
+			//speed/4, so the check trips as soon as the actor slows for steering and the behaviour script
+			//leaves its move state (Supersoldier Akkad, ch4 m1, stopping whenever the player moves).
+			//Scale the reported speed to the rendered-frame step so the ratio matches 30 fps.
+			if (GetPrivateProfileIntW(L"Movement", L"ScriptSpeedPerFrame", 1, wcModulePath) != 0)
+			{
+			match = FindOne("BA 02 00 00 00 E8 ? ? ? ? F3 0F 11 43 30 48 83 C4 20 5B C3");
+			param_floats[0] = 30.0f / framerate;
+			ParametricASMJump("mulss xmm0, %0; movss dword ptr [rbx + 0x30], xmm0; add rsp, 0x20", match, 0xA, 0x13);
+			LogF("[Movement] ScriptSpeedPerFrame on: script CMD66 actor speed scaled by 30/fps (%.4f)", 30.0f / framerate);
 			}
 
 			//In game timer
@@ -4829,6 +7620,71 @@ void OnInitializeHook()
 			pointers[0] = reinterpret_cast<uintptr_t>(propagatecounters);
 			ParametricASMJump("cmp byte ptr [rip + ?0], 1; jne A; dec eax; A: test eax, eax; cmovs eax, r12d;", match, 0x5, 0xB);
 
+			//[Effects] SummonTimerFix=1 (2026-09-22, upstream #20 "summon times are sped up"): the
+			//Eidolon's remaining time is word [actor+0x9b2] in 30 Hz frames (3600 = 2:00; the HUD shows
+			//it / 30). The per-render resource update 0x1401A0FC5 decrements it once per RENDERED frame
+			//(`dec eax` at 0x1401A1BAF, guarded by summon-active/pause/>0 tests), so at 90 fps 2:00
+			//elapsed in 45 s (TraceSummon: -77.6/s incl. the intro hold, -90/s once running). Gate the
+			//decrement on the 30 Hz beat like the RTS counters above. The 6-byte region
+			//`test eax,eax; jle; dec eax` has no branch targets inside (all jumps land at the resume point).
+			if (g_framerate > 30.0f && GetPrivateProfileIntW(L"Effects", L"SummonTimerFix", 1, wcModulePath) != 0)
+			{
+				match = FindOne("0F BF 87 B2 09 00 00 44 38 7F 11 75 14 F6 87 61 09 00 00 04 74 0B F6 C1 01 75 06 85 C0 7E 02 FF C8");
+				pointers[0] = reinterpret_cast<uintptr_t>(propagatecounters);
+				ParametricASMJump("test eax, eax; jle A; cmp byte ptr [rip + ?0], 1; jne A; dec eax; A: nop", match, 0x1B, 0x21);
+				LogF("[Effects] SummonTimerFix on: Eidolon summon timer [actor+0x9b2] steps once per 30 Hz frame");
+			}
+
+			//[Effects] ActorTimerFix=1 (2026-10-31, "enemies speed up" investigation): the actor resource update
+			//0x1401A0EE0 runs once per RENDERED frame and steps 30 Hz-authored counters unscaled: byte [actor+0x5E6]
+			//hit-freeze (2 renders per hit that beats poise by 1, 10 for some attack objects; while > 0 the motion queue,
+			//profile clocks and movement skip = hit-stop), byte [+0x9B8] timed protection (10/30; 0xFF is held, not
+			//stepped), byte [+0x9A9] Kill/Break Sight lockout (10 on entering the downed state), word [+0x9A2] stun
+			//build-up gauge decay (-[+0x9A5] per render), word [+0x9DC] downed-state timer (60 = 2 s native, the actor
+			//gets up with +12.5% HP) and word [+0x9BA] script lifetime. Measured with TraceActorTimers at 60 fps:
+			//16.6 ms per unit for party and enemies alike (native 33.3), so hit-stop, stun decay and the downed state run
+			//fps/30 x fast. Step them only on 30 Hz beat renders (propagatecounters == 1, as SummonTimerFix in the same
+			//function). The four regions are unique in the dump and entered only at their first byte; the hit-freeze
+			//stop flag [rbp-0x38] is still raised on every render while the counter is non-zero. Verified at 60 fps on the test PC
+			//(2026-10-31 night): hit-freeze 2 units 49-68 ms (native 66), protection 9 units 299-300 ms, 30 units 1001 ms. Default 1.
+			if (g_framerate > 30.0f && GetPrivateProfileIntW(L"Effects", L"ActorTimerFix", 1, wcModulePath) != 0)
+			{
+				pointers[0] = reinterpret_cast<uintptr_t>(propagatecounters);
+				// 0x1401A1CD6..0x1401A1D20: 5E6 hit-freeze, 9B8 timed protection, 9A9 sight lockout
+				match = FindOne("0F B6 B7 E6 05 00 00 85 F6 7E 0F FF CE C6 45 C8 01 40 88 B7 E6 05 00 00 EB 07 80 A7 B6 09 00 00 FB 0F B6 8F B8 09 00 00 8D 41 FF 3C FD 77 08 FE C9 88 8F B8 09 00 00 0F B6 87 A9 09 00 00 84 C0 74 08 FE C8 88 87 A9 09 00 00");
+				ParametricASMJump("movzx esi, byte ptr [rdi + 0x5E6]; test esi, esi; jle Z; mov byte ptr [rbp - 0x38], 1; cmp byte ptr [rip + ?0], 1; jne B; dec esi; mov byte ptr [rdi + 0x5E6], sil; jmp B; Z: and byte ptr [rdi + 0x9B6], 0xFB; B: movzx ecx, byte ptr [rdi + 0x9B8]; cmp byte ptr [rip + ?0], 1; jne C; lea eax, [rcx - 1]; cmp al, 0xFD; ja C; dec cl; mov byte ptr [rdi + 0x9B8], cl; C: movzx eax, byte ptr [rdi + 0x9A9]; test al, al; je D; cmp byte ptr [rip + ?0], 1; jne D; dec al; mov byte ptr [rdi + 0x9A9], al; D: nop", match, 0, 0x4A);
+				// 0x1401A1167..0x1401A118E: stun gauge decay (ebx = 0 on both native paths, eax = [9A5] whenever the gauge is > 0)
+				match = FindOne("0F B7 8F A2 09 00 00 85 C9 7E 1A 0F B6 87 A5 09 00 00 BB 00 00 00 00 2B C8 0F 48 CB 66 89 8F A2 09 00 00 EB 02 33 DB");
+				ParametricASMJump("xor ebx, ebx; movzx ecx, word ptr [rdi + 0x9A2]; test ecx, ecx; jle M; movzx eax, byte ptr [rdi + 0x9A5]; cmp byte ptr [rip + ?0], 1; jne M; sub ecx, eax; cmovs ecx, ebx; mov word ptr [rdi + 0x9A2], cx; M: nop", match, 0, 0x27);
+				// 0x1401A14A3..0x1401A14B2: downed-state timer (the cmp feeds the native jg at the resume point)
+				match = FindOne("66 FF 8F DC 09 00 00 66 83 BF DC 09 00 00 00");
+				ParametricASMJump("cmp byte ptr [rip + ?0], 1; jne N; dec word ptr [rdi + 0x9DC]; N: cmp word ptr [rdi + 0x9DC], 0", match, 0, 0x0F);
+				// 0x1401A1EF9..0x1401A1F02: script lifetime (the native test / jle / store follow)
+				match = FindOne("0F BF 87 BA 09 00 00 FF C8");
+				ParametricASMJump("movsx eax, word ptr [rdi + 0x9BA]; cmp byte ptr [rip + ?0], 1; jne K; dec eax; K: nop", match, 0, 0x09);
+				LogF("[Effects] ActorTimerFix on: hit-freeze, timed protection, sight lockout, stun gauge decay, downed timer and script lifetime step once per 30 Hz frame");
+			}
+
+			//[Effects] MessageTimerFix=1 (2026-09-26, user report: Cid's Crucible condition vanishes at 120 fps):
+			//message windows keep their remaining display time in [window+0x4C] (the crucible notice =
+			//0x14075D210 + 0x4C, set to 300 at 0x1403E7527) and the shared window update 0x1403E90A0 does
+			//`if (t > 0) t--` on every call - twice per RENDERED frame for that notice (DataRing captures:
+			//-24 per 100 ms at 120 fps; hardware write watch: only writer 0x1403E90D2). 300 = 5 s at 30 fps,
+			//1.25 s at 120. Decrement only on 30 Hz beat renders, which keeps the native per-frame count for
+			//every window whatever its call count; before the first frame-setup tick (boot, counter 0) the
+			//native decrement stays. Region 0x1403E90C9..D4 (`mov eax,[rbx+4C]; test; jle; dec; mov`); the
+			//only branches into it land on its first byte or on the resume point. Verified 2026-09-26 at 120 fps
+			//(user + write watch): the crucible notice stays 5.06 s (native 5.0 s, was 1.25 s). Default on.
+			if (g_framerate > 30.0f && GetPrivateProfileIntW(L"Effects", L"MessageTimerFix", 1, wcModulePath) != 0)
+			{
+				match = FindOne("C6 43 7C 00 8B 43 4C 85 C0 7E 05 FF C8 89 43 4C 83 7B 3C 00");
+				pointers[0] = reinterpret_cast<uintptr_t>(propagatecounters);
+				pointers[1] = reinterpret_cast<uintptr_t>(scriptFrames);
+				ParametricASMJump("mov eax, dword ptr [rbx + 0x4c]; test eax, eax; jle A; cmp dword ptr [rip + ?1], 0; je B; "
+					"cmp byte ptr [rip + ?0], 1; jne A; B: dec eax; mov dword ptr [rbx + 0x4c], eax; A: nop", match, 0x4, 0x10);
+				LogF("[Effects] MessageTimerFix on: message window display timers [window+0x4C] step on 30 Hz beats (Cid's Crucible notice)");
+			}
+
 			//RTS Troop reshooting time
 			match = FindOne("7E 22 66 FF C9 66 89 8B D8 01 00 00 0F BF C1 74");
 			pointers[0] = reinterpret_cast<uintptr_t>(propagatecounters);
@@ -4854,6 +7710,31 @@ void OnInitializeHook()
 			match = FindOne("40 53 48 83 EC 30 48 8B 81 30 05 00 00 48 8B D9");
 			pointers[0] = reinterpret_cast<uintptr_t>(propagatecounters);
 			ParametricASMJump("cmp byte ptr [rip + ?0], 1; je A; ret; A: push rbx; sub rsp, 0x30", match, 0, 0x6);
+
+			// The MP-restoration effect (0x2a6cc0, observed action 0x5180) tests
+			// counter % interval before granting maxMP/128 to eligible party members.
+			// The generic +0x86 patch below already advances that counter at 30 Hz,
+			// but the unchanged modulo test grants on EVERY render while it is zero.
+			// Consume each qualifying value immediately, once per effect/request.
+			// Skip to the original no-grant path; cleanup/action-exit checks still run
+			// every render, and the shared gauge drain and other MP sources stay intact.
+			if (GetPrivateProfileIntW(L"Movement", L"MpRegenFix", 1, wcModulePath) != 0)
+			{
+				match = FindOne("0F BF 83 86 00 00 00 99 41 F7 F9 85 D2 0F 85 91 02 00 00");
+				constants[0] = baseaddress + 0x2a71f2;
+				constants[1] = reinterpret_cast<uintptr_t>(&ConsumeMpRegenCounter);
+				// This is inside a Win64 function body (RSP aligned to 16). Preserve
+				// all volatile registers except dead RAX, plus 32-byte shadow space.
+				ParametricASMJump("test edx, edx; je A; mov rax, $0; jmp rax; A: push rcx; push rdx; push r8; push r9; push r10; push r11; sub rsp, 0x80; "
+					"movdqu xmmword ptr [rsp + 0x20], xmm0; movdqu xmmword ptr [rsp + 0x30], xmm1; movdqu xmmword ptr [rsp + 0x40], xmm2; "
+					"movdqu xmmword ptr [rsp + 0x50], xmm3; movdqu xmmword ptr [rsp + 0x60], xmm4; movdqu xmmword ptr [rsp + 0x70], xmm5; "
+					"mov rcx, rbx; mov rdx, rbp; mov rax, $1; call rax; "
+					"movdqu xmm0, xmmword ptr [rsp + 0x20]; movdqu xmm1, xmmword ptr [rsp + 0x30]; movdqu xmm2, xmmword ptr [rsp + 0x40]; "
+					"movdqu xmm3, xmmword ptr [rsp + 0x50]; movdqu xmm4, xmmword ptr [rsp + 0x60]; movdqu xmm5, xmmword ptr [rsp + 0x70]; "
+					"add rsp, 0x80; pop r11; pop r10; pop r9; pop r8; pop rdx; pop rcx; "
+					"test al, al; jne B; mov rax, $0; jmp rax; B: nop", match, 0xB, 0x13);
+				LogF("[Movement] MpRegenFix on: each eligible MP effect counter grants once on first observation (no beat delay)");
+			}
 
 			//General frame counter based actions #1 (bullets range (Ace's cards, rocket launcher guy), charged attacks, Nine's jump etc.)
 			FindAll("66 FF ? 86 00 00 00", 0).for_each_result([propagatecounters](auto found)
@@ -5016,6 +7897,67 @@ void OnInitializeHook()
 
 		}
 
+		// [Gameplay] ExpMultiplier=N (2026-09-25, user request: catch up on levels in chapter 7). Every EXP
+		// change goes through AddExp 0x140256730(slot, char, delta, &out): character record 0x1406CB260 +
+		// char*0x220, EXP u32 at +0xF4 (clamped to 99,999,999), level word at +0x28. It verifies the roster
+		// checksum (0x14024D800(7, ...)) before the add and stores a fresh one (0x1406C5028) after it, so
+		// scaling the delta in place keeps the game's tamper check consistent. Callers: kill EXP
+		// 0x14019FE90 -> 0x14019CEB0 (also the free-time EXP rewards of 0x140241180), roster-wide rewards
+		// 0x140253220 (reward type 8, n*1000 per cadet), script handler 0x140369ED0, and the level SETTER
+		// 0x140256090 (scripts/network/actor re-init: delta = an EXP value inside the new level's band minus
+		// the current EXP), which is left unscaled via its return address so a scripted level is never
+		// overshot. Hook on `mov ecx,[r15+0xF4]; movzx ebp,[r15+0x28]; add ecx,r14d` (r14d = delta; rax and
+		// rdx are dead here; the only branch into the region lands on its first byte). Positive deltas only;
+		// the scaled delta is capped at 99,999,999 so EXP + delta cannot overflow before the game's clamp.
+		{
+			const int expMul = GetPrivateProfileIntW(L"Gameplay", L"ExpMultiplier", 1, wcModulePath);
+			if (expMul > 1)
+			{
+				auto add = FindAll("41 8B 8F F4 00 00 00 41 0F B7 6F 28 41 03 CE 79 04 33 C9 EB 0A B8 FF E0 F5 05", 1);
+				auto set = FindAll("8B D3 8B CF E8 ? ? ? ? 4C 8D 4C 24 48 8B CF 44 2B C0 E8 ? ? ? ? 41 B1 01", 1);
+				if (add.size() == 1 && set.size() == 1)
+				{
+					auto addMatch = add.get(0);
+					auto setMatch = set.get(0);
+					const uintptr_t setterReturn = reinterpret_cast<uintptr_t>(setMatch.get<uint8_t>(0x18));
+					int32_t relative = 0;
+					memcpy(&relative, setMatch.get<uint8_t>(0x14), sizeof(relative));
+					const uintptr_t addExpStart = reinterpret_cast<uintptr_t>(addMatch.get<uint8_t>(0)) - 0x175;
+					if (setterReturn + relative == addExpStart)
+					{
+						for (auto& cell : g_expCell)
+						{
+							auto p = trampoline->Pointer<uint64_t>();
+							*p = 0;
+							cell = p;
+						}
+						g_expMul = expMul > 1000 ? 1000 : expMul;
+						constants[0] = static_cast<uint64_t>(g_expMul);
+						constants[1] = setterReturn;
+						for (int i = 0; i < 4; i++)
+							pointers[i] = reinterpret_cast<uintptr_t>(g_expCell[i]);
+						if (ParametricASMJump(
+							"test r14d, r14d; jle A; "
+							"mov rax, qword ptr [rsp + 0x4b98]; mov rdx, $1; cmp rax, rdx; je C; "
+							"mov eax, r14d; add qword ptr [rip + ?0], rax; "
+							"imul rax, rax, $0; cmp rax, 99999999; jle B; mov eax, 99999999; "
+							"B: mov r14d, eax; add qword ptr [rip + ?1], rax; inc qword ptr [rip + ?2]; jmp A; "
+							"C: inc qword ptr [rip + ?3]; "
+							"A: mov ecx, dword ptr [r15 + 0xf4]; movzx ebp, word ptr [r15 + 0x28]; add ecx, r14d",
+							addMatch, 0, 0xF) == 0)
+						{
+							LogF("[Gameplay] ExpMultiplier x%d: EXP gains are multiplied (kills, rewards); scripted level changes stay exact", g_expMul);
+							StartExpLogWatcher();
+						}
+					}
+					else
+						LogF("[Gameplay] ExpMultiplier skipped: the level setter does not call AddExp here (unexpected build)");
+				}
+				else
+					LogF("[Gameplay] ExpMultiplier skipped: AddExp not found (%zu/%zu matches)", add.size(), set.size());
+			}
+		}
+
 		const float fovoverride = GetPrivateProfileIntW(L"FOV", L"FOVPercentage", 0, wcModulePath) / 100.0f;
 		if (fovoverride > 0.0f)
 		{
@@ -5048,6 +7990,76 @@ void OnInitializeHook()
 		if (g_skipIntroVideos)
 			g_introBase = baseaddress;
 		g_gameBase = baseaddress;
+		g_partySceneFix = GetPrivateProfileIntW(L"Cutscenes", L"PartySceneFix", 0, wcModulePath) != 0;
+		if (g_partySceneFix || GetPrivateProfileIntW(L"Cutscenes", L"JudeccaFullPartyScenes", 0, wcModulePath) != 0)
+		{
+			const uintptr_t handlerCell = baseaddress + 0x612368 + 0x5E * 0x30;
+			if (*reinterpret_cast<uintptr_t*>(handlerCell) != baseaddress + 0x35F520)
+				throw std::runtime_error("Judecca cutscene fix: unexpected CMD5F handler");
+			// Verify the leaf handler as well as its registry pointer; no instruction
+			// trampoline or change to other commands is required for this hook.
+			FindOne("66 0F 6E 05 1C 84 2F 00 0F 5B C0 F3 0F 11 41 30 C3");
+			// Keep the original resolver intact. Redirect only its three VM calls:
+			// expression names, command targets, and named command arguments.
+			FindOne("40 53 48 83 EC 30 48 8B 05 93 72 28 00 48 33 C4");
+			constexpr uintptr_t nameCalls[] = { 0x3708D4, 0x370D58, 0x370E80 };
+			for (const auto rva : nameCalls) {
+				const auto call = reinterpret_cast<const uint8_t*>(baseaddress + rva);
+				int32_t relative = 0;
+				memcpy(&relative, call + 1, sizeof(relative));
+				if (*call != 0xE8 || baseaddress + rva + 5 + relative != baseaddress + 0x383E60)
+					throw std::runtime_error("Judecca cutscene fix: unexpected actor-name call");
+			}
+			g_judeccaStandIns = g_partySceneFix || GetPrivateProfileIntW(L"Cutscenes", L"JudeccaStandIns", 0, wcModulePath) != 0;
+			if (g_judeccaStandIns) {
+				const uintptr_t modelCell = baseaddress + 0x612368 + 0x25B * 0x30;
+				if (*reinterpret_cast<uintptr_t*>(modelCell) != baseaddress + 0x366340 ||
+					*reinterpret_cast<uintptr_t*>(baseaddress + 0x612368 + 0xEE * 0x30) != baseaddress + 0x363EB0 ||
+					*reinterpret_cast<uintptr_t*>(baseaddress + 0x612368 + 0x20 * 0x30) != baseaddress + 0x35D500 ||
+					*reinterpret_cast<uintptr_t*>(baseaddress + 0x612368 + 0x2 * 0x30) != baseaddress + 0x35C600 ||
+					*reinterpret_cast<uintptr_t*>(baseaddress + 0x612368 + 0x27B * 0x30) != baseaddress + 0x366CB0)
+					throw std::runtime_error("Judecca stand-ins: unexpected native command registry");
+				// Validate every added call before installing any of the new hooks.
+				constexpr uintptr_t lifeCalls[][2] = {{0x34C6B1, 0x34B880}, {0x34B5A1, 0x384960}};
+				for (const auto& site : lifeCalls) {
+					const auto call = reinterpret_cast<const uint8_t*>(baseaddress + site[0]);
+					int32_t relative = 0; memcpy(&relative, call + 1, sizeof(relative));
+					if (*call != 0xE8 || baseaddress + site[0] + 5 + relative != baseaddress + site[1])
+						throw std::runtime_error("Judecca stand-ins: unexpected lifecycle call");
+				}
+				FindOne("48 83 EC 28 4C 8B C1 F3 0F 2C 49 38 E8 CF 9F E5 FF 66 0F 6E C0 0F 5B C0");
+				FindOne("48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57 41 54 41 55 41 56 41 57 48 83 EC 40 48 8B F9 E8 CC 53 01 00 83 78 30 00 4C 8B E8 74 14 E8 4E 8A");
+				FindOne("40 53 48 83 EC 50 48 8B D9 E8 E2 25 01 00 83 78 30 00 74 13 E8 67 5C FE");
+				FindOne("48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 48 89 7C 24 20 41 56 48 83 EC 20 4C 8B F1 E8 FE D9 02 00 41 80 7E 4C 00 8B 15 53 A5 30 00 C7 05 C9");
+				FindOne("48 8B C4 48 89 48 08 41 54 48 83 EC 50 45 33 DB 4C 8B D1 45 8B E3 44 89");
+				FindOne("40 56 48 83 EC 40 F3 0F 2C 41 34 48 8B F1 48 8B 0D 0B B8 30 00 48 85 C9 0F 84 FF 00 00 00 48 89");
+				FindOne("48 89 5C 24 10 57 48 83 EC 50 F3 0F 2C 41 34 48 8B F9 48 8B 0D 07 A9 30 00 33 D2 48 85 C9 74 0C");
+				InjectHook(reinterpret_cast<void*>(baseaddress + 0x34C6B1), trampoline->Jump(&PrepareJudeccaStandIns), PATCH_CALL);
+				InjectHook(reinterpret_cast<void*>(baseaddress + 0x34B5A1), trampoline->Jump(&CleanupJudeccaStandIns), PATCH_CALL);
+				Patch<uintptr_t>(modelCell, reinterpret_cast<uintptr_t>(&QueryJudeccaSceneModel));
+				Patch<uintptr_t>(baseaddress + 0x612368 + 0x2 * 0x30, reinterpret_cast<uintptr_t>(&PlayJudeccaSceneMotion));
+				if (!g_partySceneFix)
+					LogF("[Cutscenes] JudeccaStandIns v2 on (EXPERIMENTAL): scene7555 only, native actors plus required PC animation clips");
+			}
+			g_nativeActorName = reinterpret_cast<decltype(g_nativeActorName)>(baseaddress + 0x383E60);
+			const auto nameRelay = trampoline->Jump(&ResolveJudeccaActorName);
+			for (const auto rva : nameCalls)
+				InjectHook(reinterpret_cast<void*>(baseaddress + rva), nameRelay, PATCH_CALL);
+			g_nativePartyCount = reinterpret_cast<void(*)(uintptr_t)>(baseaddress + 0x35F520);
+			Patch<uintptr_t>(handlerCell, reinterpret_cast<uintptr_t>(&QueryJudeccaCutscenePartyCount));
+			if (g_partySceneFix)
+				LogF("[Cutscenes] PartySceneFix on (EXPERIMENTAL): 17 reviewed scenes, exact module checks, scene-specific casting; other party counts unchanged");
+			else
+				LogF("[Cutscenes] JudeccaFullPartyScenes v3 on (EXPERIMENTAL): scenes7553/7555 allow partial parties; empty PC placeholders skipped");
+		}
+		if (GetPrivateProfileIntW(L"Diagnostics", L"TraceDeathOverlay", 0, wcModulePath) != 0) {
+			const uintptr_t drawCell = baseaddress + 0x5702E8 + 0x18;
+			if (*reinterpret_cast<uintptr_t*>(drawCell) != baseaddress + 0x4D2FE0)
+				throw std::runtime_error("Death overlay diagnostics: unexpected FecTexfilter draw handler");
+			FindOne("48 89 74 24 10 48 89 7C 24 18 55 41 56 41 57 48 8D 6C 24 C1 48 81 EC B0 00 00 00 48 8B 05 FE 80 13 00 48 33 C4 48 89 45 2F 4C 8B 7D 7F 4C 8B 92");
+			Patch<uintptr_t>(drawCell, reinterpret_cast<uintptr_t>(&TraceDeathTextureFilter));
+			LogF("[DeathOverlay] native FecTexfilter draw observation enabled; rendering unchanged");
+		}
 		// [TraceScriptOps] (default 0): record every script
 		// command parsed by 0x140370c70 into a ring; HangWatch prints the last 48 at a stall. Same hook
 		// site as TraceWatchdog's script-op hook, so it is skipped when TraceWatchdog is on.
@@ -5093,11 +8105,46 @@ void OnInitializeHook()
 				"Z: popfq; pop r11; pop r10; pop rax; "
 				"movss dword ptr [rbx + 0x34], xmm0; movzx eax, word ptr [rdi + 2]", match, 0, 0x9);
 			LogF("[TraceScriptOps] ring armed (last 512 script commands, dumped by HangWatch)");
+			const int streamChannel = GetPrivateProfileIntW(L"Diagnostics", L"TraceScriptStreamChannel", -1, wcModulePath);
+			if (streamChannel >= 0 && streamChannel < 0x42) StartScriptStreamWatcher(streamChannel);
+		}
+		// [TraceCmdQ] = <channel>: log every push into that actor's command queue (0x1401b5b20: rcx=actor,
+		// edx=command id, r8d/r9d=args) with the caller and the queue fill; dumped by the * report.
+		{
+			const int cq = GetPrivateProfileIntW(L"Diagnostics", L"TraceCmdQ", -1, wcModulePath);
+			if (cq >= 0 && cq < 0x42)
+			{
+				auto ring = trampoline->RawSpace(512 * 24);
+				auto head = reinterpret_cast<uint32_t*>(trampoline->RawSpace(sizeof(uint32_t)));
+				auto zero = reinterpret_cast<uint32_t*>(trampoline->RawSpace(sizeof(uint32_t)));
+				memset(ring, 0, 512 * 24); *head = 0; *zero = 0;
+				g_cmdqRing = reinterpret_cast<volatile uint8_t*>(ring); g_cmdqHead = head;
+				constants[0] = static_cast<uint64_t>(cq);
+				constants[1] = reinterpret_cast<uintptr_t>(GetModuleHandle(nullptr));
+				pointers[0] = reinterpret_cast<uintptr_t>(ring);
+				pointers[1] = reinterpret_cast<uintptr_t>(head);
+				pointers[2] = reinterpret_cast<uintptr_t>(g_scriptFrames ? const_cast<uint32_t*>(g_scriptFrames) : zero);
+				auto match = FindOne("48 89 5C 24 20 56 48 83 EC 50 48 89 6C 24 60 33 DB F6 81 B8");
+				ParametricASMJump(
+					"push rax; push r10; push r11; movzx eax, byte ptr [rcx + 0x18]; cmp eax, $0; jne Z; "
+					"mov r10d, dword ptr [rip + ?1]; inc dword ptr [rip + ?1]; and r10d, 0x1ff; imul r10d, r10d, 24; lea r11, [rip + ?0]; add r11, r10; "
+					"mov dword ptr [r11], edx; mov dword ptr [r11 + 4], r8d; mov dword ptr [r11 + 8], r9d; "
+					"mov rax, qword ptr [rsp + 0x18]; mov r10, $1; sub rax, r10; mov dword ptr [r11 + 12], eax; "
+					"mov eax, dword ptr [rcx + 0x7c0]; mov dword ptr [r11 + 16], eax; mov eax, dword ptr [rip + ?2]; mov dword ptr [r11 + 20], eax; "
+					"Z: pop r11; pop r10; pop rax; mov qword ptr [rsp + 0x20], rbx", match, 0, 0x5);
+				LogF("[TraceCmdQ] armed for channel %d", cq);
+			}
 		}
 		StartStatsWatcher();
 		StartActorVarWatcher();
+		StartMoverWatcher();
+		StartLegScanner();
+		StartActorOffWatcher();
 		if (GetPrivateProfileIntW(L"Diagnostics", L"HangWatch", 1, wcModulePath) != 0)
 			StartHangWatcher();
+		if (GetPrivateProfileIntW(L"Diagnostics", L"DataRing", 0, wcModulePath) != 0)
+			StartDataRingWatcher();
+		StartDeathOverlayWatcher();
 		StartSoundTraceWatcher();
 		StartMovieTraceWatcher();
 		StartIntroSkipWatcher();
@@ -5124,11 +8171,308 @@ void OnInitializeHook()
 			StartPitchTraceWatcher();
 		if (GetPrivateProfileIntW(L"Diagnostics", L"TraceMove", 0, wcModulePath) != 0)
 			StartMoveTraceWatcher();
+		if (GetPrivateProfileIntW(L"Diagnostics", L"TraceCamera", 0, wcModulePath) != 0)
+			StartCameraTraceWatcher();
+		if (GetPrivateProfileIntW(L"Diagnostics", L"FlashScan", 0, wcModulePath) != 0)
+			StartFlashScanWatcher();
+		if (GetPrivateProfileIntW(L"Diagnostics", L"TraceFecFlash", 0, wcModulePath) != 0)
+		{
+			// FecFlash draw entry: push rbp; push rbx; push rdi; lea rbp,[rsp-0x3f] (9 bytes),
+			// RSP%16==8 here, so the capture-style bridge (7 pushes + pushfq + 0x88) is aligned.
+			auto fx = FindOne("40 55 53 57 48 8D 6C 24 C1 48 81 EC 00 01 00 00 4C 8B 1D");
+			constants[0] = reinterpret_cast<uintptr_t>(&LogFecFlashDraw);
+			ParametricASMJump(
+				"pushfq; push rax; push rcx; push rdx; push r8; push r9; push r10; push r11; sub rsp, 0x88; "
+				"movdqu xmmword ptr [rsp + 0x20], xmm0; movdqu xmmword ptr [rsp + 0x30], xmm1; movdqu xmmword ptr [rsp + 0x40], xmm2; "
+				"movdqu xmmword ptr [rsp + 0x50], xmm3; movdqu xmmword ptr [rsp + 0x60], xmm4; movdqu xmmword ptr [rsp + 0x70], xmm5; "
+				"mov rax, $0; call rax; "
+				"movdqu xmm0, xmmword ptr [rsp + 0x20]; movdqu xmm1, xmmword ptr [rsp + 0x30]; movdqu xmm2, xmmword ptr [rsp + 0x40]; "
+				"movdqu xmm3, xmmword ptr [rsp + 0x50]; movdqu xmm4, xmmword ptr [rsp + 0x60]; movdqu xmm5, xmmword ptr [rsp + 0x70]; "
+				"add rsp, 0x88; pop r11; pop r10; pop r9; pop r8; pop rdx; pop rcx; pop rax; popfq; "
+				"push rbp; push rbx; push rdi; lea rbp, [rsp - 0x3f]", fx, 0, 9);
+			LogF("[TraceFecFlash] armed on FecFlash draw");
+		}
+		// Chapter-5 mounted turret: native fire interval is 7 renders (233.333 ms).
+		// 0x2d2e82..0x2d2e9c computes (ECX+1)%7; 0x2d2e9c stores to 0x658ce8.
+		// Scale this LOCAL counter's period, not the global projectile updater.
+		// Round to the nearest render for other caps; 60/90/120 are exact (14/21/28).
+		// [Effects] AnimLoopSeamFix=1 (2026-09-22): looping animation clips hitch once per loop above
+		// 30 fps (field save stone, actor class 0, bone 1: a 45-key 360-degree spin, 8 deg per key). The
+		// pose sampler 0x1403BEB50 keeps a cursor on key ceil(frame) and outputs prev + (cur - prev) *
+		// frac from the 24.8 frame; at the loop wrap the cursor rewinds to key 0 while "prev" keeps the
+		// last key. A full turn ends with the last key's quaternion in the opposite hemisphere from key 0
+		// (traced: w = -32690 vs +32767), so the lerp passes through w = 0 (a 180-degree flip) during the
+		// fps/30-1 fractional renders of the last interval. At 30 fps frac is always 0 and the lerp never
+		// runs. The game's own quaternion sign alignment 0x1403BEA50 (negate prev when dot(prev,cur) < 0)
+		// runs after a rewind only for layers with flag 4 in [layer+0x84]; extend the test mask to loop
+		// layers (flag 8): one byte 04 -> 0C at 0x1403BEBF3. Benign for loops without a sign flip
+		// (dot > 0 = no-op) and never reached at 30 fps.
+		// The AnimQuatAlignFix hooks are installed in the >30 fps block before the character animation rate
+		// (audit 2026-09-26, R3). AnimLoopSeamFix is the fallback when the rewind-path hook is not in place.
+		if (!g_quatAlignCallHooked && g_framerate > 30.0f && GetPrivateProfileIntW(L"Effects", L"AnimLoopSeamFix", 1, wcModulePath) != 0)
+		{
+			auto seam = FindOne("F6 81 84 00 00 00 04 74 05 E8");
+			Patch<uint8_t>(seam.get<void>(6), 0x0C);
+			LogF("[Effects] AnimLoopSeamFix on: quaternion sign alignment after a loop rewind for every looping animation layer (was: flag-4 layers only)");
+		}
+		if (g_framerate > 30.0f && GetPrivateProfileIntW(L"Effects", L"TurretFireRateFix", 1, wcModulePath) != 0)
+		{
+			auto tc = FindOne("FF C1 B8 6D DB B6 6D F7 E9 2B D1 C1 FA 02 8B C2 C1 E8 1F 03 D0 6B D2 07 03 CA 89 0D ? ? ? ?");
+			const int period = static_cast<int>(floorf(7.0f * g_framerate / 30.0f + 0.5f));
+			constants[0] = period;
+			if (ParametricASMJump(kTurretCooldownAsm, tc, 0, 0x1A) == 0)
+				LogF("[Effects] TurretFireRateFix on: 7 -> %d renders at %.0f FPS (%.3f ms)", period, g_framerate, period * 1000.0 / g_framerate);
+		}
+		if (GetPrivateProfileIntW(L"Diagnostics", L"TraceTurretFire", 0, wcModulePath) != 0)
+		{
+			// 0x2d2e31: after the resource check, just before requesting action 0x500d.
+			// Inside the function RSP is aligned; 8 pushes + 0x80 retain alignment.
+			auto tf = FindOne("BA 0D 50 00 00 89 44 24 38 C6 44 24 30 00 C6 44 24 28 00 C6 44 24 20 01");
+			constants[0] = reinterpret_cast<uintptr_t>(&LogTurretFire);
+			ParametricASMJump(
+				"pushfq; push rax; push rcx; push rdx; push r8; push r9; push r10; push r11; sub rsp, 0x80; "
+				"movdqu xmmword ptr [rsp + 0x20], xmm0; movdqu xmmword ptr [rsp + 0x30], xmm1; movdqu xmmword ptr [rsp + 0x40], xmm2; "
+				"movdqu xmmword ptr [rsp + 0x50], xmm3; movdqu xmmword ptr [rsp + 0x60], xmm4; movdqu xmmword ptr [rsp + 0x70], xmm5; "
+				"mov rax, $0; call rax; "
+				"movdqu xmm0, xmmword ptr [rsp + 0x20]; movdqu xmm1, xmmword ptr [rsp + 0x30]; movdqu xmm2, xmmword ptr [rsp + 0x40]; "
+				"movdqu xmm3, xmmword ptr [rsp + 0x50]; movdqu xmm4, xmmword ptr [rsp + 0x60]; movdqu xmm5, xmmword ptr [rsp + 0x70]; "
+				"add rsp, 0x80; pop r11; pop r10; pop r9; pop r8; pop rdx; pop rcx; pop rax; popfq; "
+				"mov edx, 0x500d; mov dword ptr [rsp + 0x38], eax", tf, 0, 9);
+			LogF("[TraceTurretFire] armed on action 500D requests; dt is QPC milliseconds at every FPS");
+		}
+
+		// Historical experiment: +0xbc is projectile speed, +0xc4 acceleration,
+		// +0xc0 the speed cap. This does NOT fix the turret's firing interval.
+		// Retained default-off for compatibility with earlier diagnostic builds.
+		if (g_framerate > 30.0f && GetPrivateProfileIntW(L"Effects", L"WeaponChargeRateFix", 0, wcModulePath) != 0)
+		{
+			param_floats[0] = 30.0f / g_framerate;
+			FindAll("F3 0F 10 87 C4 00 00 00 F3 0F 10 8F C0 00 00 00 F3 0F 58 87 BC 00 00 00", 5).for_each_result([](auto found) mutable
+			{
+				ParametricASMJump("movss xmm0, dword ptr [rdi + 0xc4]; mulss xmm0, %0", found, 0, 8);
+			});
+			LogF("[Effects] WeaponChargeRateFix on (EXPERIMENTAL): weapon fire-charge step scaled by 30/%.0f", g_framerate);
+		}
+
+		//[Effects] EventOncePerFrameFix=1 (EXPERIMENTAL, 2026-09-19): the animation event-track
+		//player 0x1403BD780 dispatches keyframe events {kind, arg, startFrame, endFrame} while
+		//the layer's INTEGER frame ([layer+0x6c]>>8) is inside the window. For |rate| <= 1 it
+		//assumes one new frame per call and dispatches every call; for |rate| > 1 it walks
+		//from the last processed frame [layer+0x70] to the current one, once per frame. Above
+		//30 fps layers run at 30/fps, the same integer frame repeats fps/30 renders and a
+		//one-frame event fires fps/30 times (chapter-5 turret: 4 shots/sounds/muzzle effects
+		//per animation frame -> "fires faster"). Route every rate through the walking branch:
+		//the two `jb` to it become `jmp`; each integer frame is then dispatched exactly once.
+		if (g_framerate > 30.0f && GetPrivateProfileIntW(L"Effects", L"EventOncePerFrameFix", 0, wcModulePath) != 0)
+		{
+			auto ev = FindOne("0F 2F C1 72 5A 0F 2F 0D ? ? ? ? 72 51 85 D2 7E 44");
+			Patch<uint8_t>(ev.get<void>(0x3), 0xEB);
+			Patch<uint8_t>(ev.get<void>(0xC), 0xEB);
+			LogF("[Effects] EventOncePerFrameFix on (EXPERIMENTAL): animation keyframe events dispatched once per integer frame at any layer rate");
+		}
+		if (GetPrivateProfileIntW(L"Diagnostics", L"TraceWeapon", 0, wcModulePath) != 0)
+		{
+			// weapon update entry: mov rax,rsp; mov [rax+0x20],rbx; push rbp;push rsi;push rdi;
+			// push r13;push r14; lea rbp,[rax-0x288] (0x16 bytes), RSP%16==8. ecx = slot index.
+			auto wp = FindOne("48 8B C4 48 89 58 20 55 56 57 41 55 41 56 48 8D A8 78 FD FF FF 48");
+			constants[0] = reinterpret_cast<uintptr_t>(&LogWeapon);
+			ParametricASMJump(
+				"pushfq; push rax; push rcx; push rdx; push r8; push r9; push r10; push r11; sub rsp, 0x88; "
+				"movdqu xmmword ptr [rsp + 0x20], xmm0; movdqu xmmword ptr [rsp + 0x30], xmm1; movdqu xmmword ptr [rsp + 0x40], xmm2; "
+				"movdqu xmmword ptr [rsp + 0x50], xmm3; movdqu xmmword ptr [rsp + 0x60], xmm4; movdqu xmmword ptr [rsp + 0x70], xmm5; "
+				"mov rax, $0; call rax; "
+				"movdqu xmm0, xmmword ptr [rsp + 0x20]; movdqu xmm1, xmmword ptr [rsp + 0x30]; movdqu xmm2, xmmword ptr [rsp + 0x40]; "
+				"movdqu xmm3, xmmword ptr [rsp + 0x50]; movdqu xmm4, xmmword ptr [rsp + 0x60]; movdqu xmm5, xmmword ptr [rsp + 0x70]; "
+				"add rsp, 0x88; pop r11; pop r10; pop r9; pop r8; pop rdx; pop rcx; pop rax; popfq; "
+				"mov rax, rsp; mov qword ptr [rax + 0x20], rbx; push rbp; push rsi; push rdi; push r13; push r14; lea rbp, [rax - 0x288]", wp, 0, 0x15);
+			LogF("[TraceWeapon] armed on the weapon state machine");
+		}
+		if (GetPrivateProfileIntW(L"Diagnostics", L"TraceMotionSpeed", 0, wcModulePath) != 0)
+		{
+			// CMD134 after the factor store and the party reset: mov ecx,[rdi+0x44]; test ecx,ecx (5 bytes; only the
+			// first byte is a branch target). Function body, RSP%16 == 0: 8 pushes + 0x80 keep it aligned.
+			auto ms = FindOne("8B 4F 44 85 C9 7E 0A F3 0F 2C 57 34 E8");
+			constants[0] = reinterpret_cast<uintptr_t>(&NoteMotionSpeed);
+			if (ParametricASMJump(
+				"pushfq; push rax; push rcx; push rdx; push r8; push r9; push r10; push r11; sub rsp, 0x80; "
+				"movdqu xmmword ptr [rsp + 0x20], xmm0; movdqu xmmword ptr [rsp + 0x30], xmm1; movdqu xmmword ptr [rsp + 0x40], xmm2; "
+				"movdqu xmmword ptr [rsp + 0x50], xmm3; movdqu xmmword ptr [rsp + 0x60], xmm4; movdqu xmmword ptr [rsp + 0x70], xmm5; "
+				"mov rcx, rbp; mov rax, $0; call rax; "
+				"movdqu xmm0, xmmword ptr [rsp + 0x20]; movdqu xmm1, xmmword ptr [rsp + 0x30]; movdqu xmm2, xmmword ptr [rsp + 0x40]; "
+				"movdqu xmm3, xmmword ptr [rsp + 0x50]; movdqu xmm4, xmmword ptr [rsp + 0x60]; movdqu xmm5, xmmword ptr [rsp + 0x70]; "
+				"add rsp, 0x80; pop r11; pop r10; pop r9; pop r8; pop rdx; pop rcx; pop rax; popfq; "
+				"mov ecx, dword ptr [rdi + 0x44]; test ecx, ecx", ms, 0, 5) == 0)
+			{
+				g_traceMotionSpeed = true;
+				LogF("[MotionSpeed] trace armed on CMD134 (motion speed factor per actor, read-only)");
+			}
+		}
+		// Audit 2026-09-26 (B9): TraceWatchdog's ANIM_FRAME hook uses the same entry bytes.
+		if (GetPrivateProfileIntW(L"Diagnostics", L"TraceAnimRate", 0, wcModulePath) != 0
+			&& GetPrivateProfileIntW(L"Diagnostics", L"TraceWatchdog", 0, wcModulePath) != 0)
+			LogF("[TraceAnimRate] skipped: TraceWatchdog hooks the same function entry");
+		else if (GetPrivateProfileIntW(L"Diagnostics", L"TraceAnimRate", 0, wcModulePath) != 0)
+		{
+			// event-track player entry: push rdi; sub rsp,0x40 (6 bytes), RSP%16==8
+			auto ar = FindOne("40 57 48 83 EC 40 48 8B 01 48 8B F9 48 83 B8 80 04 00 00 00");
+			constants[0] = reinterpret_cast<uintptr_t>(&LogAnimRate);
+			ParametricASMJump(
+				"pushfq; push rax; push rcx; push rdx; push r8; push r9; push r10; push r11; sub rsp, 0x88; "
+				"movdqu xmmword ptr [rsp + 0x20], xmm0; movdqu xmmword ptr [rsp + 0x30], xmm1; movdqu xmmword ptr [rsp + 0x40], xmm2; "
+				"movdqu xmmword ptr [rsp + 0x50], xmm3; movdqu xmmword ptr [rsp + 0x60], xmm4; movdqu xmmword ptr [rsp + 0x70], xmm5; "
+				"mov rax, $0; call rax; "
+				"movdqu xmm0, xmmword ptr [rsp + 0x20]; movdqu xmm1, xmmword ptr [rsp + 0x30]; movdqu xmm2, xmmword ptr [rsp + 0x40]; "
+				"movdqu xmm3, xmmword ptr [rsp + 0x50]; movdqu xmm4, xmmword ptr [rsp + 0x60]; movdqu xmm5, xmmword ptr [rsp + 0x70]; "
+				"add rsp, 0x88; pop r11; pop r10; pop r9; pop r8; pop rdx; pop rcx; pop rax; popfq; "
+				"push rdi; sub rsp, 0x40", ar, 0, 6);
+			LogF("[TraceAnimRate] armed on the animation event-track player");
+		}
+		if (GetPrivateProfileIntW(L"Diagnostics", L"TraceLoopWrap", 0, wcModulePath) != 0)
+		{
+			// (a) effect element loop wrap: the 10 bytes after `call 0x1404A88D0` in 0x1404A8980
+			// (movzx eax,[rbx+2]; cvttss2si r8d,[rbx+0x40]); rbx = element, rdi = context; RSP%16==0.
+			auto lw = FindOne("0F B7 43 02 F3 44 0F 2C 43 40 66 23 C6 66 83 C8 02 66 89 43 02");
+			constants[0] = reinterpret_cast<uintptr_t>(&LogFecWrap);
+			ParametricASMJump(
+				"pushfq; push rax; push rcx; push rdx; push r8; push r9; push r10; push r11; sub rsp, 0x90; "
+				"movdqu xmmword ptr [rsp + 0x30], xmm0; movdqu xmmword ptr [rsp + 0x40], xmm1; movdqu xmmword ptr [rsp + 0x50], xmm2; "
+				"movdqu xmmword ptr [rsp + 0x60], xmm3; movdqu xmmword ptr [rsp + 0x70], xmm4; movdqu xmmword ptr [rsp + 0x80], xmm5; "
+				"mov rcx, rbx; mov rdx, rdi; mov rax, $0; call rax; "
+				"movdqu xmm0, xmmword ptr [rsp + 0x30]; movdqu xmm1, xmmword ptr [rsp + 0x40]; movdqu xmm2, xmmword ptr [rsp + 0x50]; "
+				"movdqu xmm3, xmmword ptr [rsp + 0x60]; movdqu xmm4, xmmword ptr [rsp + 0x70]; movdqu xmm5, xmmword ptr [rsp + 0x80]; "
+				"add rsp, 0x90; pop r11; pop r10; pop r9; pop r8; pop rdx; pop rcx; pop rax; popfq; "
+				"movzx eax, word ptr [rbx + 2]; cvttss2si r8d, dword ptr [rbx + 0x40]", lw, 0, 10);
+			// (b) element clock advance in 0x1404A97C0: movaps xmm2,xmm7; addss xmm2,[rbx+0x40] (8 bytes); rbx = element; RSP%16==0.
+			auto lc = FindOne("0F 28 D7 F3 0F 58 53 40 0F 2F F2 F3 0F 11 53 40");
+			constants[0] = reinterpret_cast<uintptr_t>(&LogFecClock);
+			ParametricASMJump(
+				"pushfq; push rax; push rcx; push rdx; push r8; push r9; push r10; push r11; sub rsp, 0x90; "
+				"movdqu xmmword ptr [rsp + 0x30], xmm0; movdqu xmmword ptr [rsp + 0x40], xmm1; movdqu xmmword ptr [rsp + 0x50], xmm2; "
+				"movdqu xmmword ptr [rsp + 0x60], xmm3; movdqu xmmword ptr [rsp + 0x70], xmm4; movdqu xmmword ptr [rsp + 0x80], xmm5; "
+				"mov rcx, rbx; mov rax, $0; call rax; "
+				"movdqu xmm0, xmmword ptr [rsp + 0x30]; movdqu xmm1, xmmword ptr [rsp + 0x40]; movdqu xmm2, xmmword ptr [rsp + 0x50]; "
+				"movdqu xmm3, xmmword ptr [rsp + 0x60]; movdqu xmm4, xmmword ptr [rsp + 0x70]; movdqu xmm5, xmmword ptr [rsp + 0x80]; "
+				"add rsp, 0x90; pop r11; pop r10; pop r9; pop r8; pop rdx; pop rcx; pop rax; popfq; "
+				"movaps xmm2, xmm7; addss xmm2, dword ptr [rbx + 0x40]", lc, 0, 8);
+			// (c) FecRotmv per-render update through its vtable slot 2 (the body `mov rax,[rsp+0x28]; movaps xmm0,xmm3; ...`
+			// is duplicated for other *mv classes, so no byte signature). Entry RSP%16==8; 5th arg (state) at
+			// entry [rsp+0x28] = stub [rsp+0x100]; xmm3 (t) is passed as the 6th argument.
+			const uintptr_t rotmvUpdate = *reinterpret_cast<uintptr_t*>(baseaddress + 0x572138 + 0x10);
+			static const uint8_t rotmvHead[8] = { 0x48, 0x8B, 0x44, 0x24, 0x28, 0x0F, 0x28, 0xC3 };
+			if (rotmvUpdate > baseaddress && rotmvUpdate < baseaddress + 0x600000 && memcmp(reinterpret_cast<const void*>(rotmvUpdate), rotmvHead, 8) == 0)
+			{
+				constants[0] = reinterpret_cast<uintptr_t>(&LogFecRotmv);
+				ParametricASMJump(
+					"pushfq; push rax; push rcx; push rdx; push r8; push r9; push r10; push r11; sub rsp, 0x98; "
+					"movdqu xmmword ptr [rsp + 0x30], xmm0; movdqu xmmword ptr [rsp + 0x40], xmm1; movdqu xmmword ptr [rsp + 0x50], xmm2; "
+					"movdqu xmmword ptr [rsp + 0x60], xmm3; movdqu xmmword ptr [rsp + 0x70], xmm4; movdqu xmmword ptr [rsp + 0x80], xmm5; "
+					"mov rax, qword ptr [rsp + 0x100]; mov qword ptr [rsp + 0x20], rax; movss dword ptr [rsp + 0x28], xmm3; mov rax, $0; call rax; "
+					"movdqu xmm0, xmmword ptr [rsp + 0x30]; movdqu xmm1, xmmword ptr [rsp + 0x40]; movdqu xmm2, xmmword ptr [rsp + 0x50]; "
+					"movdqu xmm3, xmmword ptr [rsp + 0x60]; movdqu xmm4, xmmword ptr [rsp + 0x70]; movdqu xmm5, xmmword ptr [rsp + 0x80]; "
+					"add rsp, 0x98; pop r11; pop r10; pop r9; pop r8; pop rdx; pop rcx; pop rax; popfq; "
+					"mov rax, qword ptr [rsp + 0x28]; movaps xmm0, xmm3", hook::pattern_match(reinterpret_cast<void*>(rotmvUpdate)), 0, 8);
+			}
+			else LogF("[TraceLoopWrap] FecRotmv slot 2 at %llX does not match the expected head, rotation update not traced", static_cast<unsigned long long>(rotmvUpdate - baseaddress));
+			// (d) animation layer step entry 0x1403BDB60 (rcx = layer): movss xmm0,[rcx+0x74] (5 bytes); RSP%16==8.
+			auto as = FindOne("F3 0F 10 41 74 F3 0F 10 15");
+			constants[0] = reinterpret_cast<uintptr_t>(&LogAnimStep);
+			ParametricASMJump(
+				"pushfq; push rax; push rcx; push rdx; push r8; push r9; push r10; push r11; sub rsp, 0x88; "
+				"movdqu xmmword ptr [rsp + 0x20], xmm0; movdqu xmmword ptr [rsp + 0x30], xmm1; movdqu xmmword ptr [rsp + 0x40], xmm2; "
+				"movdqu xmmword ptr [rsp + 0x50], xmm3; movdqu xmmword ptr [rsp + 0x60], xmm4; movdqu xmmword ptr [rsp + 0x70], xmm5; "
+				"mov rax, $0; call rax; "
+				"movdqu xmm0, xmmword ptr [rsp + 0x20]; movdqu xmm1, xmmword ptr [rsp + 0x30]; movdqu xmm2, xmmword ptr [rsp + 0x40]; "
+				"movdqu xmm3, xmmword ptr [rsp + 0x50]; movdqu xmm4, xmmword ptr [rsp + 0x60]; movdqu xmm5, xmmword ptr [rsp + 0x70]; "
+				"add rsp, 0x88; pop r11; pop r10; pop r9; pop r8; pop rdx; pop rcx; pop rax; popfq; "
+				"movss xmm0, dword ptr [rcx + 0x74]", as, 0, 5);
+			LogF("[TraceLoopWrap] armed: effect loop wrap + clock (near loop end / 24 renders after a wrap), FecRotmv update, animation layer step (looping layers near their boundary)");
+		}
+		if (GetPrivateProfileIntW(L"Diagnostics", L"TraceSoundNew", 0, wcModulePath) != 0)
+		{
+			// RootSound ctor entry: mov rax,rsp; push rbp; push rsi; push rdi; push r12 (8 bytes), RSP%16==8
+			auto sn = FindOne("48 8B C4 55 56 57 41 54 41 55 41 56 41 57 48 81 EC A0 00 00");
+			constants[0] = reinterpret_cast<uintptr_t>(&LogSoundNew);
+			ParametricASMJump(
+				"pushfq; push rax; push rcx; push rdx; push r8; push r9; push r10; push r11; sub rsp, 0x88; "
+				"movdqu xmmword ptr [rsp + 0x20], xmm0; movdqu xmmword ptr [rsp + 0x30], xmm1; movdqu xmmword ptr [rsp + 0x40], xmm2; "
+				"movdqu xmmword ptr [rsp + 0x50], xmm3; movdqu xmmword ptr [rsp + 0x60], xmm4; movdqu xmmword ptr [rsp + 0x70], xmm5; "
+				"mov rax, $0; call rax; "
+				"movdqu xmm0, xmmword ptr [rsp + 0x20]; movdqu xmm1, xmmword ptr [rsp + 0x30]; movdqu xmm2, xmmword ptr [rsp + 0x40]; "
+				"movdqu xmm3, xmmword ptr [rsp + 0x50]; movdqu xmm4, xmmword ptr [rsp + 0x60]; movdqu xmm5, xmmword ptr [rsp + 0x70]; "
+				"add rsp, 0x88; pop r11; pop r10; pop r9; pop r8; pop rdx; pop rcx; pop rax; popfq; "
+				"mov rax, rsp; push rbp; push rsi; push rdi; push r12", sn, 0, 8);
+			LogF("[TraceSoundNew] armed on the sound-instance constructor");
+		}
+		if (GetPrivateProfileIntW(L"Diagnostics", L"TraceFecAnm", 0, wcModulePath) != 0)
+		{
+			// FecAnm_plus draw entry: mov r11,rsp; push rbp; push rbx; push rsi; push r13 (8 bytes), RSP%16==8.
+			auto fa = FindOne("4C 8B DC 55 53 56 41 55 49 8D 6B C8 48 81 EC 18 01 00 00 48");
+			constants[0] = reinterpret_cast<uintptr_t>(&LogFecAnmDraw);
+			ParametricASMJump(
+				// 0x98 of scratch: [rsp+0x20] = 5th argument for the logger (entry [rsp+0x28] = [rsp+0x98+0x40+0x28]),
+				// xmm0..5 saved at +0x30..+0x90; entry RSP%16==8, 64 bytes of pushes keep it, 0x98 aligns the call.
+				"pushfq; push rax; push rcx; push rdx; push r8; push r9; push r10; push r11; sub rsp, 0x98; "
+				"movdqu xmmword ptr [rsp + 0x30], xmm0; movdqu xmmword ptr [rsp + 0x40], xmm1; movdqu xmmword ptr [rsp + 0x50], xmm2; "
+				"movdqu xmmword ptr [rsp + 0x60], xmm3; movdqu xmmword ptr [rsp + 0x70], xmm4; movdqu xmmword ptr [rsp + 0x80], xmm5; "
+				"mov rax, qword ptr [rsp + 0x100]; mov qword ptr [rsp + 0x20], rax; mov rax, $0; call rax; "
+				"movdqu xmm0, xmmword ptr [rsp + 0x30]; movdqu xmm1, xmmword ptr [rsp + 0x40]; movdqu xmm2, xmmword ptr [rsp + 0x50]; "
+				"movdqu xmm3, xmmword ptr [rsp + 0x60]; movdqu xmm4, xmmword ptr [rsp + 0x70]; movdqu xmm5, xmmword ptr [rsp + 0x80]; "
+				"add rsp, 0x98; pop r11; pop r10; pop r9; pop r8; pop rdx; pop rcx; pop rax; popfq; "
+				"mov r11, rsp; push rbp; push rbx; push rsi; push r13", fa, 0, 8);
+			LogF("[TraceFecAnm] armed on FecAnm_plus draw");
+		}
+		g_traceFecDraw = GetPrivateProfileIntW(L"Diagnostics", L"TraceFecDraw", 0, wcModulePath) != 0;
+		g_effectFirstFrameFix = g_framerate > 30.0f && GetPrivateProfileIntW(L"Effects", L"FirstFrameFix", 1, wcModulePath) != 0;
+		if (g_traceFecDraw || g_effectFirstFrameFix)
+		{
+			// draw loop (2 clones): mov [rsp+0x20],r8; mov rdx,r14; | mov rax,[rcx]; mov r8,r10; call [rax+0x18] | movzx eax,[rbp+0x15]
+			// Replace the 9 bytes from mov rax,[rcx]. RSP%16==0 here (a call follows), so the
+			// bridge uses 0x80 of scratch to keep the helper call aligned.
+			{
+				wchar_t list[256] = L"";
+				GetPrivateProfileStringW(L"Diagnostics", L"FecSkipClass", L"", list, 256, wcModulePath);
+				wchar_t* ctx = nullptr;
+				for (wchar_t* tok = wcstok_s(list, L", ;", &ctx); tok && g_fecSkipN < 8; tok = wcstok_s(nullptr, L", ;", &ctx))
+					g_fecSkipVt[g_fecSkipN++] = static_cast<uintptr_t>(wcstoull(tok, nullptr, 16));
+			}
+			constants[0] = reinterpret_cast<uintptr_t>(&LogFecDraw);
+			g_fecSkipCell = trampoline->Pointer<uint8_t>(); *g_fecSkipCell = 0;
+			g_fecSkipFirst = GetPrivateProfileIntW(L"Diagnostics", L"FecSkipFirstRenders", 0, wcModulePath);
+			pointers[0] = reinterpret_cast<uintptr_t>(const_cast<uint8_t*>(g_fecSkipCell));
+			FindAll("4C 89 44 24 20 49 8B D6 48 8B 01 4D 8B C2 FF 50 18 0F B6 45 15", 2).for_each_result([](auto found) mutable
+			{
+				ParametricASMJump(
+					// RSP%16==0 at the site; 64 bytes of pushes keep it, 0x90 of scratch keeps the call aligned.
+					// [rsp+0x20] = the game's 5th draw argument (entry [rsp+0x20] = [rsp+0x90+0x40+0x20]) passed on as our 5th.
+					"mov r8, r10; pushfq; push rax; push rcx; push rdx; push r8; push r9; push r10; push r11; sub rsp, 0x90; "
+					"movdqu xmmword ptr [rsp + 0x30], xmm0; movdqu xmmword ptr [rsp + 0x40], xmm1; movdqu xmmword ptr [rsp + 0x50], xmm2; "
+					"movdqu xmmword ptr [rsp + 0x60], xmm3; movdqu xmmword ptr [rsp + 0x70], xmm4; movdqu xmmword ptr [rsp + 0x80], xmm5; "
+					"mov rax, qword ptr [rsp + 0xF0]; mov qword ptr [rsp + 0x20], rax; mov rax, $0; call rax; "
+					"movdqu xmm0, xmmword ptr [rsp + 0x30]; movdqu xmm1, xmmword ptr [rsp + 0x40]; movdqu xmm2, xmmword ptr [rsp + 0x50]; "
+					"movdqu xmm3, xmmword ptr [rsp + 0x60]; movdqu xmm4, xmmword ptr [rsp + 0x70]; movdqu xmm5, xmmword ptr [rsp + 0x80]; "
+					"add rsp, 0x90; pop r11; pop r10; pop r9; pop r8; pop rdx; pop rcx; pop rax; popfq; "
+					// (movzx keeps the rip displacement last in the instruction; a cmp with imm8 would not)
+					"movzx eax, byte ptr [rip + ?0]; test eax, eax; jne S; mov rax, qword ptr [rcx]; call qword ptr [rax + 0x18]; S: nop", found, 8, 17); // resume at 8 + 9 (absolute offset)
+			});
+			if (g_traceFecDraw)
+			{
+				StartFecHotkeyWatcher();
+				LogF("[TraceFecDraw] armed on the effect draw loop, %d class(es) skipped, first %d render(s) of each sprite instance hidden; keys 1-7 toggle Flash/Gaussian/Monochrome/Megaanm+/Mdlts+/Anm+/Mdl+, 0 = all drawn", g_fecSkipN, g_fecSkipFirst);
+			}
+			if (g_effectFirstFrameFix)
+				LogF("[Effects] FirstFrameFix on: effect elements are not drawn before their clock reaches 1 (native first-frame phase)");
+		}
 		if (GetPrivateProfileIntW(L"Diagnostics", L"TraceBattle", 0, wcModulePath) != 0)
 			StartBattleTraceWatcher();
 		g_watchAiEvent = GetPrivateProfileIntW(L"Diagnostics", L"WatchAiEvent", 0, wcModulePath) != 0;
+		if (GetPrivateProfileIntW(L"Diagnostics", L"TraceSummon", 0, wcModulePath) != 0)
+			StartSummonTraceWatcher();
 		if (GetPrivateProfileIntW(L"Diagnostics", L"TraceBossPos", 0, wcModulePath) != 0)
-			StartBossPosTraceWatcher();
+			StartBossPosTraceWatcher(GetPrivateProfileIntW(L"Diagnostics", L"TraceBossChannel", -1, wcModulePath));
+		if (GetPrivateProfileIntW(L"Diagnostics", L"TraceEnemySpeed", 0, wcModulePath) != 0)
+			StartEnemySpeedTraceWatcher(GetPrivateProfileIntW(L"Diagnostics", L"TraceEnemySpeedMin", 60, wcModulePath), GetPrivateProfileIntW(L"Diagnostics", L"TraceEnemyTurnMin", 120, wcModulePath), GetPrivateProfileIntW(L"Diagnostics", L"TraceEnemyVertMin", 150, wcModulePath));
+		if (GetPrivateProfileIntW(L"Diagnostics", L"TraceActorTimers", 0, wcModulePath) != 0)
+			StartActorTimerTraceWatcher();
 		if (GetPrivateProfileIntW(L"Diagnostics", L"TraceCombat", 0, wcModulePath) != 0)
 			StartCombatTraceWatcher();
 		if (GetPrivateProfileIntW(L"Diagnostics", L"TraceScriptMove", 0, wcModulePath) != 0)

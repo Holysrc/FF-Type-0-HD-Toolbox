@@ -3,8 +3,30 @@
 This project started as a fork of [Banz99/Final-Fantasy-Type-0-Hd-Unlocker](https://github.com/Banz99/Final-Fantasy-Type-0-Hd-Unlocker) —
 the mod that unlocks custom resolutions, high framerates and FOV in Final Fantasy Type-0 HD on PC.
 Everything from the original mod still works exactly the same. The toolbox adds the things below.
-No game files are touched — all changes happen in memory while the game runs, so Steam updates
-and file checks never break anything.
+The main ASI patches the game in memory. The optional launcher skip replaces the launcher
+separately, keeping a backup of the original; Steam verification may restore the stock launcher.
+
+## Version 0.5.9
+
+Fixed broken menu text at resolutions below 1920x1080 (introduced in 0.5.7).
+See the [changelog](docs/releases/0.5.9/CHANGELOG.md).
+
+## Version 0.5.8
+
+Adds experimental partial-party cutscene handling for 17 reviewed scenes,
+including temporary participants with scene-specific animation preloads.
+Enabled in the supplied INI; see the [changelog](docs/releases/0.5.8/CHANGELOG.md)
+and [update instructions](docs/releases/0.5.8/README-EN.txt). The Judecca boss
+intro was tested in-game; other scene profiles remain experimental. The 0.5.8
+package includes the main mod only, without a launcher replacement.
+
+## Version 0.5.7
+
+See [the changelog](docs/releases/0.5.7/CHANGELOG.md) for the changes since0.5.6:
+high-FPS turret, muzzle flash, dodge, MP restoration and scripted movement fixes;
+smoother lock-on camera, desktop-resolution selection and optional launcher skip.
+Use the [update instructions](docs/releases/0.5.7/README-EN.txt) to enable the new
+fixes when keeping an old INI. The launcher has its own installation instructions.
 
 ## Skip the whole intro
 
@@ -29,9 +51,11 @@ third-person game:
 - **Stick response curve**: most of the stick travel is a calm, precise "slow zone", the last
   bit ramps to full speed — with adjustable zone size, zone speed and start smoothness.
   Diagonals count as full deflection on both axes, so circling a target feels right.
-- **Calm lock-on camera**: the stock lock-on snaps the camera onto the enemy every frame and
-  whips around when it circles you. Now it follows smoothly, with adjustable follow strength
-  and a dead zone where the camera stays still while the enemy is near the center of the screen.
+- **Calm lock-on camera**: the stock lock-on camera can whip around you at up to ~2000 deg/s
+  when an enemy circles you at close range. `LockTurnMaxDegPerSec` caps that turn rate and
+  `LockTurnDeadZoneDegrees` lets the enemy drift a little off-center before the camera follows
+  (both live in the tuner). The 0.5.4 "follow strength / dead zone" pair was removed in
+  0.5.10: it only acted in a camera mode normal lock-on never uses.
 - **Dynamic field of view**: the view widens slightly during fast turns and when looking
   steeply up or down, which adds a lot to the modern feel.
 - **Live tuning window** (`TuneWindow=1`): a small always-on-top window with a slider for

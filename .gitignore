@@ -1,4 +1,5 @@
 /build/
+/release/
 
 # Local tooling and copyrighted game files (never commit these)
 premake5.exe
@@ -8,3 +9,6 @@ premake5.exe
 
 # runtime dump of the game module (game code, never commit)
 dump/
+
+# Local Python tool imports
+__pycache__/
